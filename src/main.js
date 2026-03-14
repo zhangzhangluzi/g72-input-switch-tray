@@ -1,4 +1,4 @@
-const { app, Tray, Menu, nativeImage, Notification, dialog, shell } = require("electron");
+const { app, Tray, Menu, nativeImage, Notification, dialog, shell, screen } = require("electron");
 const { execFile } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -8,6 +8,7 @@ const path = require("node:path");
 
 const APP_NAME = "显示器输入切换";
 const PREFERRED_CONTROL_PORT = 3847;
+const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
 const TARGET_IDS = ["windows", "mac"];
 const COMMON_INPUT_VALUES = [
   { value: 15, label: "15: DP1" },
@@ -25,7 +26,12 @@ let tray = null;
 let controlServer = null;
 let controlServerError = null;
 let activeControlPort = PREFERRED_CONTROL_PORT;
+let windowsRestoreTimer = null;
+let windowsRestoreInFlight = false;
 let state = createDefaultState();
+
+// Suppress noisy Chromium network-change logs on some Windows systems.
+app.commandLine.appendSwitch("log-level", "3");
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -45,6 +51,11 @@ app.on("before-quit", () => {
   if (controlServer) {
     controlServer.close();
   }
+
+  if (windowsRestoreTimer) {
+    clearInterval(windowsRestoreTimer);
+    windowsRestoreTimer = null;
+  }
 });
 
 app.whenReady().then(() => {
@@ -55,6 +66,7 @@ app.whenReady().then(() => {
   state = loadState();
   saveState(state);
   startControlServer();
+  startWindowsRestoreWatcher();
   createTray();
   refreshMenu();
 });
@@ -98,6 +110,14 @@ function refreshMenu() {
       label: `当前显示器：${state.config.monitorName || "未设置"}`,
       enabled: false,
     },
+    ...(process.platform === "win32" && state.windowsDesktop.pendingRestore
+      ? [
+          {
+            label: `Windows 桌面：已交给副屏，等待 ${state.config.monitorName || "目标显示器"} 回来后自动恢复`,
+            enabled: false,
+          },
+        ]
+      : []),
     {
       label: controlServerError
         ? `设置页：启动失败（${controlServerError.code || "未知错误"}）`
@@ -210,6 +230,13 @@ async function switchMonitor(targetId, options = {}) {
 }
 
 async function switchOnWindows(targetId, target) {
+  const useDisplayHandoff = shouldUseWindowsDisplayHandoff(state.config);
+
+  if (useDisplayHandoff && targetId === "windows") {
+    await restoreWindowsDesktopToTargetMonitor();
+    clearPendingWindowsDesktopRestore();
+  }
+
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
   const candidates = getInputCandidates(target);
 
@@ -229,6 +256,12 @@ async function switchOnWindows(targetId, target) {
     if (index < candidates.length - 1) {
       await delay(300);
     }
+  }
+
+  if (useDisplayHandoff && targetId !== "windows") {
+    await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
+    await handOffWindowsDesktop();
+    markPendingWindowsDesktopRestore();
   }
 }
 
@@ -504,6 +537,9 @@ function buildConfigFromForm(form) {
     monitorName: normalizeText(form.get("monitorName")),
     macDisplayIndex: normalizePositiveInteger(form.get("macDisplayIndex"), 1),
     compatibilityMode: parseCompatibilityMode(form.get("compatibilityMode")),
+    windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
+      form.get("windowsDisplayHandoffMode")
+    ),
     targets: {
       windows: {
         label: normalizeText(form.get("windowsLabel")),
@@ -535,6 +571,10 @@ function getConfigValidationErrors(config) {
 
   if (!["auto", "off", "samsung_mstar"].includes(config.compatibilityMode)) {
     errors.push("兼容模式配置无效。");
+  }
+
+  if (!["auto", "off", "external"].includes(config.windowsDisplayHandoffMode)) {
+    errors.push("Windows 桌面联动配置无效。");
   }
 
   for (const targetId of TARGET_IDS) {
@@ -835,13 +875,28 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics) {
           <label>
             兼容模式
             <select name="compatibilityMode">
-              ${renderCompatibilityOption("auto", "自动判断", state.config.compatibilityMode)}
-              ${renderCompatibilityOption("off", "关闭兼容补发", state.config.compatibilityMode)}
-              ${renderCompatibilityOption("samsung_mstar", "Samsung / MStar", state.config.compatibilityMode)}
+              ${renderNamedOption("auto", "自动判断", state.config.compatibilityMode)}
+              ${renderNamedOption("off", "关闭兼容补发", state.config.compatibilityMode)}
+              ${renderNamedOption("samsung_mstar", "Samsung / MStar", state.config.compatibilityMode)}
             </select>
           </label>
           <div class="help">
             对部分 Samsung / MStar 显示器，标准值不会直接生效。开启兼容后，应用会自动补发一组三星常见替代值。
+          </div>
+          <label>
+            Windows 桌面联动
+            <select name="windowsDisplayHandoffMode">
+              ${renderNamedOption("auto", "自动判断", state.config.windowsDisplayHandoffMode)}
+              ${renderNamedOption("off", "关闭联动", state.config.windowsDisplayHandoffMode)}
+              ${renderNamedOption(
+                "external",
+                "切到模式 B 时改为仅用副屏",
+                state.config.windowsDisplayHandoffMode
+              )}
+            </select>
+          </label>
+          <div class="help">
+            只影响 Windows 版。启用后，切到模式 B 时应用会调用系统“仅第二屏幕”把桌面迁到剩余屏幕；等目标显示器回到 Windows 后，再自动恢复扩展显示。
           </div>
           <div class="card soft">
             <div class="section-title">模式 A</div>
@@ -936,6 +991,9 @@ function renderMonitorDiagnostics(diagnostics) {
   const compatibilityHelp = shouldUseSamsungMstarCompat(state.config)
     ? "当前已启用 Samsung / MStar 兼容补发。像这台 G72 这种切走后仍会保持 Windows 连接的屏，兼容补发比“判断是否断开”更可靠。"
     : "如果这台屏手动菜单能切、软件却没反应，建议把兼容模式改成 Samsung / MStar 再试。";
+  const windowsHandoffHelp = shouldUseWindowsDisplayHandoff(state.config)
+    ? "当前已启用 Windows 桌面联动。切到模式 B 后，应用会把 Windows 改成仅用剩余屏幕；等这台屏回到 Windows 后，再自动恢复扩展显示。"
+    : "如果切到另一台设备后 Windows 主屏内容还留在原位，可以把“Windows 桌面联动”改成自动判断或强制开启。";
 
   return `<div class="card soft">
     <div class="section-title">显示器诊断</div>
@@ -946,6 +1004,7 @@ function renderMonitorDiagnostics(diagnostics) {
     <div class="help" style="margin-top: 12px;">${currentValueLine}</div>
     <div class="help">${currentValueHelp}</div>
     <div class="help">${compatibilityHelp}</div>
+    <div class="help">${windowsHandoffHelp}</div>
   </div>`;
 }
 
@@ -1196,6 +1255,11 @@ function parseCompatibilityMode(value) {
   return ["auto", "off", "samsung_mstar"].includes(normalized) ? normalized : "auto";
 }
 
+function parseWindowsDisplayHandoffMode(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  return ["auto", "off", "external"].includes(normalized) ? normalized : "auto";
+}
+
 function parseInputValue(value) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isInteger(parsed) ? parsed : NaN;
@@ -1231,7 +1295,7 @@ function describeInputValue(value) {
   return knownLabel ? `${knownLabel} (${value})` : `输入值 ${value}`;
 }
 
-function renderCompatibilityOption(value, label, selectedValue) {
+function renderNamedOption(value, label, selectedValue) {
   return `<option value="${escapeHtml(value)}"${value === selectedValue ? " selected" : ""}>${escapeHtml(label)}</option>`;
 }
 
@@ -1263,16 +1327,36 @@ function shouldUseSamsungMstarCompat(config) {
   return /\b(g7|g72|odyssey|samsung)\b/i.test(config.monitorName);
 }
 
+function shouldUseWindowsDisplayHandoff(config) {
+  if (process.platform !== "win32") {
+    return false;
+  }
+
+  if (config.windowsDisplayHandoffMode === "external") {
+    return true;
+  }
+
+  if (config.windowsDisplayHandoffMode === "off") {
+    return false;
+  }
+
+  try {
+    return screen.getAllDisplays().length === 2;
+  } catch {
+    return false;
+  }
+}
+
 function getSamsungMstarCandidates(inputValue) {
   switch (inputValue) {
     case 17:
-      return [5, 6];
+      return [6];
     case 18:
-      return [6, 5];
+      return [5];
     case 15:
-      return [3, 7];
+      return [3];
     case 16:
-      return [7, 9];
+      return [9, 7];
     default:
       return [];
   }
@@ -1287,6 +1371,43 @@ function notify(body) {
     title: APP_NAME,
     body,
   }).show();
+}
+
+async function handOffWindowsDesktop() {
+  await runWindowsDisplaySwitch("/external");
+  await waitForDisplayCount(1, "Windows 没有切成仅用副屏。");
+}
+
+async function restoreWindowsDesktopToTargetMonitor() {
+  await runWindowsDisplaySwitch("/extend");
+  await waitForDisplayCount(2, "Windows 没有恢复到扩展显示。");
+}
+
+function runWindowsDisplaySwitch(mode) {
+  const displaySwitchPath = path.join(
+    process.env.WINDIR || "C:\\Windows",
+    "System32",
+    "DisplaySwitch.exe"
+  );
+  return runCommand(displaySwitchPath, [mode]);
+}
+
+async function waitForDisplayCount(expectedCount, errorMessage) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < 8000) {
+    try {
+      if (screen.getAllDisplays().length === expectedCount) {
+        return;
+      }
+    } catch {
+      // Ignore transient display enumeration failures while Windows is reconfiguring.
+    }
+
+    await delay(250);
+  }
+
+  throw new Error(errorMessage);
 }
 
 function runCommand(file, args, options = {}) {
@@ -1329,11 +1450,91 @@ function getBundledResourcePath(...segments) {
   return path.join(app.getAppPath(), "resources", ...segments);
 }
 
+function startWindowsRestoreWatcher() {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const scheduleAttempt = () => {
+    void attemptPendingWindowsDesktopRestore();
+  };
+
+  screen.on("display-added", scheduleAttempt);
+  screen.on("display-removed", scheduleAttempt);
+
+  windowsRestoreTimer = setInterval(scheduleAttempt, 2500);
+  scheduleAttempt();
+}
+
+async function attemptPendingWindowsDesktopRestore() {
+  if (process.platform !== "win32" || windowsRestoreInFlight || !state.windowsDesktop.pendingRestore) {
+    return;
+  }
+
+  if (getWindowsDisplayCount() >= 2) {
+    clearPendingWindowsDesktopRestore();
+    notify(`已检测到 ${state.config.monitorName} 回到 Windows，桌面已恢复为扩展显示。`);
+    return;
+  }
+
+  windowsRestoreInFlight = true;
+
+  try {
+    const names = await getAvailableMonitorNames();
+    if (!names.includes(state.config.monitorName)) {
+      return;
+    }
+
+    await restoreWindowsDesktopToTargetMonitor();
+    clearPendingWindowsDesktopRestore();
+    notify(`已检测到 ${state.config.monitorName} 回到 Windows，桌面已恢复为扩展显示。`);
+  } catch {
+    // Keep waiting. The monitor may have reappeared but not finished handshaking yet.
+  } finally {
+    windowsRestoreInFlight = false;
+  }
+}
+
+function markPendingWindowsDesktopRestore() {
+  if (state.windowsDesktop.pendingRestore) {
+    return;
+  }
+
+  state.windowsDesktop.pendingRestore = true;
+  saveState(state);
+  refreshMenu();
+}
+
+function clearPendingWindowsDesktopRestore() {
+  if (!state.windowsDesktop.pendingRestore) {
+    return;
+  }
+
+  state.windowsDesktop.pendingRestore = false;
+  saveState(state);
+  refreshMenu();
+}
+
+function getWindowsDisplayCount() {
+  try {
+    return screen.getAllDisplays().length;
+  } catch {
+    return 0;
+  }
+}
+
 function createDefaultState() {
   return {
     lastTarget: null,
     controlToken: crypto.randomBytes(12).toString("hex"),
+    windowsDesktop: createDefaultWindowsDesktopState(),
     config: createDefaultConfig(),
+  };
+}
+
+function createDefaultWindowsDesktopState() {
+  return {
+    pendingRestore: false,
   };
 }
 
@@ -1342,6 +1543,7 @@ function createDefaultConfig() {
     monitorName: "G72",
     macDisplayIndex: 1,
     compatibilityMode: "auto",
+    windowsDisplayHandoffMode: "auto",
     targets: {
       windows: {
         label: "Windows（DP2）",
@@ -1371,10 +1573,16 @@ function normalizeState(nextState) {
   return {
     lastTarget: TARGET_IDS.includes(nextState.lastTarget) ? nextState.lastTarget : null,
     controlToken: normalizeText(nextState.controlToken) || defaults.controlToken,
+    windowsDesktop: {
+      pendingRestore: Boolean(nextState.windowsDesktop?.pendingRestore),
+    },
     config: {
       monitorName: normalizeText(rawConfig.monitorName) || defaults.config.monitorName,
       macDisplayIndex: normalizePositiveInteger(rawConfig.macDisplayIndex, defaults.config.macDisplayIndex),
       compatibilityMode: parseCompatibilityMode(rawConfig.compatibilityMode || defaults.config.compatibilityMode),
+      windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
+        rawConfig.windowsDisplayHandoffMode || defaults.config.windowsDisplayHandoffMode
+      ),
       targets: {
         windows: {
           label: normalizeText(rawTargets.windows?.label) || defaults.config.targets.windows.label,

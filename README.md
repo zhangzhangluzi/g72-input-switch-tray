@@ -10,6 +10,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - Built-in local browser settings page for choosing the monitor name, macOS display index, and two input profiles
 - The tray/menu shows the last requested switch target, not a guaranteed real-time input readback
 - Optional Samsung / MStar compatibility mode for monitors whose real input-switch values do not match the standard MCCS values
+- Optional Windows desktop handoff mode that moves the desktop to the remaining screen when the target monitor switches away, then restores extend mode when that monitor comes back
 - Optional launch at login
 - Windows uninstall entry via the packaged NSIS uninstaller
 - macOS self-uninstall command from the app menu
@@ -27,6 +28,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - Some monitors do not report a trustworthy “current input” value over DDC/CI. The app now treats the tray state as the last command sent, and the settings page shows monitor diagnostics when Windows can read them.
 - Some monitors, especially Samsung / MStar models, continue reporting an active connection to the current computer even after the picture switches away. The app no longer treats “still attached” as a failure for those screens.
 - For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
+- On Windows, desktop handoff uses the system display switcher to move the desktop off the departing monitor, and retries extend mode until that monitor is available again.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching prefers a bundled `ddcctl` binary built during the macOS GitHub Actions release job.
 - If the bundled macOS helper is unavailable, the app falls back to `betterdisplaycli` and then `ddcctl` from `PATH`.
