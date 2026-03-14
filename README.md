@@ -25,6 +25,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - macOS switching prefers a bundled `ddcctl` binary built during the macOS GitHub Actions release job.
 - If the bundled macOS helper is unavailable, the app falls back to `betterdisplaycli` and then `ddcctl` from `PATH`.
 - The app starts local pages on port `3847` and binds to `127.0.0.1`.
+- If port `3847` is unavailable on Windows, the local pages automatically fall back to another free local port.
 - macOS does not provide a hidden-screen self-recovery workflow. It only switches while the current Mac still has a visible picture and can launch the app/menu.
 
 ## Development

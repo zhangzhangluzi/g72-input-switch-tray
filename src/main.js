@@ -7,7 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const APP_NAME = "显示器输入切换";
-const CONTROL_PORT = 3847;
+const PREFERRED_CONTROL_PORT = 3847;
 const TARGET_IDS = ["windows", "mac"];
 const COMMON_INPUT_VALUES = [
   { value: 15, label: "15: DP1" },
@@ -21,6 +21,7 @@ const COMMON_INPUT_VALUES = [
 let tray = null;
 let controlServer = null;
 let controlServerError = null;
+let activeControlPort = PREFERRED_CONTROL_PORT;
 let state = createDefaultState();
 
 if (!app.requestSingleInstanceLock()) {
@@ -322,6 +323,7 @@ rm -f "$0"
 
 function startControlServer() {
   controlServerError = null;
+  activeControlPort = PREFERRED_CONTROL_PORT;
   controlServer = http.createServer((request, response) => {
     handleControlRequest(request, response).catch((error) => {
       if (response.headersSent) {
@@ -334,14 +336,27 @@ function startControlServer() {
     });
   });
 
+  let fallbackAttempted = false;
+
   controlServer.on("error", (error) => {
+    if (!fallbackAttempted && isRecoverablePortError(error)) {
+      fallbackAttempted = true;
+      setImmediate(() => {
+        if (controlServer) {
+          controlServer.listen(0, "127.0.0.1");
+        }
+      });
+      return;
+    }
+
     controlServerError = error;
     controlServer = null;
     refreshMenu();
     notify(`本机页面启动失败：${error.message}`);
   });
 
-  controlServer.listen(CONTROL_PORT, "127.0.0.1", () => {
+  controlServer.listen(PREFERRED_CONTROL_PORT, "127.0.0.1", () => {
+    activeControlPort = getListeningPort();
     controlServerError = null;
     refreshMenu();
   });
@@ -982,6 +997,21 @@ function summarizeControlAddress(url) {
   }
 }
 
+function isRecoverablePortError(error) {
+  return error && ["EACCES", "EADDRINUSE"].includes(error.code);
+}
+
+function getListeningPort() {
+  if (!controlServer) {
+    return PREFERRED_CONTROL_PORT;
+  }
+
+  const address = controlServer.address();
+  return address && typeof address === "object" && address.port
+    ? address.port
+    : PREFERRED_CONTROL_PORT;
+}
+
 function getTarget(targetId) {
   return state.config.targets[targetId];
 }
@@ -999,11 +1029,11 @@ function getSettingsPath() {
 }
 
 function getLocalControlUrl() {
-  return `http://127.0.0.1:${CONTROL_PORT}${getControlPath()}`;
+  return `http://127.0.0.1:${activeControlPort}${getControlPath()}`;
 }
 
 function getLocalSettingsUrl() {
-  return `http://127.0.0.1:${CONTROL_PORT}${getSettingsPath()}`;
+  return `http://127.0.0.1:${activeControlPort}${getSettingsPath()}`;
 }
 
 function writeHtml(response, statusCode, html) {
