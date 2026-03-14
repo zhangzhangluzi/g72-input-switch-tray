@@ -301,61 +301,224 @@ function Get-FriendlyNameMap {
     return $friendlyNameMap
 }
 
-$friendlyNameMap = Get-FriendlyNameMap
-$logicalMonitors = [NativeDisplayMapper]::EnumerateLogicalMonitors()
-$availableMonitors = @()
-$targetLogicalMonitor = $null
+function Normalize-MonitorToken {
+    param(
+        [string]$Value
+    )
 
-foreach ($logicalMonitor in $logicalMonitors) {
-    $friendlyName = $null
-    if ($friendlyNameMap.ContainsKey($logicalMonitor.DisplayProductCode.ToUpperInvariant())) {
-        $friendlyName = $friendlyNameMap[$logicalMonitor.DisplayProductCode.ToUpperInvariant()]
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
     }
 
-    $availableMonitors += if ([string]::IsNullOrWhiteSpace($friendlyName)) {
-        $logicalMonitor.DisplayProductCode
-    } else {
-        $friendlyName
-    }
-
-    if ($friendlyName -eq $MonitorName) {
-        $targetLogicalMonitor = $logicalMonitor
-    }
+    return (($Value -replace '[^0-9A-Za-z]+', '')).ToUpperInvariant()
 }
 
-if ($null -eq $targetLogicalMonitor) {
-    $availableText = if ($availableMonitors.Count -gt 0) {
-        $availableMonitors -join ", "
-    } else {
-        "<none>"
+function Get-MonitorEntries {
+    param(
+        [array]$LogicalMonitors,
+        [hashtable]$FriendlyNameMap
+    )
+
+    $entries = @()
+
+    foreach ($logicalMonitor in $LogicalMonitors) {
+        $friendlyName = $null
+        $productCodeKey = [string]$logicalMonitor.DisplayProductCode
+        if (-not [string]::IsNullOrWhiteSpace($productCodeKey)) {
+            $productCodeKey = $productCodeKey.ToUpperInvariant()
+        }
+
+        if ($FriendlyNameMap.ContainsKey($productCodeKey)) {
+            $friendlyName = $FriendlyNameMap[$productCodeKey]
+        }
+
+        $displayName = if ([string]::IsNullOrWhiteSpace($friendlyName)) {
+            $logicalMonitor.DisplayProductCode
+        } else {
+            $friendlyName
+        }
+
+        $entries += [pscustomobject]@{
+            LogicalMonitor        = $logicalMonitor
+            FriendlyName          = $friendlyName
+            DisplayName           = $displayName
+            ProductCode           = $logicalMonitor.DisplayProductCode
+            NormalizedDisplayName = Normalize-MonitorToken $displayName
+            NormalizedProductCode = Normalize-MonitorToken $logicalMonitor.DisplayProductCode
+        }
     }
 
+    return @($entries)
+}
+
+function Get-AvailableMonitorNames {
+    param(
+        [array]$MonitorEntries
+    )
+
+    $names = @()
+
+    foreach ($entry in $MonitorEntries) {
+        if (-not [string]::IsNullOrWhiteSpace($entry.DisplayName)) {
+            $names += $entry.DisplayName
+        }
+    }
+
+    return @($names | Sort-Object -Unique)
+}
+
+function Select-TargetMonitorEntry {
+    param(
+        [array]$MonitorEntries,
+        [string]$MonitorName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($MonitorName)) {
+        return $null
+    }
+
+    $requestedName = $MonitorName.Trim()
+    $requestedToken = Normalize-MonitorToken $requestedName
+    $exactMatches = @(
+        $MonitorEntries | Where-Object {
+            $_.DisplayName -ieq $requestedName -or $_.ProductCode -ieq $requestedName
+        }
+    )
+
+    if ($exactMatches.Count -eq 1) {
+        return $exactMatches[0]
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($requestedToken)) {
+        $normalizedMatches = @(
+            $MonitorEntries | Where-Object {
+                $_.NormalizedDisplayName -eq $requestedToken -or $_.NormalizedProductCode -eq $requestedToken
+            }
+        )
+
+        if ($normalizedMatches.Count -eq 1) {
+            return $normalizedMatches[0]
+        }
+
+        $partialMatches = @(
+            $MonitorEntries | Where-Object {
+                ($_.NormalizedDisplayName.Length -gt 0 -and (
+                    $_.NormalizedDisplayName.Contains($requestedToken) -or
+                    $requestedToken.Contains($_.NormalizedDisplayName)
+                )) -or
+                ($_.NormalizedProductCode.Length -gt 0 -and (
+                    $_.NormalizedProductCode.Contains($requestedToken) -or
+                    $requestedToken.Contains($_.NormalizedProductCode)
+                ))
+            }
+        )
+
+        if ($partialMatches.Count -eq 1) {
+            return $partialMatches[0]
+        }
+    }
+
+    if ($MonitorEntries.Count -eq 1) {
+        return $MonitorEntries[0]
+    }
+
+    return $null
+}
+
+function Resolve-ErrorMessage {
+    param(
+        $ErrorRecord
+    )
+
+    if ($null -eq $ErrorRecord) {
+        return "Unknown error."
+    }
+
+    $message = $ErrorRecord.Exception.Message
+    if ([string]::IsNullOrWhiteSpace($message)) {
+        $message = [string]$ErrorRecord
+    }
+
+    return $message.Trim()
+}
+
+try {
+    $friendlyNameMap = Get-FriendlyNameMap
+    $logicalMonitors = [NativeDisplayMapper]::EnumerateLogicalMonitors()
+    $monitorEntries = Get-MonitorEntries -LogicalMonitors $logicalMonitors -FriendlyNameMap $friendlyNameMap
+    $availableMonitors = Get-AvailableMonitorNames -MonitorEntries $monitorEntries
+
     if ($ListOnly) {
-        $uniqueMonitors = $availableMonitors | Sort-Object -Unique
-        Write-Output ($uniqueMonitors | ConvertTo-Json -Compress)
+        Write-Output (ConvertTo-Json -InputObject @($availableMonitors) -Compress)
         exit 0
     }
 
-    throw "No monitor matched '$MonitorName'. Available monitors: $availableText"
-}
+    $targetMonitorEntry = Select-TargetMonitorEntry -MonitorEntries $monitorEntries -MonitorName $MonitorName
+    if ($null -eq $targetMonitorEntry) {
+        $availableText = if ($availableMonitors.Count -gt 0) {
+            $availableMonitors -join ", "
+        } else {
+            "<none>"
+        }
 
-$physicalMonitors = [NativeDisplayMapper]::GetPhysicalMonitorsForDisplay($targetLogicalMonitor.HMonitor)
-if ($physicalMonitors.Length -eq 0) {
-    throw "No physical monitor handles were found for '$MonitorName'."
-}
+        throw "No monitor matched '$MonitorName'. Available monitors: $availableText"
+    }
 
-if ($ReadInputValue) {
+    $targetLogicalMonitor = $targetMonitorEntry.LogicalMonitor
+    $targetDisplayName = $targetMonitorEntry.DisplayName
+    $physicalMonitors = [NativeDisplayMapper]::GetPhysicalMonitorsForDisplay($targetLogicalMonitor.HMonitor)
+    if ($physicalMonitors.Length -eq 0) {
+        throw "No physical monitor handles were found for '$targetDisplayName'."
+    }
+
+    if ($ReadInputValue) {
+        try {
+            foreach ($physicalMonitor in $physicalMonitors) {
+                $currentValue = 0
+                $maximumValue = 0
+                if ([NativeDisplayMapper]::TryGetInput($physicalMonitor, [ref]$currentValue, [ref]$maximumValue)) {
+                    Write-Output (@{
+                        monitor = $targetDisplayName
+                        currentInputValue = [int]$currentValue
+                        maximumValue = [int]$maximumValue
+                    } | ConvertTo-Json -Compress)
+                    exit 0
+                }
+            }
+        }
+        finally {
+            [NativeDisplayMapper]::ReleasePhysicalMonitors($physicalMonitors)
+        }
+
+        throw "Reading VCP 0x60 failed for '$targetDisplayName'."
+    }
+
+    if ($ReadCapabilities) {
+        try {
+            foreach ($physicalMonitor in $physicalMonitors) {
+                $capabilities = [NativeDisplayMapper]::GetCapabilities($physicalMonitor)
+                if (-not [string]::IsNullOrWhiteSpace($capabilities)) {
+                    Write-Output (@{
+                        monitor = $targetDisplayName
+                        capabilities = $capabilities
+                    } | ConvertTo-Json -Compress)
+                    exit 0
+                }
+            }
+        }
+        finally {
+            [NativeDisplayMapper]::ReleasePhysicalMonitors($physicalMonitors)
+        }
+
+        throw "Reading capabilities failed for '$targetDisplayName'."
+    }
+
+    $switchSucceeded = $false
+
     try {
         foreach ($physicalMonitor in $physicalMonitors) {
-            $currentValue = 0
-            $maximumValue = 0
-            if ([NativeDisplayMapper]::TryGetInput($physicalMonitor, [ref]$currentValue, [ref]$maximumValue)) {
-                Write-Output (@{
-                    monitor = $MonitorName
-                    currentInputValue = [int]$currentValue
-                    maximumValue = [int]$maximumValue
-                } | ConvertTo-Json -Compress)
-                exit 0
+            if ([NativeDisplayMapper]::SetInput($physicalMonitor, [uint32]$InputValue)) {
+                $switchSucceeded = $true
             }
         }
     }
@@ -363,44 +526,13 @@ if ($ReadInputValue) {
         [NativeDisplayMapper]::ReleasePhysicalMonitors($physicalMonitors)
     }
 
-    throw "Reading VCP 0x60 failed for '$MonitorName'."
-}
-
-if ($ReadCapabilities) {
-    try {
-        foreach ($physicalMonitor in $physicalMonitors) {
-            $capabilities = [NativeDisplayMapper]::GetCapabilities($physicalMonitor)
-            if (-not [string]::IsNullOrWhiteSpace($capabilities)) {
-                Write-Output (@{
-                    monitor = $MonitorName
-                    capabilities = $capabilities
-                } | ConvertTo-Json -Compress)
-                exit 0
-            }
-        }
-    }
-    finally {
-        [NativeDisplayMapper]::ReleasePhysicalMonitors($physicalMonitors)
+    if (-not $switchSucceeded) {
+        throw "Setting VCP 0x60 to value $InputValue failed for '$targetDisplayName'."
     }
 
-    throw "Reading capabilities failed for '$MonitorName'."
+    Write-Output "OK"
 }
-
-$switchSucceeded = $false
-
-try {
-    foreach ($physicalMonitor in $physicalMonitors) {
-        if ([NativeDisplayMapper]::SetInput($physicalMonitor, [uint32]$InputValue)) {
-            $switchSucceeded = $true
-        }
-    }
+catch {
+    [Console]::Error.WriteLine((Resolve-ErrorMessage $_))
+    exit 1
 }
-finally {
-    [NativeDisplayMapper]::ReleasePhysicalMonitors($physicalMonitors)
-}
-
-if (-not $switchSucceeded) {
-    throw "Setting VCP 0x60 to value $InputValue failed for '$MonitorName'."
-}
-
-Write-Output "OK"

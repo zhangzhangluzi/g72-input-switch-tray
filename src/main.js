@@ -303,14 +303,16 @@ async function switchMonitor(targetId, options = {}) {
       notify(`已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
     }
   } catch (error) {
+    const userFacingError = createUserFacingSwitchError(targetId, error);
+
     if (showErrorDialog) {
       dialog.showErrorBox(
         APP_NAME,
-        `${target.label} 切换命令发送失败。\n\n${error.message}`
+        `${target.label} 切换命令发送失败。\n\n${userFacingError.message}`
       );
     }
 
-    throw error;
+    throw userFacingError;
   }
 }
 
@@ -325,8 +327,8 @@ async function switchOnWindows(targetId, target) {
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
   const candidates = getInputCandidates(target);
 
-  for (let index = 0; index < candidates.length; index += 1) {
-    await runCommand("powershell.exe", [
+  await runCandidateSequence(candidates, (candidate) =>
+    runCommand("powershell.exe", [
       "-NoProfile",
       "-ExecutionPolicy",
       "Bypass",
@@ -335,13 +337,9 @@ async function switchOnWindows(targetId, target) {
       "-MonitorName",
       state.config.monitorName,
       "-InputValue",
-      String(candidates[index]),
-    ]);
-
-    if (index < candidates.length - 1) {
-      await delay(300);
-    }
-  }
+      String(candidate),
+    ])
+  );
 
   if (useDisplayHandoff && targetId !== "windows") {
     await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
@@ -361,6 +359,89 @@ function switchOnMac(target) {
       },
     })
   );
+}
+
+function createUserFacingSwitchError(targetId, error) {
+  const rawMessage = normalizeText(error?.message);
+  const formattedMessage = formatSwitchErrorMessage(targetId, rawMessage);
+
+  if (!formattedMessage || formattedMessage === rawMessage) {
+    return error;
+  }
+
+  const nextError = new Error(formattedMessage);
+  nextError.cause = error;
+  return nextError;
+}
+
+function formatSwitchErrorMessage(targetId, rawMessage) {
+  if (!rawMessage) {
+    return "切换失败。请打开设置页检查当前配置。";
+  }
+
+  if (process.platform === "darwin") {
+    return formatMacSwitchErrorMessage(targetId, rawMessage);
+  }
+
+  if (process.platform === "win32") {
+    return formatWindowsSwitchErrorMessage(rawMessage);
+  }
+
+  return rawMessage;
+}
+
+function formatMacSwitchErrorMessage(targetId, rawMessage) {
+  const betterDisplayMismatchMatch = /^BetterDisplay 已发送输入切换命令，但当前输入仍是 ([0-9]+)，未匹配目标值集合：([0-9 ]+)$/u.exec(
+    rawMessage
+  );
+  if (betterDisplayMismatchMatch) {
+    const currentValue = Number.parseInt(betterDisplayMismatchMatch[1], 10);
+    const expectedValues = betterDisplayMismatchMatch[2].trim().split(/\s+/).join(" / ");
+    const target = getTarget(targetId);
+    return `显示器仍停留在 ${describeInputValue(
+      currentValue
+    )}。这通常说明 ${getTargetSlotName(
+      targetId
+    )} 的输入值还没配对，而不是命令没有发出去。请到设置页里的“输入值探测助手”为 ${target.label} 测试并保存正确值。当前候选集合：${expectedValues}。`;
+  }
+
+  if (/^Failed\.?$/i.test(rawMessage)) {
+    return `底层工具只返回了“Failed.”。请打开设置页里的“输入值探测助手”，重新确认 ${getTargetSlotName(
+      targetId
+    )} 的输入值。`;
+  }
+
+  return rawMessage;
+}
+
+function formatWindowsSwitchErrorMessage(rawMessage) {
+  const missingMonitorMatch = /^No monitor matched '([^']+)'\. Available monitors: (.+)$/i.exec(rawMessage);
+  if (missingMonitorMatch) {
+    const requestedName = missingMonitorMatch[1];
+    const availableText = missingMonitorMatch[2];
+
+    if (availableText === "<none>") {
+      return "Windows 当前没有发现可控的外接显示器。请确认显示器已连接、已亮屏，并且显示器里开启了 DDC/CI。";
+    }
+
+    return `Windows 当前没有找到名为“${requestedName}”的显示器。现在检测到的是：${availableText}。请把设置页里的“显示器名称”改成其中一个检测值后再试。`;
+  }
+
+  const noPhysicalHandleMatch = /^No physical monitor handles were found for '([^']+)'\.$/i.exec(rawMessage);
+  if (noPhysicalHandleMatch) {
+    return `Windows 找到了“${noPhysicalHandleMatch[1]}”，但没有拿到可控的物理显示器句柄。请确认它是支持 DDC/CI 的外接显示器，并在显示器菜单里开启 DDC/CI。`;
+  }
+
+  const setInputFailedMatch = /^Setting VCP 0x60 to value ([0-9]+) failed for '([^']+)'\.$/i.exec(rawMessage);
+  if (setInputFailedMatch) {
+    return `Windows 已找到“${setInputFailedMatch[2]}”，但显示器拒绝了输入值 ${setInputFailedMatch[1]}。请确认 DDC/CI 已开启，并检查模式 A / 模式 B 的输入值是否填对。`;
+  }
+
+  if (/^Failed\.?$/i.test(rawMessage)) {
+    return "Windows 底层命令只返回了“Failed.”。请先到设置页确认显示器名称和输入值，再重新尝试切换。";
+  }
+
+  return rawMessage;
 }
 
 function uninstallApp() {
@@ -971,7 +1052,15 @@ async function getAvailableMonitorNames() {
       "-ListOnly",
     ]);
     const parsed = JSON.parse(output);
-    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+    if (Array.isArray(parsed)) {
+      return parsed.filter(Boolean);
+    }
+
+    if (typeof parsed === "string" && parsed.trim()) {
+      return [parsed.trim()];
+    }
+
+    return [];
   } catch {
     return [];
   }
@@ -1338,7 +1427,21 @@ function renderMonitorHints(monitorNames) {
     return `<div class="help">当前平台没有自动列出显示器名称时，直接手动填写即可。若切换失败，错误提示里也会告诉你当前可用名称。</div>`;
   }
 
+  const configuredName = normalizeText(state.config.monitorName);
+  const hasConfiguredMatch =
+    configuredName &&
+    monitorNames.some((name) => normalizeText(name).toLowerCase() === configuredName.toLowerCase());
+  const mismatchBanner =
+    configuredName && !hasConfiguredMatch
+      ? `<div class="banner error">当前配置填写的是 ${escapeHtml(
+          configuredName
+        )}，但系统检测到的显示器名称是：${monitorNames
+          .map(escapeHtml)
+          .join("、")}。切换失败时，通常就是这个名称没有对上。</div>`
+      : "";
+
   return `<div>
+    ${mismatchBanner}
     <div class="help">当前检测到的显示器名称</div>
     <div class="tip-list">
       ${monitorNames.map((name) => `<span class="pill">${escapeHtml(name)}</span>`).join("")}
@@ -1788,7 +1891,7 @@ async function runCandidateSequence(candidates, runCandidate) {
     } catch (error) {
       lastError = pickMoreInformativeError(lastError, error);
 
-      if (index >= candidates.length - 1) {
+      if (index >= candidates.length - 1 || shouldAbortCandidateRetries(lastError)) {
         throw lastError;
       }
     }
@@ -1801,6 +1904,23 @@ async function runCandidateSequence(candidates, runCandidate) {
   if (lastError) {
     throw lastError;
   }
+}
+
+function shouldAbortCandidateRetries(error) {
+  const message = normalizeText(error?.message);
+
+  if (!message) {
+    return false;
+  }
+
+  return [
+    /^No monitor matched /i,
+    /^MonitorName was not provided\./i,
+    /^No physical monitor handles were found /i,
+    /^Windows 当前没有发现可控的外接显示器/u,
+    /没有可用的 macOS DDC 辅助程序/u,
+    /ddcctl 没有检测到可控制的外接显示器/u,
+  ].some((pattern) => pattern.test(message));
 }
 
 function pickMoreInformativeError(previousError, nextError) {
