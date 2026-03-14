@@ -30,9 +30,12 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
 - On Windows, desktop handoff uses the system display switcher to move the desktop off the departing monitor, and retries extend mode until that monitor is available again.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
-- macOS switching now prefers `betterdisplaycli` when it is available, because name-based matching is more reliable than a fixed display index on some Macs.
+- macOS switching now prefers BetterDisplay command-line control when it is available, because name-based matching is more reliable than a fixed display index on some Macs.
+- If `betterdisplaycli` is not installed but `BetterDisplay.app` is present in `/Applications` or `~/Applications`, the app uses the BetterDisplay bundle binary directly.
+- When BetterDisplay is used for input switching, the app reads the input value back after each write so Samsung / MStar displays can keep falling through to alternate values when the standard MCCS value is acknowledged but does not actually take effect.
+- The macOS settings page now includes a built-in input probe assistant, so you can test candidate input values and write a confirmed value back into Mode A / Mode B without relying on an external script or an AI session.
 - If BetterDisplay CLI is unavailable, the app falls back to the bundled `ddcctl` binary built during the macOS GitHub Actions release job, and then to `ddcctl` from `PATH`.
-- When the app has to use `ddcctl`, it tries the configured macOS display index first and then probes a few common fallback indices automatically.
+- When the app has to use `ddcctl`, it tries the configured macOS display index first, discovers how many external displays `ddcctl` can see, and then probes the remaining valid indices automatically.
 - The app starts a local settings page on port `3847` and binds to `127.0.0.1`.
 - If port `3847` is unavailable on Windows, the local pages automatically fall back to another free local port.
 - macOS does not provide a hidden-screen self-recovery workflow. It only switches while the current Mac still has a visible picture and can launch the app/menu.

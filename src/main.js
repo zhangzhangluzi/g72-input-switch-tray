@@ -25,6 +25,9 @@ const COMMON_INPUT_VALUES = [
 const COMMON_INPUT_LABELS = new Map(
   COMMON_INPUT_VALUES.map((item) => [item.value, item.label.replace(/^\d+:\s*/, "")])
 );
+const MAC_PROBE_COMMON_INPUT_VALUES = Array.from(
+  new Set([...COMMON_INPUT_VALUES.map((item) => item.value), 3, 5, 6, 7, 9])
+);
 
 let tray = null;
 let controlServer = null;
@@ -498,6 +501,8 @@ async function handleControlRequest(request, response) {
   const monitorsPath = `/api/${state.controlToken}/monitors`;
   const windowsPath = `/api/${state.controlToken}/switch/windows`;
   const macPath = `/api/${state.controlToken}/switch/mac`;
+  const macProbePath = `/api/${state.controlToken}/probe/mac`;
+  const macProbeApplyPath = `/api/${state.controlToken}/probe/mac/apply`;
 
   if (requestUrl.pathname === "/health") {
     return writeJson(response, 200, {
@@ -538,13 +543,28 @@ async function handleControlRequest(request, response) {
   }
 
   if (requestUrl.pathname === settingsPath) {
-    const monitors = await getAvailableMonitorNames();
-    const diagnostics = await getMonitorDiagnostics();
-    return writeHtml(response, 200, renderSettingsPage(requestUrl, monitors, diagnostics));
+    const [monitors, diagnostics, macProbeDiagnostics] = await Promise.all([
+      getAvailableMonitorNames(),
+      getMonitorDiagnostics(),
+      getMacProbeDiagnostics(),
+    ]);
+    return writeHtml(
+      response,
+      200,
+      renderSettingsPage(requestUrl, monitors, diagnostics, macProbeDiagnostics)
+    );
   }
 
   if (requestUrl.pathname === configPath && request.method === "POST") {
     return handleConfigSave(request, response, requestUrl);
+  }
+
+  if (requestUrl.pathname === macProbePath && request.method === "POST") {
+    return handleMacProbe(request, response, requestUrl);
+  }
+
+  if (requestUrl.pathname === macProbeApplyPath && request.method === "POST") {
+    return handleMacProbeApply(request, response, requestUrl);
   }
 
   if (requestUrl.pathname === windowsPath) {
@@ -614,6 +634,259 @@ async function handleConfigSave(request, response, requestUrl) {
   });
 }
 
+async function handleMacProbe(request, response, requestUrl) {
+  const body = await readRequestBody(request);
+  const form = new URLSearchParams(body);
+  const targetId = parseTargetId(form.get("targetId"));
+  const candidate = parseInputValue(form.get("candidate"));
+
+  if (process.platform !== "darwin") {
+    state.macInputProbe = createMacInputProbeResult({
+      targetId,
+      candidate,
+      status: "error",
+      message: "输入值探测目前只在 macOS 版本里提供。",
+    });
+    saveState(state);
+    redirectToSettingsPage(response, requestUrl, {});
+    return;
+  }
+
+  if (!targetId) {
+    state.macInputProbe = createMacInputProbeResult({
+      targetId: "windows",
+      candidate,
+      status: "error",
+      message: "请选择要写回的目标模式。",
+    });
+    saveState(state);
+    redirectToSettingsPage(response, requestUrl, {});
+    return;
+  }
+
+  if (!Number.isInteger(candidate) || candidate < 1 || candidate > 255) {
+    state.macInputProbe = createMacInputProbeResult({
+      targetId,
+      candidate: null,
+      status: "error",
+      message: "请输入 1 到 255 的输入值后再测试。",
+    });
+    saveState(state);
+    redirectToSettingsPage(response, requestUrl, {});
+    return;
+  }
+
+  state.macInputProbe = await runMacInputProbe(targetId, candidate);
+  saveState(state);
+  redirectToSettingsPage(response, requestUrl, {});
+}
+
+async function handleMacProbeApply(request, response, requestUrl) {
+  const body = await readRequestBody(request);
+  const form = new URLSearchParams(body);
+  const targetId = parseTargetId(form.get("targetId"));
+  const candidate = parseInputValue(form.get("candidate"));
+
+  if (!targetId || !Number.isInteger(candidate) || candidate < 1 || candidate > 255) {
+    redirectToSettingsPage(response, requestUrl, {
+      status: "error",
+      message: "没有可保存的探测结果。",
+    });
+    return;
+  }
+
+  state.config.targets[targetId].inputValue = candidate;
+  state.macInputProbe = createMacInputProbeResult({
+    targetId,
+    candidate,
+    status: "saved",
+    message: `${getTarget(targetId).label} 的输入值已更新为 ${candidate}。`,
+  });
+  saveState(state);
+  refreshMenu();
+  redirectToSettingsPage(response, requestUrl, {
+    status: "success",
+    message: state.macInputProbe.message,
+  });
+}
+
+async function runMacInputProbe(targetId, candidate) {
+  const beforeResult = await getMacCurrentInputResult();
+  let commandError = "";
+
+  try {
+    await sendMacInputValue(candidate);
+  } catch (error) {
+    commandError = error.message;
+  }
+
+  await delay(250);
+  const afterResult = await getMacCurrentInputResult();
+  const expectedValues = getExpectedProbeInputValues(candidate);
+
+  if (afterResult.ok && expectedValues.includes(afterResult.value)) {
+    return createMacInputProbeResult({
+      targetId,
+      candidate,
+      status: "matched",
+      beforeValue: beforeResult.ok ? beforeResult.value : null,
+      afterValue: afterResult.value,
+      expectedValues,
+      commandError,
+      message: `值 ${candidate} 已命中 ${getTargetSlotName(targetId)} 的候选集合，当前输入回报为 ${describeInputValue(afterResult.value)}。`,
+    });
+  }
+
+  if (afterResult.ok && beforeResult.ok && afterResult.value === beforeResult.value) {
+    return createMacInputProbeResult({
+      targetId,
+      candidate,
+      status: "unchanged",
+      beforeValue: beforeResult.value,
+      afterValue: afterResult.value,
+      expectedValues,
+      commandError,
+      message: `测试 ${candidate} 后，显示器当前输入仍是 ${describeInputValue(afterResult.value)}。`,
+    });
+  }
+
+  if (afterResult.ok) {
+    return createMacInputProbeResult({
+      targetId,
+      candidate,
+      status: "different",
+      beforeValue: beforeResult.ok ? beforeResult.value : null,
+      afterValue: afterResult.value,
+      expectedValues,
+      commandError,
+      message: `测试 ${candidate} 后，当前输入回报为 ${describeInputValue(afterResult.value)}，没有匹配预期集合 ${expectedValues.join(" / ")}。`,
+    });
+  }
+
+  return createMacInputProbeResult({
+    targetId,
+    candidate,
+    status: "inconclusive",
+    beforeValue: beforeResult.ok ? beforeResult.value : null,
+    afterValue: null,
+    expectedValues,
+    commandError,
+    message:
+      commandError ||
+      afterResult.error ||
+      "命令已发送，但目前无法重新读回当前输入值。若画面已经切到另一台设备，请切回后把这个值保存到对应模式。",
+  });
+}
+
+async function getMacProbeDiagnostics() {
+  if (process.platform !== "darwin") {
+    return null;
+  }
+
+  const monitorName = normalizeText(state.config.monitorName);
+  if (!monitorName) {
+    return {
+      monitorName: "",
+      currentInputValue: null,
+      currentInputLabel: null,
+      currentInputError: "先填写显示器名称，再使用输入值探测。",
+      quickCandidateGroups: getMacProbeCandidateGroups(),
+      lastProbe: state.macInputProbe,
+    };
+  }
+
+  const currentInputResult = await getMacCurrentInputResult();
+
+  return {
+    monitorName,
+    currentInputValue: currentInputResult.ok ? currentInputResult.value : null,
+    currentInputLabel: currentInputResult.ok
+      ? describeInputValue(currentInputResult.value)
+      : null,
+    currentInputError: currentInputResult.ok ? null : currentInputResult.error,
+    quickCandidateGroups: getMacProbeCandidateGroups(),
+    lastProbe: state.macInputProbe,
+  };
+}
+
+async function getMacCurrentInputResult() {
+  if (process.platform !== "darwin") {
+    return {
+      ok: false,
+      value: null,
+      error: "当前平台不支持 macOS 输入值读取。",
+    };
+  }
+
+  const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
+
+  try {
+    const output = await runCommand("/bin/sh", [scriptPath, "--query-input"], {
+      env: {
+        DISPLAY_NAME: state.config.monitorName,
+        DISPLAY_INDEX: String(state.config.macDisplayIndex),
+      },
+    });
+    const parsedValue = parseMacInputValueOutput(output);
+
+    if (!Number.isInteger(parsedValue)) {
+      throw new Error(`无法从探测输出里解析输入值：${output}`);
+    }
+
+    return {
+      ok: true,
+      value: parsedValue,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      value: null,
+      error: error.message,
+    };
+  }
+}
+
+function sendMacInputValue(candidate) {
+  const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
+  return runCommand("/bin/sh", [scriptPath, String(candidate)], {
+    env: {
+      DISPLAY_NAME: state.config.monitorName,
+      DISPLAY_INDEX: String(state.config.macDisplayIndex),
+    },
+  });
+}
+
+function parseMacInputValueOutput(output) {
+  const normalized = normalizeText(output);
+  return /^\d+$/.test(normalized) ? Number.parseInt(normalized, 10) : NaN;
+}
+
+function createMacInputProbeResult({
+  targetId = "windows",
+  candidate = null,
+  status = "idle",
+  message = "",
+  beforeValue = null,
+  afterValue = null,
+  expectedValues = [],
+  commandError = "",
+} = {}) {
+  return {
+    targetId,
+    candidate: Number.isInteger(candidate) ? candidate : null,
+    status,
+    message,
+    beforeValue: Number.isInteger(beforeValue) ? beforeValue : null,
+    afterValue: Number.isInteger(afterValue) ? afterValue : null,
+    expectedValues: Array.isArray(expectedValues)
+      ? expectedValues.filter((value) => Number.isInteger(value))
+      : [],
+    commandError: normalizeText(commandError),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 function buildConfigFromForm(form) {
   const config = {
     monitorName: normalizeText(form.get("monitorName")),
@@ -676,6 +949,10 @@ function getConfigValidationErrors(config) {
 
 function getTargetSlotName(targetId) {
   return targetId === "windows" ? "模式 A" : "模式 B";
+}
+
+function parseTargetId(value) {
+  return TARGET_IDS.includes(value) ? value : null;
 }
 
 async function getAvailableMonitorNames() {
@@ -832,12 +1109,13 @@ function redirectToPath(response, requestUrl, pathName, query) {
   response.end();
 }
 
-function renderSettingsPage(requestUrl, monitorNames, diagnostics) {
+function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagnostics) {
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
   const statusHtml = renderSettingsBanner(status, message);
   const monitorHintHtml = renderMonitorHints(monitorNames);
   const diagnosticsHtml = renderMonitorDiagnostics(diagnostics);
+  const macProbeHtml = renderMacProbeAssistant(macProbeDiagnostics);
 
   return `<!doctype html>
 <html lang="zh-Hant">
@@ -909,6 +1187,37 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics) {
       gap: 12px;
       flex-wrap: wrap;
     }
+    .probe-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .probe-buttons form {
+      display: block;
+    }
+    .probe-buttons button {
+      width: auto;
+      min-height: 0;
+      padding: 10px 12px;
+      border-radius: 999px;
+      font-size: 14px;
+    }
+    .probe-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .probe-actions form {
+      display: block;
+      flex: 1 1 220px;
+    }
+    .probe-meta {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
     .link-button {
       display: inline-flex;
       align-items: center;
@@ -937,6 +1246,7 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics) {
     <div class="stack">
       ${statusHtml}
       ${diagnosticsHtml}
+      ${macProbeHtml}
       <div class="card">
         <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/config">
           <label>
@@ -1090,9 +1400,124 @@ function renderMonitorDiagnostics(diagnostics) {
   </div>`;
 }
 
+function renderMacProbeAssistant(macProbeDiagnostics) {
+  if (!macProbeDiagnostics) {
+    return "";
+  }
+
+  const currentInputLine = Number.isInteger(macProbeDiagnostics.currentInputValue)
+    ? `当前 macOS 侧回报输入：${escapeHtml(macProbeDiagnostics.currentInputLabel)}`
+    : "当前 macOS 侧暂时没有读到可用的输入回报值。";
+  const currentInputHelp = macProbeDiagnostics.currentInputError
+    ? `读取失败：${escapeHtml(macProbeDiagnostics.currentInputError)}`
+    : "探测助手会真的向显示器发送输入切换命令。若画面切到另一台设备，请从另一台设备或显示器按键切回后，再回来查看结果。";
+  const lastProbe = state.macInputProbe;
+  const quickGroupsHtml = macProbeDiagnostics.quickCandidateGroups
+    .map((group) => renderMacProbeQuickGroup(group))
+    .join("");
+  const candidateValue = Number.isInteger(lastProbe?.candidate)
+    ? lastProbe.candidate
+    : state.config.targets.windows.inputValue;
+  const resultHtml = renderMacProbeResult(lastProbe);
+  const canApplyProbe = Boolean(
+    lastProbe &&
+      Number.isInteger(lastProbe.candidate) &&
+      ["matched", "different", "inconclusive"].includes(lastProbe.status) &&
+      parseTargetId(lastProbe.targetId)
+  );
+
+  return `<div class="card soft">
+    <div class="section-title">输入值探测助手</div>
+    <div class="help">目标显示器：${escapeHtml(macProbeDiagnostics.monitorName || "未设置")}</div>
+    <div class="probe-meta">
+      <div class="help">${currentInputLine}</div>
+      <div class="help">${currentInputHelp}</div>
+    </div>
+    <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/probe/mac" style="margin-top: 14px;">
+      <div class="two-col">
+        <label>
+          把结果用于
+          <select name="targetId">
+            ${TARGET_IDS.map((targetId) =>
+              renderNamedOption(targetId, getTargetSlotName(targetId), lastProbe?.targetId || "windows")
+            ).join("")}
+          </select>
+        </label>
+        <label>
+          测试输入值
+          <input name="candidate" type="number" min="1" max="255" step="1" value="${escapeHtml(
+            String(candidateValue)
+          )}">
+        </label>
+      </div>
+      <button type="submit" class="secondary">测试这个输入值</button>
+    </form>
+    <div class="help" style="margin-top: 12px;">快捷测试</div>
+    ${quickGroupsHtml}
+    ${resultHtml}
+    ${
+      canApplyProbe
+        ? `<div class="probe-actions">
+            <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/probe/mac/apply">
+              <input type="hidden" name="targetId" value="${escapeHtml(lastProbe.targetId)}">
+              <input type="hidden" name="candidate" value="${escapeHtml(String(lastProbe.candidate))}">
+              <button type="submit">把 ${escapeHtml(
+                String(lastProbe.candidate)
+              )} 保存到 ${escapeHtml(getTargetSlotName(lastProbe.targetId))}</button>
+            </form>
+          </div>`
+        : ""
+    }
+  </div>`;
+}
+
+function renderMacProbeQuickGroup(group) {
+  if (!group.values.length) {
+    return "";
+  }
+
+  return `<div>
+    <div class="help" style="margin-top: 12px;">${escapeHtml(group.title)}</div>
+    <div class="probe-buttons">
+      ${group.values
+        .map(
+          (value) => `<form method="post" action="/api/${encodeURIComponent(state.controlToken)}/probe/mac">
+            <input type="hidden" name="targetId" value="${escapeHtml(group.targetId)}">
+            <input type="hidden" name="candidate" value="${escapeHtml(String(value))}">
+            <button type="submit" class="secondary">${escapeHtml(describeInputValue(value))}</button>
+          </form>`
+        )
+        .join("")}
+    </div>
+  </div>`;
+}
+
+function renderMacProbeResult(result) {
+  if (!result || result.status === "idle") {
+    return "";
+  }
+
+  const statusClass = ["matched", "saved"].includes(result.status) ? "success" : "error";
+  const lines = [escapeHtml(result.message)];
+
+  if (Number.isInteger(result.beforeValue)) {
+    lines.push(`测试前：${escapeHtml(describeInputValue(result.beforeValue))}`);
+  }
+
+  if (Number.isInteger(result.afterValue)) {
+    lines.push(`测试后：${escapeHtml(describeInputValue(result.afterValue))}`);
+  }
+
+  if (result.expectedValues.length > 0) {
+    lines.push(`候选集合：${escapeHtml(result.expectedValues.join(" / "))}`);
+  }
+
+  return `<div class="banner ${statusClass}" style="margin-top: 14px;">${lines.join("<br>")}</div>`;
+}
+
 function renderSettingsBanner(status, message) {
   if (status === "success") {
-    return `<div class="banner success">设置已保存。新的切换规则会立刻生效。</div>`;
+    return `<div class="banner success">${escapeHtml(message || "设置已保存。新的切换规则会立刻生效。")}</div>`;
   }
 
   if (status === "error" && message) {
@@ -1361,10 +1786,10 @@ async function runCandidateSequence(candidates, runCandidate) {
       await runCandidate(candidates[index]);
       return;
     } catch (error) {
-      lastError = error;
+      lastError = pickMoreInformativeError(lastError, error);
 
       if (index >= candidates.length - 1) {
-        throw error;
+        throw lastError;
       }
     }
 
@@ -1376,6 +1801,34 @@ async function runCandidateSequence(candidates, runCandidate) {
   if (lastError) {
     throw lastError;
   }
+}
+
+function pickMoreInformativeError(previousError, nextError) {
+  if (!previousError) {
+    return nextError;
+  }
+
+  return getErrorSpecificityScore(nextError) >= getErrorSpecificityScore(previousError)
+    ? nextError
+    : previousError;
+}
+
+function getErrorSpecificityScore(error) {
+  const message = normalizeText(error?.message);
+
+  if (!message) {
+    return 0;
+  }
+
+  if (/^(failed|error)\.?$/i.test(message)) {
+    return 1;
+  }
+
+  if (/^(usage|用法)[:：]/i.test(message)) {
+    return 5;
+  }
+
+  return Math.min(message.length, 200) + 20;
 }
 
 function escapeHtml(value) {
@@ -1410,6 +1863,33 @@ function getInputCandidates(target) {
   }
 
   return candidates;
+}
+
+function getExpectedProbeInputValues(inputValue) {
+  const candidates = [inputValue];
+
+  for (const candidate of getSamsungMstarCandidates(inputValue)) {
+    if (!candidates.includes(candidate)) {
+      candidates.push(candidate);
+    }
+  }
+
+  return candidates;
+}
+
+function getMacProbeCandidateGroups() {
+  return TARGET_IDS.map((targetId) => {
+    const configuredCandidates = getExpectedProbeInputValues(getTarget(targetId).inputValue);
+    const commonCandidates = MAC_PROBE_COMMON_INPUT_VALUES.filter(
+      (value) => !configuredCandidates.includes(value)
+    );
+
+    return {
+      targetId,
+      title: `${getTargetSlotName(targetId)} 当前候选与常见补充`,
+      values: [...configuredCandidates, ...commonCandidates],
+    };
+  });
 }
 
 function shouldUseSamsungMstarCompat(config) {
@@ -1688,6 +2168,7 @@ function createDefaultState() {
     lastTarget: null,
     controlToken: crypto.randomBytes(12).toString("hex"),
     windowsDesktop: createDefaultWindowsDesktopState(),
+    macInputProbe: createMacInputProbeResult(),
     config: createDefaultConfig(),
   };
 }
@@ -1736,6 +2217,7 @@ function normalizeState(nextState) {
     windowsDesktop: {
       pendingRestore: Boolean(nextState.windowsDesktop?.pendingRestore),
     },
+    macInputProbe: normalizeMacInputProbeState(nextState.macInputProbe, defaults.macInputProbe),
     config: {
       monitorName: normalizeText(rawConfig.monitorName) || defaults.config.monitorName,
       macDisplayIndex: normalizePositiveInteger(rawConfig.macDisplayIndex, defaults.config.macDisplayIndex),
@@ -1755,6 +2237,29 @@ function normalizeState(nextState) {
       },
     },
   };
+}
+
+function normalizeMacInputProbeState(nextProbe, fallbackProbe) {
+  const targetId = parseTargetId(nextProbe?.targetId) || fallbackProbe.targetId;
+  const status = normalizeText(nextProbe?.status) || fallbackProbe.status;
+
+  return {
+    targetId,
+    candidate: normalizeProbeInteger(nextProbe?.candidate),
+    status,
+    message: normalizeText(nextProbe?.message),
+    beforeValue: normalizeProbeInteger(nextProbe?.beforeValue),
+    afterValue: normalizeProbeInteger(nextProbe?.afterValue),
+    expectedValues: Array.isArray(nextProbe?.expectedValues)
+      ? nextProbe.expectedValues.filter((value) => Number.isInteger(value))
+      : [],
+    commandError: normalizeText(nextProbe?.commandError),
+    updatedAt: normalizeText(nextProbe?.updatedAt) || fallbackProbe.updatedAt,
+  };
+}
+
+function normalizeProbeInteger(value) {
+  return Number.isInteger(value) ? value : null;
 }
 
 function saveState(nextState) {
