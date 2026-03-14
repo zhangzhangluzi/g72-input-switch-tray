@@ -82,7 +82,7 @@ function refreshMenu() {
 
   const openAtLogin = app.getLoginItemSettings().openAtLogin;
   const configErrors = getConfigValidationErrors(state.config);
-  const localControlUrl = getLocalControlUrl();
+  const localSettingsUrl = getLocalSettingsUrl();
 
   const menu = Menu.buildFromTemplate([
     {
@@ -97,8 +97,8 @@ function refreshMenu() {
     },
     {
       label: controlServerError
-        ? `本机页面：启动失败（${controlServerError.code || "未知错误"}）`
-        : `本机页面：${summarizeControlAddress(localControlUrl)}`,
+        ? `设置页：启动失败（${controlServerError.code || "未知错误"}）`
+        : `设置页：${summarizeControlAddress(localSettingsUrl)}`,
       enabled: false,
     },
     ...(configErrors.length > 0
@@ -126,14 +126,9 @@ function refreshMenu() {
     },
     { type: "separator" },
     {
-      label: "打开本机切换页",
-      enabled: !controlServerError,
-      click: () => shell.openExternal(localControlUrl),
-    },
-    {
       label: "打开本机设置页",
       enabled: !controlServerError,
-      click: () => shell.openExternal(getLocalSettingsUrl()),
+      click: () => shell.openExternal(localSettingsUrl),
     },
     {
       label: "开机时启动",
@@ -332,7 +327,7 @@ function startControlServer() {
       }
 
       response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
-      response.end(`本机页面请求失败：${error.message}`);
+      response.end(`设置页请求失败：${error.message}`);
     });
   });
 
@@ -352,7 +347,7 @@ function startControlServer() {
     controlServerError = error;
     controlServer = null;
     refreshMenu();
-    notify(`本机页面启动失败：${error.message}`);
+    notify(`本机设置页启动失败：${error.message}`);
   });
 
   controlServer.listen(PREFERRED_CONTROL_PORT, "127.0.0.1", () => {
@@ -408,7 +403,7 @@ async function handleControlRequest(request, response) {
   }
 
   if (requestUrl.pathname === controlPath) {
-    return writeHtml(response, 200, renderControlPage(requestUrl));
+    return redirectToSettingsPage(response, requestUrl, {});
   }
 
   if (requestUrl.pathname === settingsPath) {
@@ -585,67 +580,6 @@ function redirectToPath(response, requestUrl, pathName, query) {
   response.end();
 }
 
-function renderControlPage(requestUrl) {
-  const status = requestUrl.searchParams.get("status");
-  const targetId = requestUrl.searchParams.get("target");
-  const message = requestUrl.searchParams.get("message");
-  const currentLabel = getCurrentTargetLabel();
-  const addressText = getLocalControlUrl();
-  const statusHtml = renderStatusBanner(status, targetId, message);
-  const configErrors = getConfigValidationErrors(state.config);
-
-  return `<!doctype html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(APP_NAME)} 控制页</title>
-  <style>
-    ${renderSharedStyles()}
-  </style>
-</head>
-<body>
-  <main>
-    <div class="eyebrow">Local Switch</div>
-    <h1>${escapeHtml(APP_NAME)}</h1>
-    <p>当前记录的输入源：${escapeHtml(currentLabel)}</p>
-    <div class="stack">
-      ${statusHtml}
-      ${configErrors.length > 0 ? `<div class="banner error">${escapeHtml(configErrors.join(" "))}</div>` : ""}
-      <div class="card meta-grid">
-        <div>
-          <strong>显示器</strong>
-          <p>${escapeHtml(state.config.monitorName)}</p>
-        </div>
-        <div>
-          <strong>macOS 序号</strong>
-          <p>${escapeHtml(String(state.config.macDisplayIndex))}</p>
-        </div>
-      </div>
-      <div class="card grid">
-        <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/windows">
-          <button type="submit"${configErrors.length > 0 ? " disabled" : ""}>切到 ${escapeHtml(getTarget("windows").label)}</button>
-        </form>
-        <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/mac">
-          <button class="secondary" type="submit"${configErrors.length > 0 ? " disabled" : ""}>切到 ${escapeHtml(getTarget("mac").label)}</button>
-        </form>
-      </div>
-      <div class="card">
-        <p>这个页面只用于当前有画面的这台机器进行切换。它不会负责在黑屏后自行切回。</p>
-      </div>
-      <div class="card">
-        <p>本机地址</p>
-        <code>${escapeHtml(addressText)}</code>
-      </div>
-      <div class="actions">
-        <a href="${escapeHtml(getSettingsPath())}">打开设置页</a>
-      </div>
-    </div>
-  </main>
-</body>
-</html>`;
-}
-
 function renderSettingsPage(requestUrl, monitorNames) {
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
@@ -736,7 +670,7 @@ function renderSettingsPage(requestUrl, monitorNames) {
   <main>
     <div class="eyebrow">Local Setup</div>
     <h1>${escapeHtml(APP_NAME)} 设置</h1>
-    <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。Mac 端和 Windows 端都是当前有画面时本机发起切换。</p>
+    <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。实际切换请回到托盘或菜单栏操作。</p>
     <div class="stack">
       ${statusHtml}
       <div class="card">
@@ -793,9 +727,6 @@ function renderSettingsPage(requestUrl, monitorNames) {
           <button type="submit">保存设置</button>
         </form>
       </div>
-      <div class="actions-row">
-        <a class="link-button" href="${escapeHtml(getControlPath())}">返回控制页</a>
-      </div>
     </div>
   </main>
 </body>
@@ -813,20 +744,6 @@ function renderMonitorHints(monitorNames) {
       ${monitorNames.map((name) => `<span class="pill">${escapeHtml(name)}</span>`).join("")}
     </div>
   </div>`;
-}
-
-function renderStatusBanner(status, targetId, message) {
-  if (status === "success" && targetId && TARGET_IDS.includes(targetId)) {
-    return `<div class="banner success">已切换到 ${escapeHtml(getTarget(targetId).label)}。</div>`;
-  }
-
-  if (status === "error") {
-    const targetLabel = TARGET_IDS.includes(targetId) ? getTarget(targetId).label : "目标模式";
-    const detail = message ? ` ${escapeHtml(message)}` : "";
-    return `<div class="banner error">${escapeHtml(targetLabel)} 切换失败。${detail}</div>`;
-  }
-
-  return "";
 }
 
 function renderSettingsBanner(status, message) {
@@ -1026,10 +943,6 @@ function getControlPath() {
 
 function getSettingsPath() {
   return `/settings/${state.controlToken}`;
-}
-
-function getLocalControlUrl() {
-  return `http://127.0.0.1:${activeControlPort}${getControlPath()}`;
 }
 
 function getLocalSettingsUrl() {
