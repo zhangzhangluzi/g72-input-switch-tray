@@ -1,12 +1,12 @@
 {
   "name": "g72-input-switch-tray",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "description": "用于切换任意支持 DDC/CI 的显示器输入源的跨平台托盘应用。",
   "main": "src/main.js",
   "scripts": {
     "start": "electron --log-level=3 .",
     "dist": "electron-builder --publish never",
-    "dist:win": "electron-builder --win nsis --publish never",
+    "dist:win": "electron-builder --win nsis --x64 --publish never",
     "dist:mac": "electron-builder --mac dmg zip --publish never",
     "release": "electron-builder --publish always"
   },
@@ -27,6 +27,7 @@
     "appId": "com.zhangzhangluzi.g72inputswitchtray",
     "productName": "显示器输入切换",
     "asar": true,
+    "afterPack": "./scripts/brand-mac-helper-apps.js",
     "afterSign": "./scripts/hide-mac-helper-apps.js",
     "directories": {
       "buildResources": "assets",

@@ -186,6 +186,29 @@ function refreshMenu() {
     ? windowsMonitorAvailability.message ||
       `${state.config.monitorName || "共享屏"} 当前不在 Windows 侧，请到 Mac 端或显示器菜单切回。`
     : "";
+  const switchMenuItems = windowsSharedMonitorMissing
+    ? [
+        {
+          label: "共享屏当前已交给另一台电脑，查看交接说明",
+          click: () => showWindowsSharedMonitorTransferHint(windowsSharedMonitorMessage),
+        },
+      ]
+    : [
+        {
+          label: getTarget("windows").label,
+          type: "radio",
+          checked: state.lastTarget === "windows",
+          enabled: configErrors.length === 0,
+          click: () => handleTraySwitch("windows"),
+        },
+        {
+          label: getTarget("mac").label,
+          type: "radio",
+          checked: state.lastTarget === "mac",
+          enabled: configErrors.length === 0,
+          click: () => handleTraySwitch("mac"),
+        },
+      ];
 
   const menu = Menu.buildFromTemplate([
     {
@@ -233,20 +256,7 @@ function refreshMenu() {
       enabled: false,
     },
     { type: "separator" },
-    {
-      label: getTarget("windows").label,
-      type: "radio",
-      checked: state.lastTarget === "windows",
-      enabled: configErrors.length === 0 && !windowsSharedMonitorMissing,
-      click: () => handleTraySwitch("windows"),
-    },
-    {
-      label: getTarget("mac").label,
-      type: "radio",
-      checked: state.lastTarget === "mac",
-      enabled: configErrors.length === 0 && !windowsSharedMonitorMissing,
-      click: () => handleTraySwitch("mac"),
-    },
+    ...switchMenuItems,
     { type: "separator" },
     {
       label: "打开本机设置页",
@@ -285,6 +295,25 @@ function refreshMenu() {
   ]);
 
   tray.setContextMenu(menu);
+}
+
+function showWindowsSharedMonitorTransferHint(message = "") {
+  const monitorName = state.config.monitorName || "共享屏";
+  const detail = [
+    message || `${monitorName} 当前不在 Windows 侧，请到 Mac 端或显示器菜单切回。`,
+    "",
+    "现在的交接规则是：谁当前拥有这块共享屏，谁负责把它交出去。",
+    "如果它已经切到 Mac，请在 Mac 端菜单栏或显示器菜单里把它切回 Windows。",
+  ].join("\n");
+
+  void dialog.showMessageBox({
+    type: "info",
+    title: APP_NAME,
+    message: `${monitorName} 当前不在 Windows 侧`,
+    detail,
+    buttons: ["知道了"],
+    defaultId: 0,
+  });
 }
 
 function handleTraySwitch(targetId) {
