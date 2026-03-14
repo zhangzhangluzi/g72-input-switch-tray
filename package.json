@@ -1,6 +1,6 @@
 {
   "name": "g72-input-switch-tray",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "用于在 DP2（Windows）和 HDMI1（Mac mini）之间切换 G72 输入源的跨平台托盘应用。",
   "main": "src/main.js",
   "scripts": {
@@ -54,7 +54,7 @@
       }
     ],
     "mac": {
-      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "artifactName": "g72-input-switch-tray-${version}-${arch}.${ext}",
       "category": "public.app-category.utilities",
       "target": [
         "dmg",
@@ -66,7 +66,7 @@
       }
     },
     "win": {
-      "artifactName": "${productName}-${version}-setup.${ext}",
+      "artifactName": "g72-input-switch-tray-setup-${version}.${ext}",
       "target": [
         {
           "target": "nsis",
