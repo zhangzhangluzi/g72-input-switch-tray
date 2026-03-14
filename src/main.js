@@ -7,7 +7,11 @@ const os = require("node:os");
 const path = require("node:path");
 
 const APP_NAME = "显示器输入切换";
+const APP_ID = "com.zhangzhangluzi.g72inputswitchtray";
+const WINDOWS_TRAY_GUID = "f5b6f5d6-2917-42e3-b552-b5796b6f7f0d";
 const PREFERRED_CONTROL_PORT = 3847;
+const TRAY_REBUILD_DELAY_MS = 1200;
+const TRAY_HEALTHCHECK_INTERVAL_MS = 5000;
 const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
 const TARGET_IDS = ["windows", "mac"];
 const COMMON_INPUT_VALUES = [
@@ -28,10 +32,27 @@ let controlServerError = null;
 let activeControlPort = PREFERRED_CONTROL_PORT;
 let windowsRestoreTimer = null;
 let windowsRestoreInFlight = false;
+let trayRebuildTimer = null;
+let trayHealthTimer = null;
+let explorerSignature = null;
 let state = createDefaultState();
 
 // Suppress noisy Chromium network-change logs on some Windows systems.
 app.commandLine.appendSwitch("log-level", "3");
+
+if (process.platform === "win32") {
+  app.setAppUserModelId(APP_ID);
+}
+
+process.on("unhandledRejection", (reason) => {
+  appendDiagnosticLog("Unhandled promise rejection", reason);
+  scheduleTrayRebuild("unhandled-rejection", 0);
+});
+
+process.on("uncaughtException", (error) => {
+  appendDiagnosticLog("Uncaught exception", error);
+  scheduleTrayRebuild("uncaught-exception", 0);
+});
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -56,6 +77,16 @@ app.on("before-quit", () => {
     clearInterval(windowsRestoreTimer);
     windowsRestoreTimer = null;
   }
+
+  if (trayRebuildTimer) {
+    clearTimeout(trayRebuildTimer);
+    trayRebuildTimer = null;
+  }
+
+  if (trayHealthTimer) {
+    clearInterval(trayHealthTimer);
+    trayHealthTimer = null;
+  }
 });
 
 app.whenReady().then(() => {
@@ -67,6 +98,7 @@ app.whenReady().then(() => {
   saveState(state);
   startControlServer();
   startWindowsRestoreWatcher();
+  startWindowsTrayWatcher();
   createTray();
   refreshMenu();
 });
@@ -81,13 +113,52 @@ function createTray() {
     icon.setTemplateImage(true);
   }
 
-  tray = new Tray(icon);
+  destroyTray();
+  tray =
+    process.platform === "win32"
+      ? new Tray(icon, WINDOWS_TRAY_GUID)
+      : new Tray(icon);
   tray.setToolTip(APP_NAME);
 
   if (process.platform === "win32") {
     tray.on("click", () => tray.popUpContextMenu());
     tray.on("right-click", () => tray.popUpContextMenu());
   }
+}
+
+function destroyTray() {
+  if (!tray) {
+    return;
+  }
+
+  try {
+    tray.destroy();
+  } catch {
+    // Ignore stale tray handles during shell/display transitions.
+  }
+
+  tray = null;
+}
+
+function rebuildTray(reason = "unknown") {
+  appendDiagnosticLog(`Rebuilding tray (${reason})`);
+  createTray();
+  refreshMenu();
+}
+
+function scheduleTrayRebuild(reason, delayMs = TRAY_REBUILD_DELAY_MS) {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  if (trayRebuildTimer) {
+    clearTimeout(trayRebuildTimer);
+  }
+
+  trayRebuildTimer = setTimeout(() => {
+    trayRebuildTimer = null;
+    rebuildTray(reason);
+  }, delayMs);
 }
 
 function refreshMenu() {
@@ -142,20 +213,25 @@ function refreshMenu() {
       type: "radio",
       checked: state.lastTarget === "windows",
       enabled: configErrors.length === 0,
-      click: () => switchMonitor("windows"),
+      click: () => handleTraySwitch("windows"),
     },
     {
       label: getTarget("mac").label,
       type: "radio",
       checked: state.lastTarget === "mac",
       enabled: configErrors.length === 0,
-      click: () => switchMonitor("mac"),
+      click: () => handleTraySwitch("mac"),
     },
     { type: "separator" },
     {
       label: "打开本机设置页",
       enabled: !controlServerError,
-      click: () => shell.openExternal(localSettingsUrl),
+      click: () => {
+        void shell.openExternal(localSettingsUrl).catch((error) => {
+          appendDiagnosticLog("Failed to open settings page", error);
+          dialog.showErrorBox(APP_NAME, `无法打开本机设置页。\n\n${error.message}`);
+        });
+      },
     },
     {
       label: "开机时启动",
@@ -184,6 +260,12 @@ function refreshMenu() {
   ]);
 
   tray.setContextMenu(menu);
+}
+
+function handleTraySwitch(targetId) {
+  void switchMonitor(targetId).catch((error) => {
+    appendDiagnosticLog(`Tray switch failed (${targetId})`, error);
+  });
 }
 
 async function switchMonitor(targetId, options = {}) {
@@ -862,7 +944,7 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics) {
             <input name="monitorName" value="${escapeHtml(state.config.monitorName)}" placeholder="例如：G72、DELL U2723QE、LG ULTRAGEAR">
           </label>
           <div class="help">
-            Windows 会按这个名字去匹配目标显示器。macOS 若使用 BetterDisplay CLI 也会参考这个名称；若走内置 ddcctl，则会用下面的显示器序号。
+            Windows 会按这个名字去匹配目标显示器。macOS 会优先按这个名字调用 BetterDisplay CLI；如果回退到 ddcctl，再参考下面的显示器序号。
           </div>
           ${monitorHintHtml}
           <label>
@@ -870,7 +952,7 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics) {
             <input name="macDisplayIndex" type="number" min="1" step="1" value="${escapeHtml(String(state.config.macDisplayIndex))}">
           </label>
           <div class="help">
-            这个值只影响 Mac 版本在“当前有画面时”的本机切换。单屏通常填 1；如果 Mac 上连了多台支持 DDC/CI 的显示器，可能需要改成 2、3 等。
+            这个值只影响 Mac 版本在“当前有画面时”的本机切换。应用会先试这里的序号，再自动补试常见序号；单屏通常填 1，多屏时可能需要改成 2、3 等。
           </div>
           <label>
             兼容模式
@@ -1272,12 +1354,27 @@ function delay(ms) {
 }
 
 async function runCandidateSequence(candidates, runCandidate) {
+  let lastError = null;
+
   for (let index = 0; index < candidates.length; index += 1) {
-    await runCandidate(candidates[index]);
+    try {
+      await runCandidate(candidates[index]);
+      return;
+    } catch (error) {
+      lastError = error;
+
+      if (index >= candidates.length - 1) {
+        throw error;
+      }
+    }
 
     if (index < candidates.length - 1) {
       await delay(300);
     }
+  }
+
+  if (lastError) {
+    throw lastError;
   }
 }
 
@@ -1459,11 +1556,74 @@ function startWindowsRestoreWatcher() {
     void attemptPendingWindowsDesktopRestore();
   };
 
-  screen.on("display-added", scheduleAttempt);
-  screen.on("display-removed", scheduleAttempt);
+  screen.on("display-added", () => {
+    scheduleTrayRebuild("display-added");
+    scheduleAttempt();
+  });
+  screen.on("display-removed", () => {
+    scheduleTrayRebuild("display-removed");
+    scheduleAttempt();
+  });
 
   windowsRestoreTimer = setInterval(scheduleAttempt, 2500);
   scheduleAttempt();
+}
+
+function startWindowsTrayWatcher() {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  void refreshExplorerSignature();
+  trayHealthTimer = setInterval(() => {
+    void verifyTrayHealth();
+  }, TRAY_HEALTHCHECK_INTERVAL_MS);
+}
+
+async function verifyTrayHealth() {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  if (!tray || isTrayDestroyed()) {
+    rebuildTray("tray-missing");
+    return;
+  }
+
+  const nextExplorerSignature = await getExplorerSignature();
+  if (!nextExplorerSignature) {
+    return;
+  }
+
+  if (explorerSignature && nextExplorerSignature !== explorerSignature) {
+    explorerSignature = nextExplorerSignature;
+    scheduleTrayRebuild("explorer-restarted", 0);
+    return;
+  }
+
+  explorerSignature = nextExplorerSignature;
+}
+
+async function refreshExplorerSignature() {
+  explorerSignature = await getExplorerSignature();
+}
+
+async function getExplorerSignature() {
+  try {
+    const output = await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-Command",
+      "$p = Get-Process explorer -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1; if ($p) { '{0}:{1}' -f $p.Id, $p.StartTime.ToFileTimeUtc() }",
+    ]);
+    return normalizeText(output) || null;
+  } catch (error) {
+    appendDiagnosticLog("Failed to read explorer signature", error);
+    return null;
+  }
+}
+
+function isTrayDestroyed() {
+  return !tray || (typeof tray.isDestroyed === "function" && tray.isDestroyed());
 }
 
 async function attemptPendingWindowsDesktopRestore() {
@@ -1604,6 +1764,44 @@ function saveState(nextState) {
 
 function getStatePath() {
   return path.join(app.getPath("userData"), "state.json");
+}
+
+function getDiagnosticLogPath() {
+  return path.join(app.getPath("userData"), "app.log");
+}
+
+function appendDiagnosticLog(message, error = null) {
+  try {
+    fs.mkdirSync(path.dirname(getDiagnosticLogPath()), { recursive: true });
+    const lines = [`[${new Date().toISOString()}] ${message}`];
+    const details = formatDiagnosticError(error);
+    if (details) {
+      lines.push(details);
+    }
+    fs.appendFileSync(getDiagnosticLogPath(), `${lines.join("\n")}\n`);
+  } catch {
+    // Swallow logging failures to avoid cascading background crashes.
+  }
+}
+
+function formatDiagnosticError(error) {
+  if (!error) {
+    return "";
+  }
+
+  if (error instanceof Error) {
+    return error.stack || error.message;
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
 }
 
 function shellEscape(value) {
