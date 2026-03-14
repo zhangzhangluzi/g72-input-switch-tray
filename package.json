@@ -49,7 +49,8 @@
       {
         "provider": "github",
         "owner": "zhangzhangluzi",
-        "repo": "g72-input-switch-tray"
+        "repo": "g72-input-switch-tray",
+        "releaseType": "release"
       }
     ],
     "mac": {
