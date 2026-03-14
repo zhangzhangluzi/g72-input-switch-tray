@@ -9,6 +9,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - Switching happens from the tray/menu bar, not from a separate browser switch page
 - Built-in local browser settings page for choosing the monitor name, macOS display index, and two input profiles
 - The tray/menu shows the last requested switch target, not a guaranteed real-time input readback
+- Optional Samsung / MStar compatibility mode for monitors whose real input-switch values do not match the standard MCCS values
 - Optional launch at login
 - Windows uninstall entry via the packaged NSIS uninstaller
 - macOS self-uninstall command from the app menu
@@ -24,7 +25,8 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 
 - Windows switching is done with a bundled PowerShell DDC/CI helper that maps the target monitor through Win32 and WMI. The installer does **not** bundle `.NET`.
 - Some monitors do not report a trustworthy “current input” value over DDC/CI. The app now treats the tray state as the last command sent, and the settings page shows monitor diagnostics when Windows can read them.
-- When Windows sends a switch-away command, the app now verifies that the monitor actually disappears from the local display list. If it stays attached, the app reports the switch as failed instead of pretending it worked.
+- Some monitors, especially Samsung / MStar models, continue reporting an active connection to the current computer even after the picture switches away. The app no longer treats “still attached” as a failure for those screens.
+- For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching prefers a bundled `ddcctl` binary built during the macOS GitHub Actions release job.
 - If the bundled macOS helper is unavailable, the app falls back to `betterdisplaycli` and then `ddcctl` from `PATH`.

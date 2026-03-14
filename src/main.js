@@ -211,48 +211,38 @@ async function switchMonitor(targetId, options = {}) {
 
 async function switchOnWindows(targetId, target) {
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
-  await runCommand("powershell.exe", [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    scriptPath,
-    "-MonitorName",
-    state.config.monitorName,
-    "-InputValue",
-    String(target.inputValue),
-  ]);
+  const candidates = getInputCandidates(target);
 
-  // On Windows, switching to the "other machine" should make this monitor
-  // disappear from the local display list. If it never detaches, the command
-  // did not produce a real input change on the monitor.
-  if (targetId === "mac") {
-    const transition = await waitForWindowsMonitorDetachment(state.config.monitorName);
+  for (let index = 0; index < candidates.length; index += 1) {
+    await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-MonitorName",
+      state.config.monitorName,
+      "-InputValue",
+      String(candidates[index]),
+    ]);
 
-    if (transition === "detached") {
-      return;
+    if (index < candidates.length - 1) {
+      await delay(300);
     }
-
-    if (transition === "briefly-detached") {
-      throw new Error(
-        "显示器短暂离开了 Windows 又马上回来了。通常是目标输入没有稳定信号，或显示器启用了自动输入源后又切回当前画面。"
-      );
-    }
-
-    throw new Error(
-      "显示器在切换命令后仍然一直留在 Windows 上，没有真正离开当前输入。请先确认目标设备正在输出稳定画面，并检查显示器 OSD 里的自动输入源/DDC 设置。若这些都正常，通常就是这台显示器不接受通过 DDC/CI 切换输入源。"
-    );
   }
 }
 
 function switchOnMac(target) {
   const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
-  return runCommand("/bin/sh", [scriptPath, String(target.inputValue)], {
-    env: {
-      DISPLAY_NAME: state.config.monitorName,
-      DISPLAY_INDEX: String(state.config.macDisplayIndex),
-    },
-  });
+  const candidates = getInputCandidates(target);
+  return runCandidateSequence(candidates, (candidate) =>
+    runCommand("/bin/sh", [scriptPath, String(candidate)], {
+      env: {
+        DISPLAY_NAME: state.config.monitorName,
+        DISPLAY_INDEX: String(state.config.macDisplayIndex),
+      },
+    })
+  );
 }
 
 function uninstallApp() {
@@ -513,6 +503,7 @@ function buildConfigFromForm(form) {
   const config = {
     monitorName: normalizeText(form.get("monitorName")),
     macDisplayIndex: normalizePositiveInteger(form.get("macDisplayIndex"), 1),
+    compatibilityMode: parseCompatibilityMode(form.get("compatibilityMode")),
     targets: {
       windows: {
         label: normalizeText(form.get("windowsLabel")),
@@ -540,6 +531,10 @@ function getConfigValidationErrors(config) {
 
   if (!Number.isInteger(config.macDisplayIndex) || config.macDisplayIndex < 1) {
     errors.push("macOS 显示器序号必须是大于等于 1 的整数。");
+  }
+
+  if (!["auto", "off", "samsung_mstar"].includes(config.compatibilityMode)) {
+    errors.push("兼容模式配置无效。");
   }
 
   for (const targetId of TARGET_IDS) {
@@ -581,28 +576,6 @@ async function getAvailableMonitorNames() {
   } catch {
     return [];
   }
-}
-
-async function waitForWindowsMonitorDetachment(monitorName, timeoutMs = 5000, intervalMs = 250) {
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt <= timeoutMs) {
-    const isAttached = await isWindowsMonitorAttached(monitorName);
-
-    if (!isAttached) {
-      await delay(1200);
-      return (await isWindowsMonitorAttached(monitorName)) ? "briefly-detached" : "detached";
-    }
-
-    await delay(intervalMs);
-  }
-
-  return "still-attached";
-}
-
-async function isWindowsMonitorAttached(monitorName) {
-  const names = await getAvailableMonitorNames();
-  return names.includes(monitorName);
 }
 
 async function getMonitorDiagnostics() {
@@ -772,6 +745,16 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics) {
       background: rgba(255, 255, 255, 0.96);
       color: var(--ink);
     }
+    select {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 13px 14px;
+      font-size: 16px;
+      background: rgba(255, 255, 255, 0.96);
+      color: var(--ink);
+    }
     .two-col {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -848,6 +831,17 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics) {
           </label>
           <div class="help">
             这个值只影响 Mac 版本在“当前有画面时”的本机切换。单屏通常填 1；如果 Mac 上连了多台支持 DDC/CI 的显示器，可能需要改成 2、3 等。
+          </div>
+          <label>
+            兼容模式
+            <select name="compatibilityMode">
+              ${renderCompatibilityOption("auto", "自动判断", state.config.compatibilityMode)}
+              ${renderCompatibilityOption("off", "关闭兼容补发", state.config.compatibilityMode)}
+              ${renderCompatibilityOption("samsung_mstar", "Samsung / MStar", state.config.compatibilityMode)}
+            </select>
+          </label>
+          <div class="help">
+            对部分 Samsung / MStar 显示器，标准值不会直接生效。开启兼容后，应用会自动补发一组三星常见替代值。
           </div>
           <div class="card soft">
             <div class="section-title">模式 A</div>
@@ -939,6 +933,9 @@ function renderMonitorDiagnostics(diagnostics) {
   const capabilityHelp = diagnostics.capabilitiesError
     ? `支持列表读取失败：${escapeHtml(diagnostics.capabilitiesError)}`
     : "这些值是显示器自己通过 DDC/CI 能力串声明的输入目标。";
+  const compatibilityHelp = shouldUseSamsungMstarCompat(state.config)
+    ? "当前已启用 Samsung / MStar 兼容补发。像这台 G72 这种切走后仍会保持 Windows 连接的屏，兼容补发比“判断是否断开”更可靠。"
+    : "如果这台屏手动菜单能切、软件却没反应，建议把兼容模式改成 Samsung / MStar 再试。";
 
   return `<div class="card soft">
     <div class="section-title">显示器诊断</div>
@@ -948,6 +945,7 @@ function renderMonitorDiagnostics(diagnostics) {
     <div class="tip-list">${supportedInputsHtml}</div>
     <div class="help" style="margin-top: 12px;">${currentValueLine}</div>
     <div class="help">${currentValueHelp}</div>
+    <div class="help">${compatibilityHelp}</div>
   </div>`;
 }
 
@@ -1193,6 +1191,11 @@ function normalizePositiveInteger(value, fallbackValue) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallbackValue;
 }
 
+function parseCompatibilityMode(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  return ["auto", "off", "samsung_mstar"].includes(normalized) ? normalized : "auto";
+}
+
 function parseInputValue(value) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isInteger(parsed) ? parsed : NaN;
@@ -1202,6 +1205,16 @@ function delay(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+async function runCandidateSequence(candidates, runCandidate) {
+  for (let index = 0; index < candidates.length; index += 1) {
+    await runCandidate(candidates[index]);
+
+    if (index < candidates.length - 1) {
+      await delay(300);
+    }
+  }
 }
 
 function escapeHtml(value) {
@@ -1216,6 +1229,53 @@ function escapeHtml(value) {
 function describeInputValue(value) {
   const knownLabel = COMMON_INPUT_LABELS.get(value);
   return knownLabel ? `${knownLabel} (${value})` : `输入值 ${value}`;
+}
+
+function renderCompatibilityOption(value, label, selectedValue) {
+  return `<option value="${escapeHtml(value)}"${value === selectedValue ? " selected" : ""}>${escapeHtml(label)}</option>`;
+}
+
+function getInputCandidates(target) {
+  const candidates = [target.inputValue];
+
+  if (!shouldUseSamsungMstarCompat(state.config)) {
+    return candidates;
+  }
+
+  for (const candidate of getSamsungMstarCandidates(target.inputValue)) {
+    if (!candidates.includes(candidate)) {
+      candidates.push(candidate);
+    }
+  }
+
+  return candidates;
+}
+
+function shouldUseSamsungMstarCompat(config) {
+  if (config.compatibilityMode === "samsung_mstar") {
+    return true;
+  }
+
+  if (config.compatibilityMode === "off") {
+    return false;
+  }
+
+  return /\b(g7|g72|odyssey|samsung)\b/i.test(config.monitorName);
+}
+
+function getSamsungMstarCandidates(inputValue) {
+  switch (inputValue) {
+    case 17:
+      return [5, 6];
+    case 18:
+      return [6, 5];
+    case 15:
+      return [3, 7];
+    case 16:
+      return [7, 9];
+    default:
+      return [];
+  }
 }
 
 function notify(body) {
@@ -1281,6 +1341,7 @@ function createDefaultConfig() {
   return {
     monitorName: "G72",
     macDisplayIndex: 1,
+    compatibilityMode: "auto",
     targets: {
       windows: {
         label: "Windows（DP2）",
@@ -1313,6 +1374,7 @@ function normalizeState(nextState) {
     config: {
       monitorName: normalizeText(rawConfig.monitorName) || defaults.config.monitorName,
       macDisplayIndex: normalizePositiveInteger(rawConfig.macDisplayIndex, defaults.config.macDisplayIndex),
+      compatibilityMode: parseCompatibilityMode(rawConfig.compatibilityMode || defaults.config.compatibilityMode),
       targets: {
         windows: {
           label: normalizeText(rawTargets.windows?.label) || defaults.config.targets.windows.label,
