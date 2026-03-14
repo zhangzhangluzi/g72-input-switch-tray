@@ -9,6 +9,6 @@ rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
 
 git clone --depth 1 https://github.com/kfix/ddcctl.git "$WORK_DIR"
-make -C "$WORK_DIR" ddcctl
-cp "$WORK_DIR/ddcctl" "$OUTPUT_DIR/ddcctl"
+make -C "$WORK_DIR"
+cp "$WORK_DIR/bin/release/ddcctl" "$OUTPUT_DIR/ddcctl"
 chmod +x "$OUTPUT_DIR/ddcctl"
