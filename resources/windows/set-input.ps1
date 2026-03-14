@@ -4,12 +4,16 @@ param(
     [ValidateRange(1, 255)]
     [int]$InputValue,
 
-    [switch]$ListOnly
+    [switch]$ListOnly,
+
+    [switch]$ReadInputValue,
+
+    [switch]$ReadCapabilities
 )
 
 $ErrorActionPreference = "Stop"
 
-if (-not $ListOnly) {
+if (-not $ListOnly -and -not $ReadInputValue -and -not $ReadCapabilities) {
     if ([string]::IsNullOrWhiteSpace($MonitorName)) {
         throw "MonitorName was not provided."
     }
@@ -141,6 +145,16 @@ public static class NativeDisplayMapper
         uint value
     );
 
+    [DllImport("dxva2.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetVCPFeatureAndVCPFeatureReply(
+        IntPtr monitor,
+        byte code,
+        out uint vcpType,
+        out uint currentValue,
+        out uint maximumValue
+    );
+
     public static LogicalMonitor[] EnumerateLogicalMonitors()
     {
         var results = new List<LogicalMonitor>();
@@ -209,6 +223,44 @@ public static class NativeDisplayMapper
     public static bool SetInput(PHYSICAL_MONITOR monitor, uint inputValue)
     {
         return SetVCPFeature(monitor.hPhysicalMonitor, 0x60, inputValue);
+    }
+
+    public static bool TryGetInput(PHYSICAL_MONITOR monitor, out uint currentValue, out uint maximumValue)
+    {
+        uint vcpType;
+        return GetVCPFeatureAndVCPFeatureReply(monitor.hPhysicalMonitor, 0x60, out vcpType, out currentValue, out maximumValue);
+    }
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetCapabilitiesStringLength(
+        IntPtr monitor,
+        out uint length
+    );
+
+    [DllImport("dxva2.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CapabilitiesRequestAndCapabilitiesReply(
+        IntPtr monitor,
+        System.Text.StringBuilder capabilitiesString,
+        uint length
+    );
+
+    public static string GetCapabilities(PHYSICAL_MONITOR monitor)
+    {
+        uint length;
+        if (!GetCapabilitiesStringLength(monitor.hPhysicalMonitor, out length) || length == 0)
+        {
+            return string.Empty;
+        }
+
+        var buffer = new System.Text.StringBuilder((int)length);
+        if (!CapabilitiesRequestAndCapabilitiesReply(monitor.hPhysicalMonitor, buffer, length))
+        {
+            return string.Empty;
+        }
+
+        return buffer.ToString();
     }
 
     private static string ExtractProductCode(string deviceId)
@@ -290,6 +342,48 @@ if ($null -eq $targetLogicalMonitor) {
 $physicalMonitors = [NativeDisplayMapper]::GetPhysicalMonitorsForDisplay($targetLogicalMonitor.HMonitor)
 if ($physicalMonitors.Length -eq 0) {
     throw "No physical monitor handles were found for '$MonitorName'."
+}
+
+if ($ReadInputValue) {
+    try {
+        foreach ($physicalMonitor in $physicalMonitors) {
+            $currentValue = 0
+            $maximumValue = 0
+            if ([NativeDisplayMapper]::TryGetInput($physicalMonitor, [ref]$currentValue, [ref]$maximumValue)) {
+                Write-Output (@{
+                    monitor = $MonitorName
+                    currentInputValue = [int]$currentValue
+                    maximumValue = [int]$maximumValue
+                } | ConvertTo-Json -Compress)
+                exit 0
+            }
+        }
+    }
+    finally {
+        [NativeDisplayMapper]::ReleasePhysicalMonitors($physicalMonitors)
+    }
+
+    throw "Reading VCP 0x60 failed for '$MonitorName'."
+}
+
+if ($ReadCapabilities) {
+    try {
+        foreach ($physicalMonitor in $physicalMonitors) {
+            $capabilities = [NativeDisplayMapper]::GetCapabilities($physicalMonitor)
+            if (-not [string]::IsNullOrWhiteSpace($capabilities)) {
+                Write-Output (@{
+                    monitor = $MonitorName
+                    capabilities = $capabilities
+                } | ConvertTo-Json -Compress)
+                exit 0
+            }
+        }
+    }
+    finally {
+        [NativeDisplayMapper]::ReleasePhysicalMonitors($physicalMonitors)
+    }
+
+    throw "Reading capabilities failed for '$MonitorName'."
 }
 
 $switchSucceeded = $false

@@ -17,6 +17,9 @@ const COMMON_INPUT_VALUES = [
   { value: 19, label: "19: HDMI3 / Component" },
   { value: 27, label: "27: USB-C / Type-C（部分显示器）" },
 ];
+const COMMON_INPUT_LABELS = new Map(
+  COMMON_INPUT_VALUES.map((item) => [item.value, item.label.replace(/^\d+:\s*/, "")])
+);
 
 let tray = null;
 let controlServer = null;
@@ -87,8 +90,8 @@ function refreshMenu() {
   const menu = Menu.buildFromTemplate([
     {
       label: state.lastTarget
-        ? `当前输入：${getTarget(state.lastTarget).label}`
-        : "当前输入：尚未通过此应用切换",
+        ? `最近切换请求：${getTarget(state.lastTarget).label}`
+        : "最近切换请求：尚未通过此应用发送",
       enabled: false,
     },
     {
@@ -109,6 +112,10 @@ function refreshMenu() {
           },
         ]
       : []),
+    {
+      label: "说明：这里显示的是上次发送目标，不是显示器实时输入",
+      enabled: false,
+    },
     { type: "separator" },
     {
       label: getTarget("windows").label,
@@ -188,13 +195,13 @@ async function switchMonitor(targetId, options = {}) {
     refreshMenu();
 
     if (notifyOnSuccess) {
-      notify(`已将 ${state.config.monitorName} 切换到 ${target.label}。`);
+      notify(`已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
     }
   } catch (error) {
     if (showErrorDialog) {
       dialog.showErrorBox(
         APP_NAME,
-        `${target.label} 切换失败。\n\n${error.message}`
+        `${target.label} 切换命令发送失败。\n\n${error.message}`
       );
     }
 
@@ -204,7 +211,7 @@ async function switchMonitor(targetId, options = {}) {
 
 function switchOnWindows(target) {
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
-  const args = [
+  return runCommand("powershell.exe", [
     "-NoProfile",
     "-ExecutionPolicy",
     "Bypass",
@@ -214,9 +221,7 @@ function switchOnWindows(target) {
     state.config.monitorName,
     "-InputValue",
     String(target.inputValue),
-  ];
-
-  return runCommand("powershell.exe", args);
+  ]);
 }
 
 function switchOnMac(target) {
@@ -408,7 +413,8 @@ async function handleControlRequest(request, response) {
 
   if (requestUrl.pathname === settingsPath) {
     const monitors = await getAvailableMonitorNames();
-    return writeHtml(response, 200, renderSettingsPage(requestUrl, monitors));
+    const diagnostics = await getMonitorDiagnostics();
+    return writeHtml(response, 200, renderSettingsPage(requestUrl, monitors, diagnostics));
   }
 
   if (requestUrl.pathname === configPath && request.method === "POST") {
@@ -556,6 +562,114 @@ async function getAvailableMonitorNames() {
   }
 }
 
+async function getMonitorDiagnostics() {
+  if (process.platform !== "win32") {
+    return null;
+  }
+
+  const monitorName = normalizeText(state.config.monitorName);
+  if (!monitorName) {
+    return null;
+  }
+
+  const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
+  const diagnostics = {
+    monitorName,
+    supportedInputs: [],
+    currentInputValue: null,
+    currentInputLabel: null,
+    currentInputReliable: false,
+    capabilitiesError: null,
+    currentInputError: null,
+    configWarnings: [],
+  };
+
+  const [capabilitiesResult, currentInputResult] = await Promise.allSettled([
+    runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-MonitorName",
+      monitorName,
+      "-ReadCapabilities",
+    ]),
+    runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-MonitorName",
+      monitorName,
+      "-ReadInputValue",
+    ]),
+  ]);
+
+  if (capabilitiesResult.status === "fulfilled") {
+    try {
+      const parsed = JSON.parse(capabilitiesResult.value);
+      diagnostics.supportedInputs = parseSupportedInputsFromCapabilities(parsed.capabilities);
+    } catch (error) {
+      diagnostics.capabilitiesError = error.message;
+    }
+  } else {
+    diagnostics.capabilitiesError = capabilitiesResult.reason?.message || "读取失败";
+  }
+
+  if (currentInputResult.status === "fulfilled") {
+    try {
+      const parsed = JSON.parse(currentInputResult.value);
+      diagnostics.currentInputValue = Number.isInteger(parsed.currentInputValue)
+        ? parsed.currentInputValue
+        : null;
+    } catch (error) {
+      diagnostics.currentInputError = error.message;
+    }
+  } else {
+    diagnostics.currentInputError = currentInputResult.reason?.message || "读取失败";
+  }
+
+  if (Number.isInteger(diagnostics.currentInputValue)) {
+    const matchedInput = diagnostics.supportedInputs.find(
+      (item) => item.value === diagnostics.currentInputValue
+    );
+    diagnostics.currentInputReliable = Boolean(matchedInput);
+    diagnostics.currentInputLabel = matchedInput ? matchedInput.label : null;
+  }
+
+  if (diagnostics.supportedInputs.length > 0) {
+    const supportedValues = new Set(diagnostics.supportedInputs.map((item) => item.value));
+    diagnostics.configWarnings = TARGET_IDS
+      .filter((targetId) => !supportedValues.has(getTarget(targetId).inputValue))
+      .map((targetId) => {
+        const target = getTarget(targetId);
+        return `${target.label} 的输入值 ${target.inputValue} 不在当前显示器支持列表里。`;
+      });
+  }
+
+  return diagnostics;
+}
+
+function parseSupportedInputsFromCapabilities(capabilities) {
+  const match = /60\(([^)]*)\)/i.exec(String(capabilities || ""));
+  if (!match) {
+    return [];
+  }
+
+  return match[1]
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((hexValue) => Number.parseInt(hexValue, 16))
+    .filter((value) => Number.isInteger(value))
+    .map((value) => ({
+      value,
+      label: describeInputValue(value),
+    }));
+}
+
 function redirectToControlPage(response, requestUrl, query) {
   redirectToPath(response, requestUrl, getControlPath(), query);
 }
@@ -580,11 +694,12 @@ function redirectToPath(response, requestUrl, pathName, query) {
   response.end();
 }
 
-function renderSettingsPage(requestUrl, monitorNames) {
+function renderSettingsPage(requestUrl, monitorNames, diagnostics) {
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
   const statusHtml = renderSettingsBanner(status, message);
   const monitorHintHtml = renderMonitorHints(monitorNames);
+  const diagnosticsHtml = renderMonitorDiagnostics(diagnostics);
 
   return `<!doctype html>
 <html lang="zh-Hant">
@@ -670,9 +785,10 @@ function renderSettingsPage(requestUrl, monitorNames) {
   <main>
     <div class="eyebrow">Local Setup</div>
     <h1>${escapeHtml(APP_NAME)} 设置</h1>
-    <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。实际切换请回到托盘或菜单栏操作。</p>
+    <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。实际切换请回到托盘或菜单栏操作；菜单里显示的是最近一次发送的目标，不是显示器实时输入。</p>
     <div class="stack">
       ${statusHtml}
+      ${diagnosticsHtml}
       <div class="card">
         <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/config">
           <label>
@@ -743,6 +859,52 @@ function renderMonitorHints(monitorNames) {
     <div class="tip-list">
       ${monitorNames.map((name) => `<span class="pill">${escapeHtml(name)}</span>`).join("")}
     </div>
+  </div>`;
+}
+
+function renderMonitorDiagnostics(diagnostics) {
+  if (!diagnostics) {
+    return "";
+  }
+
+  const supportedInputsHtml =
+    diagnostics.supportedInputs.length > 0
+      ? diagnostics.supportedInputs
+          .map((item) => `<span class="pill">${escapeHtml(item.label)}</span>`)
+          .join("")
+      : `<span class="help">这次没有从显示器能力串里读到支持的输入值。</span>`;
+
+  let currentValueLine = "当前没有读到可用的输入回报值。";
+  if (Number.isInteger(diagnostics.currentInputValue)) {
+    currentValueLine = diagnostics.currentInputReliable
+      ? `当前回报值：${escapeHtml(diagnostics.currentInputLabel)}`
+      : `当前回报值：${escapeHtml(String(diagnostics.currentInputValue))}（不在支持列表里）`;
+  }
+
+  let currentValueHelp = "有些显示器不会可靠回报“当前输入”，所以应用无法把菜单状态当成实时输入。";
+  if (diagnostics.currentInputReliable) {
+    currentValueHelp = "这次回报值和支持列表匹配，可以当作输入参考。";
+  } else if (diagnostics.currentInputError) {
+    currentValueHelp = `当前输入回报读取失败：${escapeHtml(diagnostics.currentInputError)}`;
+  }
+
+  const warningHtml =
+    diagnostics.configWarnings.length > 0
+      ? `<div class="banner error">${diagnostics.configWarnings.map(escapeHtml).join(" ")}</div>`
+      : "";
+
+  const capabilityHelp = diagnostics.capabilitiesError
+    ? `支持列表读取失败：${escapeHtml(diagnostics.capabilitiesError)}`
+    : "这些值是显示器自己通过 DDC/CI 能力串声明的输入目标。";
+
+  return `<div class="card soft">
+    <div class="section-title">显示器诊断</div>
+    ${warningHtml}
+    <div class="help">目标显示器：${escapeHtml(diagnostics.monitorName)}</div>
+    <div class="help">${escapeHtml(capabilityHelp)}</div>
+    <div class="tip-list">${supportedInputsHtml}</div>
+    <div class="help" style="margin-top: 12px;">${currentValueLine}</div>
+    <div class="help">${currentValueHelp}</div>
   </div>`;
 }
 
@@ -934,7 +1096,7 @@ function getTarget(targetId) {
 }
 
 function getCurrentTargetLabel() {
-  return state.lastTarget ? getTarget(state.lastTarget).label : "尚未通过此应用切换";
+  return state.lastTarget ? getTarget(state.lastTarget).label : "尚未通过此应用发送";
 }
 
 function getControlPath() {
@@ -1000,6 +1162,11 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function describeInputValue(value) {
+  const knownLabel = COMMON_INPUT_LABELS.get(value);
+  return knownLabel ? `${knownLabel} (${value})` : `输入值 ${value}`;
 }
 
 function notify(body) {

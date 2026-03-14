@@ -8,6 +8,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - macOS: menu bar app with a click menu
 - Switching happens from the tray/menu bar, not from a separate browser switch page
 - Built-in local browser settings page for choosing the monitor name, macOS display index, and two input profiles
+- The tray/menu shows the last requested switch target, not a guaranteed real-time input readback
 - Optional launch at login
 - Windows uninstall entry via the packaged NSIS uninstaller
 - macOS self-uninstall command from the app menu
@@ -22,6 +23,8 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 ## Platform notes
 
 - Windows switching is done with a bundled PowerShell DDC/CI helper that maps the target monitor through Win32 and WMI. The installer does **not** bundle `.NET`.
+- Some monitors do not report a trustworthy “current input” value over DDC/CI. The app now treats the tray state as the last command sent, and the settings page shows monitor diagnostics when Windows can read them.
+- If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching prefers a bundled `ddcctl` binary built during the macOS GitHub Actions release job.
 - If the bundled macOS helper is unavailable, the app falls back to `betterdisplaycli` and then `ddcctl` from `PATH`.
 - The app starts a local settings page on port `3847` and binds to `127.0.0.1`.
