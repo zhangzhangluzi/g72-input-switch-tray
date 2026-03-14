@@ -418,10 +418,6 @@ function Select-TargetMonitorEntry {
         }
     }
 
-    if ($MonitorEntries.Count -eq 1) {
-        return $MonitorEntries[0]
-    }
-
     return $null
 }
 

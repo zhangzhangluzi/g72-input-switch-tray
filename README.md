@@ -30,7 +30,9 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
 - On Windows, desktop handoff uses the system display switcher to move the desktop off the departing monitor, and retries extend mode until that monitor is available again.
 - On Windows, the app now keeps switch failures user-facing and concise: monitor-name mismatches are reported together with the names Windows currently sees, instead of showing a raw PowerShell stack trace.
-- Windows monitor matching now accepts normalized names and automatically falls back to the only detected monitor when there is exactly one candidate, which helps with systems that expose a slightly different friendly name than the one you typed into settings.
+- Windows monitor matching now accepts normalized names, but it no longer falls back to "the only remaining monitor" in a shared-screen setup, so the helper will not accidentally send DDC commands to the Windows fallback screen.
+- For a shared-screen setup, treat the monitor as a single-owner resource: whichever machine currently owns the visible picture is the one that should hand it off.
+- On Windows, if the shared screen is no longer visible to Windows, the tray now treats that as "ownership has moved away" and stops offering local switch actions until the screen comes back.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching now prefers BetterDisplay command-line control when it is available, because name-based matching is more reliable than a fixed display index on some Macs.
 - If `betterdisplaycli` is not installed but `BetterDisplay.app` is present in `/Applications` or `~/Applications`, the app uses the BetterDisplay bundle binary directly.
@@ -42,6 +44,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - The app starts a local settings page on port `3847` and binds to `127.0.0.1`.
 - If port `3847` is unavailable on Windows, the local pages automatically fall back to another free local port.
 - macOS does not provide a hidden-screen self-recovery workflow. It only switches while the current Mac still has a visible picture and can launch the app/menu.
+- A longer handoff design note for the "shared screen + Windows fallback screen" model lives in `docs/shared-monitor-handoff.md`.
 
 ## Development
 

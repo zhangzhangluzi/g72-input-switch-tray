@@ -35,6 +35,12 @@ let controlServerError = null;
 let activeControlPort = PREFERRED_CONTROL_PORT;
 let windowsRestoreTimer = null;
 let windowsRestoreInFlight = false;
+let windowsMonitorAvailability = {
+  status: "unknown",
+  names: [],
+  message: "",
+};
+let windowsMonitorAvailabilityInFlight = false;
 let trayRebuildTimer = null;
 let trayHealthTimer = null;
 let explorerSignature = null;
@@ -172,6 +178,14 @@ function refreshMenu() {
   const openAtLogin = app.getLoginItemSettings().openAtLogin;
   const configErrors = getConfigValidationErrors(state.config);
   const localSettingsUrl = getLocalSettingsUrl();
+  const windowsSharedMonitorMissing =
+    process.platform === "win32" &&
+    configErrors.length === 0 &&
+    windowsMonitorAvailability.status === "missing";
+  const windowsSharedMonitorMessage = windowsSharedMonitorMissing
+    ? windowsMonitorAvailability.message ||
+      `${state.config.monitorName || "共享屏"} 当前不在 Windows 侧，请到 Mac 端或显示器菜单切回。`
+    : "";
 
   const menu = Menu.buildFromTemplate([
     {
@@ -188,6 +202,14 @@ function refreshMenu() {
       ? [
           {
             label: `Windows 桌面：已交给副屏，等待 ${state.config.monitorName || "目标显示器"} 回来后自动恢复`,
+            enabled: false,
+          },
+        ]
+      : []),
+    ...(windowsSharedMonitorMissing
+      ? [
+          {
+            label: windowsSharedMonitorMessage,
             enabled: false,
           },
         ]
@@ -215,14 +237,14 @@ function refreshMenu() {
       label: getTarget("windows").label,
       type: "radio",
       checked: state.lastTarget === "windows",
-      enabled: configErrors.length === 0,
+      enabled: configErrors.length === 0 && !windowsSharedMonitorMissing,
       click: () => handleTraySwitch("windows"),
     },
     {
       label: getTarget("mac").label,
       type: "radio",
       checked: state.lastTarget === "mac",
-      enabled: configErrors.length === 0,
+      enabled: configErrors.length === 0 && !windowsSharedMonitorMissing,
       click: () => handleTraySwitch("mac"),
     },
     { type: "separator" },
@@ -318,6 +340,7 @@ async function switchMonitor(targetId, options = {}) {
 
 async function switchOnWindows(targetId, target) {
   const useDisplayHandoff = shouldUseWindowsDisplayHandoff(state.config);
+  await assertWindowsSharedMonitorAvailableForSwitch();
 
   if (useDisplayHandoff && targetId === "windows") {
     await restoreWindowsDesktopToTargetMonitor();
@@ -400,9 +423,9 @@ function formatMacSwitchErrorMessage(targetId, rawMessage) {
     const target = getTarget(targetId);
     return `显示器仍停留在 ${describeInputValue(
       currentValue
-    )}。这通常说明 ${getTargetSlotName(
+    )}。这只说明显示器没有切到 ${target.label}；常见原因是 ${getTargetSlotName(
       targetId
-    )} 的输入值还没配对，而不是命令没有发出去。请到设置页里的“输入值探测助手”为 ${target.label} 测试并保存正确值。当前候选集合：${expectedValues}。`;
+    )} 的输入值还没配对，或者目标设备当前没有稳定可切入的信号。请先确认目标设备正在输出画面，再到设置页里的“输入值探测助手”为 ${target.label} 测试并保存正确值。当前候选集合：${expectedValues}。`;
   }
 
   if (/^Failed\.?$/i.test(rawMessage)) {
@@ -421,10 +444,10 @@ function formatWindowsSwitchErrorMessage(rawMessage) {
     const availableText = missingMonitorMatch[2];
 
     if (availableText === "<none>") {
-      return "Windows 当前没有发现可控的外接显示器。请确认显示器已连接、已亮屏，并且显示器里开启了 DDC/CI。";
+      return `Windows 当前没有看到共享屏“${requestedName}”。如果它已经切到 Mac，这是正常的，请在 Mac 端或显示器菜单把它切回；如果它本来就在 Windows 侧，请确认显示器已连接、已亮屏，并且 DDC/CI 已开启。`;
     }
 
-    return `Windows 当前没有找到名为“${requestedName}”的显示器。现在检测到的是：${availableText}。请把设置页里的“显示器名称”改成其中一个检测值后再试。`;
+    return `Windows 当前没有看到配置的共享屏“${requestedName}”。现在能看到的是：${availableText}。如果共享屏已经切到 Mac，这是预期行为，请到 Mac 端或显示器菜单切回；如果共享屏此刻明明在 Windows 侧，再把设置页里的“显示器名称”改成 Windows 实际识别到的名称。`;
   }
 
   const noPhysicalHandleMatch = /^No physical monitor handles were found for '([^']+)'\.$/i.exec(rawMessage);
@@ -709,6 +732,9 @@ async function handleConfigSave(request, response, requestUrl) {
   state.config = config;
   saveState(state);
   refreshMenu();
+  if (process.platform === "win32") {
+    void refreshWindowsMonitorAvailability();
+  }
 
   redirectToSettingsPage(response, requestUrl, {
     status: "success",
@@ -1064,6 +1090,60 @@ async function getAvailableMonitorNames() {
   } catch {
     return [];
   }
+}
+
+function normalizeMonitorToken(value) {
+  return normalizeText(value).replace(/[^0-9A-Za-z]+/g, "").toLowerCase();
+}
+
+function doesMonitorListContainConfiguredMonitor(monitorNames, configuredName) {
+  const requestedName = normalizeText(configuredName);
+  if (!requestedName) {
+    return false;
+  }
+
+  const requestedToken = normalizeMonitorToken(requestedName);
+  const exactMatches = monitorNames.filter(
+    (name) => normalizeText(name).toLowerCase() === requestedName.toLowerCase()
+  );
+  if (exactMatches.length === 1) {
+    return true;
+  }
+
+  if (!requestedToken) {
+    return false;
+  }
+
+  const normalizedMatches = monitorNames.filter((name) => normalizeMonitorToken(name) === requestedToken);
+  if (normalizedMatches.length === 1) {
+    return true;
+  }
+
+  const partialMatches = monitorNames.filter((name) => {
+    const candidateToken = normalizeMonitorToken(name);
+    return (
+      candidateToken &&
+      (candidateToken.includes(requestedToken) || requestedToken.includes(candidateToken))
+    );
+  });
+
+  return partialMatches.length === 1;
+}
+
+async function assertWindowsSharedMonitorAvailableForSwitch() {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const names = await getAvailableMonitorNames();
+  updateWindowsMonitorAvailability(names);
+
+  if (doesMonitorListContainConfiguredMonitor(names, state.config.monitorName)) {
+    return;
+  }
+
+  const availableText = names.length > 0 ? names.join("、") : "<none>";
+  throw new Error(`No monitor matched '${state.config.monitorName}'. Available monitors: ${availableText}`);
 }
 
 async function getMonitorDiagnostics() {
@@ -1428,16 +1508,16 @@ function renderMonitorHints(monitorNames) {
   }
 
   const configuredName = normalizeText(state.config.monitorName);
-  const hasConfiguredMatch =
-    configuredName &&
-    monitorNames.some((name) => normalizeText(name).toLowerCase() === configuredName.toLowerCase());
+  const hasConfiguredMatch = doesMonitorListContainConfiguredMonitor(monitorNames, configuredName);
   const mismatchBanner =
     configuredName && !hasConfiguredMatch
       ? `<div class="banner error">当前配置填写的是 ${escapeHtml(
           configuredName
         )}，但系统检测到的显示器名称是：${monitorNames
           .map(escapeHtml)
-          .join("、")}。切换失败时，通常就是这个名称没有对上。</div>`
+          .join(
+            "、"
+          )}。如果共享屏现在已经切到另一台电脑，这是正常的；如果它此刻明明在 Windows 侧却仍不匹配，再把这里改成 Windows 实际识别到的名称。</div>`
       : "";
 
   return `<div>
@@ -2154,6 +2234,7 @@ function startWindowsRestoreWatcher() {
 
   const scheduleAttempt = () => {
     void attemptPendingWindowsDesktopRestore();
+    void refreshWindowsMonitorAvailability();
   };
 
   screen.on("display-added", () => {
@@ -2167,6 +2248,70 @@ function startWindowsRestoreWatcher() {
 
   windowsRestoreTimer = setInterval(scheduleAttempt, 2500);
   scheduleAttempt();
+}
+
+async function refreshWindowsMonitorAvailability() {
+  if (process.platform !== "win32" || windowsMonitorAvailabilityInFlight) {
+    return;
+  }
+
+  windowsMonitorAvailabilityInFlight = true;
+
+  try {
+    const names = await getAvailableMonitorNames();
+    updateWindowsMonitorAvailability(names);
+  } finally {
+    windowsMonitorAvailabilityInFlight = false;
+  }
+}
+
+function updateWindowsMonitorAvailability(names) {
+  const monitorNames = Array.isArray(names) ? names.filter(Boolean) : [];
+  const nextAvailability = createWindowsMonitorAvailabilitySnapshot(monitorNames);
+
+  if (
+    windowsMonitorAvailability.status === nextAvailability.status &&
+    windowsMonitorAvailability.message === nextAvailability.message &&
+    windowsMonitorAvailability.names.join("\n") === nextAvailability.names.join("\n")
+  ) {
+    return;
+  }
+
+  windowsMonitorAvailability = nextAvailability;
+  refreshMenu();
+}
+
+function createWindowsMonitorAvailabilitySnapshot(monitorNames) {
+  if (process.platform !== "win32") {
+    return {
+      status: "unknown",
+      names: [],
+      message: "",
+    };
+  }
+
+  if (!normalizeText(state.config.monitorName)) {
+    return {
+      status: "unknown",
+      names: monitorNames,
+      message: "",
+    };
+  }
+
+  if (doesMonitorListContainConfiguredMonitor(monitorNames, state.config.monitorName)) {
+    return {
+      status: "visible",
+      names: monitorNames,
+      message: "",
+    };
+  }
+
+  const visibleText = monitorNames.length > 0 ? monitorNames.join("、") : "没有检测到任何显示器";
+  return {
+    status: "missing",
+    names: monitorNames,
+    message: `${state.config.monitorName} 当前不在 Windows 侧；现在看到的是 ${visibleText}。请到 Mac 端或显示器菜单切回。`,
+  };
 }
 
 function startWindowsTrayWatcher() {
