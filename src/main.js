@@ -4,17 +4,17 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const APP_NAME = "G72 Input Switch Tray";
+const APP_NAME = "G72 输入切换";
 const MONITOR_NAME = "G72";
 const TARGETS = {
   windows: {
     id: "windows",
-    label: "Windows (DP2)",
+    label: "Windows（DP2）",
     value: 16,
   },
   mac: {
     id: "mac",
-    label: "Mac mini (HDMI1)",
+    label: "Mac mini（HDMI1）",
     value: 17,
   },
 };
@@ -75,8 +75,8 @@ function refreshMenu() {
   const menu = Menu.buildFromTemplate([
     {
       label: state.lastTarget
-        ? `Current: ${TARGETS[state.lastTarget].label}`
-        : "Current: not switched by this app yet",
+        ? `当前输入：${TARGETS[state.lastTarget].label}`
+        : "当前输入：尚未通过此应用切换",
       enabled: false,
     },
     { type: "separator" },
@@ -94,7 +94,7 @@ function refreshMenu() {
     },
     { type: "separator" },
     {
-      label: "Launch at login",
+      label: "开机时启动",
       type: "checkbox",
       checked: openAtLogin,
       click: (item) => {
@@ -105,16 +105,16 @@ function refreshMenu() {
       },
     },
     {
-      label: "Reveal app folder",
+      label: "打开应用所在文件夹",
       click: () => shell.showItemInFolder(process.execPath),
     },
     { type: "separator" },
     {
-      label: "Uninstall...",
+      label: "卸载...",
       click: () => uninstallApp(),
     },
     {
-      label: "Quit",
+      label: "退出",
       click: () => app.quit(),
     },
   ]);
@@ -129,17 +129,17 @@ async function switchMonitor(target) {
     } else if (process.platform === "darwin") {
       await switchOnMac(target);
     } else {
-      throw new Error(`Unsupported platform: ${process.platform}`);
+      throw new Error(`当前平台不受支持：${process.platform}`);
     }
 
     state.lastTarget = target.id;
     saveState(state);
     refreshMenu();
-    notify(`Switched ${MONITOR_NAME} to ${target.label}.`);
+    notify(`已将 ${MONITOR_NAME} 切换到 ${target.label}。`);
   } catch (error) {
     dialog.showErrorBox(
       APP_NAME,
-      `${target.label} switch failed.\n\n${error.message}`
+      `${target.label} 切换失败。\n\n${error.message}`
     );
   }
 }
@@ -171,15 +171,15 @@ function uninstallApp() {
     ? {
         response: dialog.showMessageBoxSync({
           type: "question",
-          buttons: ["Cancel", "Uninstall"],
+          buttons: ["取消", "卸载"],
           defaultId: 1,
           cancelId: 0,
           title: APP_NAME,
-          message: "Uninstall G72 Input Switch Tray?",
+          message: "要卸载 G72 输入切换吗？",
           detail:
             process.platform === "win32"
-              ? "The Windows uninstaller will open."
-              : "The app will quit and then remove itself from Applications.",
+              ? "将打开 Windows 卸载程序。"
+              : "应用将退出，然后从“应用程序”中移除自身。",
         }),
       }
     : { response: 0 };
@@ -200,7 +200,7 @@ function uninstallApp() {
     return;
   }
 
-  dialog.showErrorBox(APP_NAME, `Uninstall is not supported on ${process.platform}.`);
+  dialog.showErrorBox(APP_NAME, `当前平台不支持卸载：${process.platform}。`);
 }
 
 function uninstallOnWindows() {
@@ -209,13 +209,13 @@ function uninstallOnWindows() {
   const uninstallFile = entries.find((entry) => /^Uninstall .*\.exe$/i.test(entry));
 
   if (!uninstallFile) {
-    dialog.showErrorBox(APP_NAME, "Windows uninstaller was not found next to the app executable.");
+    dialog.showErrorBox(APP_NAME, "在应用可执行文件旁未找到 Windows 卸载程序。");
     return;
   }
 
   execFile(path.join(appDir, uninstallFile), (error) => {
     if (error) {
-      dialog.showErrorBox(APP_NAME, `Unable to open the uninstaller.\n\n${error.message}`);
+      dialog.showErrorBox(APP_NAME, `无法打开卸载程序。\n\n${error.message}`);
     }
   });
 

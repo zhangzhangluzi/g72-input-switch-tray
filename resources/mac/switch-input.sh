@@ -14,7 +14,7 @@ case "$TARGET" in
     INPUT_VALUE=17
     ;;
   *)
-    echo "Usage: $0 windows|mac" >&2
+    echo "用法：$0 windows|mac" >&2
     exit 1
     ;;
 esac
@@ -35,5 +35,5 @@ if command -v ddcctl >/dev/null 2>&1; then
   exit 0
 fi
 
-echo "No macOS DDC helper is available. Install BetterDisplay CLI or ddcctl." >&2
+echo "没有可用的 macOS DDC 辅助程序。请安装 BetterDisplay CLI 或 ddcctl。" >&2
 exit 1
