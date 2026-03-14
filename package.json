@@ -1,0 +1,87 @@
+{
+  "name": "g72-input-switch-tray",
+  "version": "0.1.0",
+  "description": "Cross-platform tray app for switching G72 between DP2 (Windows) and HDMI1 (Mac mini).",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --publish never",
+    "dist:win": "electron-builder --win nsis --publish never",
+    "dist:mac": "electron-builder --mac dmg zip --publish never",
+    "release": "electron-builder --publish always"
+  },
+  "keywords": [
+    "electron",
+    "tray",
+    "monitor",
+    "ddc-ci"
+  ],
+  "author": "zhangzhangluzi",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "electron": "^41.0.2",
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "appId": "com.zhangzhangluzi.g72inputswitchtray",
+    "productName": "G72 Input Switch Tray",
+    "asar": true,
+    "directories": {
+      "buildResources": "assets",
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": "resources",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "zhangzhangluzi",
+        "repo": "g72-input-switch-tray"
+      }
+    ],
+    "mac": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "category": "public.app-category.utilities",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "darkModeSupport": true,
+      "extendInfo": {
+        "LSUIElement": "1"
+      }
+    },
+    "win": {
+      "artifactName": "${productName}-${version}-setup.${ext}",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "G72 Input Switch Tray"
+    }
+  }
+}
