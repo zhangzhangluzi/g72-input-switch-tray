@@ -183,7 +183,7 @@ async function switchMonitor(targetId, options = {}) {
 
   try {
     if (process.platform === "win32") {
-      await switchOnWindows(target);
+      await switchOnWindows(targetId, target);
     } else if (process.platform === "darwin") {
       await switchOnMac(target);
     } else {
@@ -209,9 +209,9 @@ async function switchMonitor(targetId, options = {}) {
   }
 }
 
-function switchOnWindows(target) {
+async function switchOnWindows(targetId, target) {
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
-  return runCommand("powershell.exe", [
+  await runCommand("powershell.exe", [
     "-NoProfile",
     "-ExecutionPolicy",
     "Bypass",
@@ -222,6 +222,27 @@ function switchOnWindows(target) {
     "-InputValue",
     String(target.inputValue),
   ]);
+
+  // On Windows, switching to the "other machine" should make this monitor
+  // disappear from the local display list. If it never detaches, the command
+  // did not produce a real input change on the monitor.
+  if (targetId === "mac") {
+    const transition = await waitForWindowsMonitorDetachment(state.config.monitorName);
+
+    if (transition === "detached") {
+      return;
+    }
+
+    if (transition === "briefly-detached") {
+      throw new Error(
+        "显示器短暂离开了 Windows 又马上回来了。通常是目标输入没有稳定信号，或显示器启用了自动输入源后又切回当前画面。"
+      );
+    }
+
+    throw new Error(
+      "显示器在切换命令后仍然一直留在 Windows 上，没有真正离开当前输入。请先确认目标设备正在输出稳定画面，并检查显示器 OSD 里的自动输入源/DDC 设置。若这些都正常，通常就是这台显示器不接受通过 DDC/CI 切换输入源。"
+    );
+  }
 }
 
 function switchOnMac(target) {
@@ -560,6 +581,28 @@ async function getAvailableMonitorNames() {
   } catch {
     return [];
   }
+}
+
+async function waitForWindowsMonitorDetachment(monitorName, timeoutMs = 5000, intervalMs = 250) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    const isAttached = await isWindowsMonitorAttached(monitorName);
+
+    if (!isAttached) {
+      await delay(1200);
+      return (await isWindowsMonitorAttached(monitorName)) ? "briefly-detached" : "detached";
+    }
+
+    await delay(intervalMs);
+  }
+
+  return "still-attached";
+}
+
+async function isWindowsMonitorAttached(monitorName) {
+  const names = await getAvailableMonitorNames();
+  return names.includes(monitorName);
 }
 
 async function getMonitorDiagnostics() {
@@ -1153,6 +1196,12 @@ function normalizePositiveInteger(value, fallbackValue) {
 function parseInputValue(value) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isInteger(parsed) ? parsed : NaN;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function escapeHtml(value) {

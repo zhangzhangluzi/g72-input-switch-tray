@@ -24,6 +24,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 
 - Windows switching is done with a bundled PowerShell DDC/CI helper that maps the target monitor through Win32 and WMI. The installer does **not** bundle `.NET`.
 - Some monitors do not report a trustworthy “current input” value over DDC/CI. The app now treats the tray state as the last command sent, and the settings page shows monitor diagnostics when Windows can read them.
+- When Windows sends a switch-away command, the app now verifies that the monitor actually disappears from the local display list. If it stays attached, the app reports the switch as failed instead of pretending it worked.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching prefers a bundled `ddcctl` binary built during the macOS GitHub Actions release job.
 - If the bundled macOS helper is unavailable, the app falls back to `betterdisplaycli` and then `ddcctl` from `PATH`.
