@@ -1,13 +1,23 @@
 param(
-    [Parameter(Mandatory = $true)]
     [string]$MonitorName,
 
-    [Parameter(Mandatory = $true)]
-    [ValidateSet(16, 17)]
-    [int]$InputValue
+    [ValidateRange(1, 255)]
+    [int]$InputValue,
+
+    [switch]$ListOnly
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $ListOnly) {
+    if ([string]::IsNullOrWhiteSpace($MonitorName)) {
+        throw "MonitorName was not provided."
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("InputValue")) {
+        throw "InputValue was not provided."
+    }
+}
 
 Add-Type @"
 using System;
@@ -268,7 +278,13 @@ if ($null -eq $targetLogicalMonitor) {
         "<none>"
     }
 
-    throw "No logical monitor matched '$MonitorName'. Available monitors: $availableText"
+    if ($ListOnly) {
+        $uniqueMonitors = $availableMonitors | Sort-Object -Unique
+        Write-Output ($uniqueMonitors | ConvertTo-Json -Compress)
+        exit 0
+    }
+
+    throw "No monitor matched '$MonitorName'. Available monitors: $availableText"
 }
 
 $physicalMonitors = [NativeDisplayMapper]::GetPhysicalMonitorsForDisplay($targetLogicalMonitor.HMonitor)

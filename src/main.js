@@ -1,4 +1,4 @@
-const { app, Tray, Menu, nativeImage, Notification, dialog, shell, clipboard } = require("electron");
+const { app, Tray, Menu, nativeImage, Notification, dialog, shell } = require("electron");
 const { execFile } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -6,26 +6,22 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 
-const APP_NAME = "G72 输入切换";
-const MONITOR_NAME = "G72";
+const APP_NAME = "显示器输入切换";
 const CONTROL_PORT = 3847;
-const TARGETS = {
-  windows: {
-    id: "windows",
-    label: "Windows（DP2）",
-    value: 16,
-  },
-  mac: {
-    id: "mac",
-    label: "Mac mini（HDMI1）",
-    value: 17,
-  },
-};
+const TARGET_IDS = ["windows", "mac"];
+const COMMON_INPUT_VALUES = [
+  { value: 15, label: "15: DP1" },
+  { value: 16, label: "16: DP2" },
+  { value: 17, label: "17: HDMI1" },
+  { value: 18, label: "18: HDMI2" },
+  { value: 19, label: "19: HDMI3 / Component" },
+  { value: 27, label: "27: USB-C / Type-C（部分显示器）" },
+];
 
 let tray = null;
 let controlServer = null;
 let controlServerError = null;
-let state = { lastTarget: null, controlToken: null };
+let state = createDefaultState();
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -84,46 +80,59 @@ function refreshMenu() {
   }
 
   const openAtLogin = app.getLoginItemSettings().openAtLogin;
+  const configErrors = getConfigValidationErrors(state.config);
   const localControlUrl = getLocalControlUrl();
-  const preferredLanControlUrl = getPreferredLanControlUrl();
-  const copyControlLabel = preferredLanControlUrl ? "复制局域网控制地址" : "复制本机控制地址";
 
   const menu = Menu.buildFromTemplate([
     {
       label: state.lastTarget
-        ? `当前输入：${TARGETS[state.lastTarget].label}`
+        ? `当前输入：${getTarget(state.lastTarget).label}`
         : "当前输入：尚未通过此应用切换",
       enabled: false,
     },
     {
-      label: controlServerError
-        ? `网页控制：启动失败（${controlServerError.code || "未知错误"}）`
-        : `网页控制：${summarizeControlAddress(preferredLanControlUrl || localControlUrl)}`,
+      label: `当前显示器：${state.config.monitorName || "未设置"}`,
       enabled: false,
     },
+    {
+      label: controlServerError
+        ? `本机页面：启动失败（${controlServerError.code || "未知错误"}）`
+        : `本机页面：${summarizeControlAddress(localControlUrl)}`,
+      enabled: false,
+    },
+    ...(configErrors.length > 0
+      ? [
+          {
+            label: `配置未完成：${configErrors[0]}`,
+            enabled: false,
+          },
+        ]
+      : []),
     { type: "separator" },
     {
-      label: TARGETS.windows.label,
+      label: getTarget("windows").label,
       type: "radio",
-      checked: state.lastTarget === TARGETS.windows.id,
-      click: () => switchMonitor(TARGETS.windows),
+      checked: state.lastTarget === "windows",
+      enabled: configErrors.length === 0,
+      click: () => switchMonitor("windows"),
     },
     {
-      label: TARGETS.mac.label,
+      label: getTarget("mac").label,
       type: "radio",
-      checked: state.lastTarget === TARGETS.mac.id,
-      click: () => switchMonitor(TARGETS.mac),
+      checked: state.lastTarget === "mac",
+      enabled: configErrors.length === 0,
+      click: () => switchMonitor("mac"),
     },
     { type: "separator" },
     {
-      label: "打开本机网页控制页",
+      label: "打开本机切换页",
       enabled: !controlServerError,
       click: () => shell.openExternal(localControlUrl),
     },
     {
-      label: copyControlLabel,
+      label: "打开本机设置页",
       enabled: !controlServerError,
-      click: () => copyControlUrl(preferredLanControlUrl || localControlUrl),
+      click: () => shell.openExternal(getLocalSettingsUrl()),
     },
     {
       label: "开机时启动",
@@ -154,8 +163,20 @@ function refreshMenu() {
   tray.setContextMenu(menu);
 }
 
-async function switchMonitor(target, options = {}) {
+async function switchMonitor(targetId, options = {}) {
   const { notifyOnSuccess = true, showErrorDialog = true } = options;
+  const target = getTarget(targetId);
+  const configErrors = getConfigValidationErrors(state.config);
+
+  if (configErrors.length > 0) {
+    const error = new Error(configErrors.join(" "));
+
+    if (showErrorDialog) {
+      dialog.showErrorBox(APP_NAME, `当前配置无效。\n\n${error.message}`);
+    }
+
+    throw error;
+  }
 
   try {
     if (process.platform === "win32") {
@@ -166,12 +187,12 @@ async function switchMonitor(target, options = {}) {
       throw new Error(`当前平台不受支持：${process.platform}`);
     }
 
-    state.lastTarget = target.id;
+    state.lastTarget = targetId;
     saveState(state);
     refreshMenu();
 
     if (notifyOnSuccess) {
-      notify(`已将 ${MONITOR_NAME} 切换到 ${target.label}。`);
+      notify(`已将 ${state.config.monitorName} 切换到 ${target.label}。`);
     }
   } catch (error) {
     if (showErrorDialog) {
@@ -194,9 +215,9 @@ function switchOnWindows(target) {
     "-File",
     scriptPath,
     "-MonitorName",
-    MONITOR_NAME,
+    state.config.monitorName,
     "-InputValue",
-    String(target.value),
+    String(target.inputValue),
   ];
 
   return runCommand("powershell.exe", args);
@@ -204,7 +225,12 @@ function switchOnWindows(target) {
 
 function switchOnMac(target) {
   const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
-  return runCommand("/bin/sh", [scriptPath, target.id]);
+  return runCommand("/bin/sh", [scriptPath, String(target.inputValue)], {
+    env: {
+      DISPLAY_NAME: state.config.monitorName,
+      DISPLAY_INDEX: String(state.config.macDisplayIndex),
+    },
+  });
 }
 
 function uninstallApp() {
@@ -216,7 +242,7 @@ function uninstallApp() {
           defaultId: 1,
           cancelId: 0,
           title: APP_NAME,
-          message: "要卸载 G72 输入切换吗？",
+          message: `要卸载 ${APP_NAME} 吗？`,
           detail:
             process.platform === "win32"
               ? "将打开 Windows 卸载程序。"
@@ -265,7 +291,7 @@ function uninstallOnWindows() {
 
 function uninstallOnMac() {
   const appBundlePath = path.resolve(process.execPath, "../../..");
-  const tempScriptPath = path.join(os.tmpdir(), `g72-uninstall-${Date.now()}.sh`);
+  const tempScriptPath = path.join(os.tmpdir(), `monitor-input-switch-uninstall-${Date.now()}.sh`);
   const escapedAppPath = shellEscape(appBundlePath);
   const appleScriptPath = appleScriptEscape(appBundlePath);
 
@@ -304,7 +330,7 @@ function startControlServer() {
       }
 
       response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
-      response.end(`控制页请求失败：${error.message}`);
+      response.end(`本机页面请求失败：${error.message}`);
     });
   });
 
@@ -312,10 +338,10 @@ function startControlServer() {
     controlServerError = error;
     controlServer = null;
     refreshMenu();
-    notify(`网页控制页启动失败：${error.message}`);
+    notify(`本机页面启动失败：${error.message}`);
   });
 
-  controlServer.listen(CONTROL_PORT, "0.0.0.0", () => {
+  controlServer.listen(CONTROL_PORT, "127.0.0.1", () => {
     controlServerError = null;
     refreshMenu();
   });
@@ -325,7 +351,10 @@ async function handleControlRequest(request, response) {
   const baseUrl = `http://${request.headers.host || "127.0.0.1"}`;
   const requestUrl = new URL(request.url || "/", baseUrl);
   const controlPath = getControlPath();
+  const settingsPath = getSettingsPath();
   const statePath = `/api/${state.controlToken}/state`;
+  const configPath = `/api/${state.controlToken}/config`;
+  const monitorsPath = `/api/${state.controlToken}/monitors`;
   const windowsPath = `/api/${state.controlToken}/switch/windows`;
   const macPath = `/api/${state.controlToken}/switch/mac`;
 
@@ -334,6 +363,7 @@ async function handleControlRequest(request, response) {
       ok: true,
       appName: APP_NAME,
       lastTarget: state.lastTarget,
+      monitorName: state.config.monitorName,
     });
   }
 
@@ -342,7 +372,23 @@ async function handleControlRequest(request, response) {
       ok: true,
       lastTarget: state.lastTarget,
       currentLabel: getCurrentTargetLabel(),
-      targets: TARGETS,
+      config: state.config,
+    });
+  }
+
+  if (requestUrl.pathname === configPath && request.method === "GET") {
+    return writeJson(response, 200, {
+      ok: true,
+      config: state.config,
+    });
+  }
+
+  if (requestUrl.pathname === monitorsPath) {
+    const monitors = await getAvailableMonitorNames();
+
+    return writeJson(response, 200, {
+      ok: true,
+      monitors,
     });
   }
 
@@ -350,19 +396,28 @@ async function handleControlRequest(request, response) {
     return writeHtml(response, 200, renderControlPage(requestUrl));
   }
 
+  if (requestUrl.pathname === settingsPath) {
+    const monitors = await getAvailableMonitorNames();
+    return writeHtml(response, 200, renderSettingsPage(requestUrl, monitors));
+  }
+
+  if (requestUrl.pathname === configPath && request.method === "POST") {
+    return handleConfigSave(request, response, requestUrl);
+  }
+
   if (requestUrl.pathname === windowsPath) {
-    return handleControlSwitch(request, response, requestUrl, TARGETS.windows);
+    return handleControlSwitch(request, response, requestUrl, "windows");
   }
 
   if (requestUrl.pathname === macPath) {
-    return handleControlSwitch(request, response, requestUrl, TARGETS.mac);
+    return handleControlSwitch(request, response, requestUrl, "mac");
   }
 
   response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-  response.end("未找到控制页。");
+  response.end("未找到对应页面。");
 }
 
-async function handleControlSwitch(request, response, requestUrl, target) {
+async function handleControlSwitch(request, response, requestUrl, targetId) {
   if (!["GET", "POST"].includes(request.method || "GET")) {
     response.writeHead(405, {
       "Allow": "GET, POST",
@@ -373,36 +428,140 @@ async function handleControlSwitch(request, response, requestUrl, target) {
   }
 
   if (request.method === "POST") {
-    await consumeRequestBody(request);
+    await readRequestBody(request);
   }
 
   try {
-    await switchMonitor(target, {
+    await switchMonitor(targetId, {
       notifyOnSuccess: false,
       showErrorDialog: false,
     });
 
     redirectToControlPage(response, requestUrl, {
       status: "success",
-      target: target.id,
+      target: targetId,
     });
   } catch (error) {
     redirectToControlPage(response, requestUrl, {
       status: "error",
-      target: target.id,
+      target: targetId,
       message: error.message,
     });
   }
 }
 
-function redirectToControlPage(response, requestUrl, query) {
-  const nextUrl = new URL(getControlPath(), requestUrl);
+async function handleConfigSave(request, response, requestUrl) {
+  const body = await readRequestBody(request);
+  const form = new URLSearchParams(body);
+  const { config, errors } = buildConfigFromForm(form);
 
-  Object.entries(query).forEach(([key, value]) => {
+  if (errors.length > 0) {
+    redirectToSettingsPage(response, requestUrl, {
+      status: "error",
+      message: errors.join(" "),
+    });
+    return;
+  }
+
+  state.config = config;
+  saveState(state);
+  refreshMenu();
+
+  redirectToSettingsPage(response, requestUrl, {
+    status: "success",
+  });
+}
+
+function buildConfigFromForm(form) {
+  const config = {
+    monitorName: normalizeText(form.get("monitorName")),
+    macDisplayIndex: normalizePositiveInteger(form.get("macDisplayIndex"), 1),
+    targets: {
+      windows: {
+        label: normalizeText(form.get("windowsLabel")),
+        inputValue: parseInputValue(form.get("windowsInputValue")),
+      },
+      mac: {
+        label: normalizeText(form.get("macLabel")),
+        inputValue: parseInputValue(form.get("macInputValue")),
+      },
+    },
+  };
+
+  return {
+    config,
+    errors: getConfigValidationErrors(config),
+  };
+}
+
+function getConfigValidationErrors(config) {
+  const errors = [];
+
+  if (!normalizeText(config.monitorName)) {
+    errors.push("显示器名称不能为空。");
+  }
+
+  if (!Number.isInteger(config.macDisplayIndex) || config.macDisplayIndex < 1) {
+    errors.push("macOS 显示器序号必须是大于等于 1 的整数。");
+  }
+
+  for (const targetId of TARGET_IDS) {
+    const target = config.targets?.[targetId];
+
+    if (!normalizeText(target?.label)) {
+      errors.push(`${getTargetSlotName(targetId)} 的名称不能为空。`);
+    }
+
+    if (!Number.isInteger(target?.inputValue) || target.inputValue < 1 || target.inputValue > 255) {
+      errors.push(`${getTargetSlotName(targetId)} 的输入值必须是 1 到 255 的整数。`);
+    }
+  }
+
+  return Array.from(new Set(errors));
+}
+
+function getTargetSlotName(targetId) {
+  return targetId === "windows" ? "模式 A" : "模式 B";
+}
+
+async function getAvailableMonitorNames() {
+  if (process.platform !== "win32") {
+    return [];
+  }
+
+  try {
+    const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
+    const output = await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-ListOnly",
+    ]);
+    const parsed = JSON.parse(output);
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function redirectToControlPage(response, requestUrl, query) {
+  redirectToPath(response, requestUrl, getControlPath(), query);
+}
+
+function redirectToSettingsPage(response, requestUrl, query) {
+  redirectToPath(response, requestUrl, getSettingsPath(), query);
+}
+
+function redirectToPath(response, requestUrl, pathName, query) {
+  const nextUrl = new URL(pathName, requestUrl);
+
+  for (const [key, value] of Object.entries(query)) {
     if (value) {
       nextUrl.searchParams.set(key, value);
     }
-  });
+  }
 
   response.writeHead(303, {
     "Location": `${nextUrl.pathname}${nextUrl.search}`,
@@ -413,12 +572,12 @@ function redirectToControlPage(response, requestUrl, query) {
 
 function renderControlPage(requestUrl) {
   const status = requestUrl.searchParams.get("status");
-  const target = requestUrl.searchParams.get("target");
+  const targetId = requestUrl.searchParams.get("target");
   const message = requestUrl.searchParams.get("message");
   const currentLabel = getCurrentTargetLabel();
-  const preferredLanControlUrl = getPreferredLanControlUrl();
-  const addressText = preferredLanControlUrl || getLocalControlUrl();
-  const statusHtml = renderStatusBanner(status, target, message);
+  const addressText = getLocalControlUrl();
+  const statusHtml = renderStatusBanner(status, targetId, message);
+  const configErrors = getConfigValidationErrors(state.config);
 
   return `<!doctype html>
 <html lang="zh-Hant">
@@ -427,19 +586,263 @@ function renderControlPage(requestUrl) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(APP_NAME)} 控制页</title>
   <style>
+    ${renderSharedStyles()}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">Local Switch</div>
+    <h1>${escapeHtml(APP_NAME)}</h1>
+    <p>当前记录的输入源：${escapeHtml(currentLabel)}</p>
+    <div class="stack">
+      ${statusHtml}
+      ${configErrors.length > 0 ? `<div class="banner error">${escapeHtml(configErrors.join(" "))}</div>` : ""}
+      <div class="card meta-grid">
+        <div>
+          <strong>显示器</strong>
+          <p>${escapeHtml(state.config.monitorName)}</p>
+        </div>
+        <div>
+          <strong>macOS 序号</strong>
+          <p>${escapeHtml(String(state.config.macDisplayIndex))}</p>
+        </div>
+      </div>
+      <div class="card grid">
+        <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/windows">
+          <button type="submit"${configErrors.length > 0 ? " disabled" : ""}>切到 ${escapeHtml(getTarget("windows").label)}</button>
+        </form>
+        <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/mac">
+          <button class="secondary" type="submit"${configErrors.length > 0 ? " disabled" : ""}>切到 ${escapeHtml(getTarget("mac").label)}</button>
+        </form>
+      </div>
+      <div class="card">
+        <p>这个页面只用于当前有画面的这台机器进行切换。它不会负责在黑屏后自行切回。</p>
+      </div>
+      <div class="card">
+        <p>本机地址</p>
+        <code>${escapeHtml(addressText)}</code>
+      </div>
+      <div class="actions">
+        <a href="${escapeHtml(getSettingsPath())}">打开设置页</a>
+      </div>
+    </div>
+  </main>
+</body>
+</html>`;
+}
+
+function renderSettingsPage(requestUrl, monitorNames) {
+  const status = requestUrl.searchParams.get("status");
+  const message = requestUrl.searchParams.get("message");
+  const statusHtml = renderSettingsBanner(status, message);
+  const monitorHintHtml = renderMonitorHints(monitorNames);
+
+  return `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(APP_NAME)} 设置页</title>
+  <style>
+    ${renderSharedStyles()}
+    form {
+      display: grid;
+      gap: 16px;
+    }
+    label {
+      display: grid;
+      gap: 8px;
+      font-weight: 700;
+      color: var(--ink);
+    }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 13px 14px;
+      font-size: 16px;
+      background: rgba(255, 255, 255, 0.96);
+      color: var(--ink);
+    }
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .tip-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .pill {
+      padding: 8px 10px;
+      border-radius: 999px;
+      background: rgba(13, 107, 98, 0.1);
+      color: var(--accent-strong);
+      font-size: 13px;
+    }
+    .help {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .section-title {
+      margin: 4px 0 0;
+      font-size: 20px;
+    }
+    .actions-row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .link-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 52px;
+      padding: 0 18px;
+      border-radius: 16px;
+      text-decoration: none;
+      color: var(--ink);
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.7);
+      font-weight: 700;
+    }
+    @media (max-width: 640px) {
+      .two-col {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">Local Setup</div>
+    <h1>${escapeHtml(APP_NAME)} 设置</h1>
+    <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。Mac 端和 Windows 端都是当前有画面时本机发起切换。</p>
+    <div class="stack">
+      ${statusHtml}
+      <div class="card">
+        <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/config">
+          <label>
+            显示器名称
+            <input name="monitorName" value="${escapeHtml(state.config.monitorName)}" placeholder="例如：G72、DELL U2723QE、LG ULTRAGEAR">
+          </label>
+          <div class="help">
+            Windows 会按这个名字去匹配目标显示器。macOS 若使用 BetterDisplay CLI 也会参考这个名称；若走内置 ddcctl，则会用下面的显示器序号。
+          </div>
+          ${monitorHintHtml}
+          <label>
+            macOS 显示器序号
+            <input name="macDisplayIndex" type="number" min="1" step="1" value="${escapeHtml(String(state.config.macDisplayIndex))}">
+          </label>
+          <div class="help">
+            这个值只影响 Mac 版本在“当前有画面时”的本机切换。单屏通常填 1；如果 Mac 上连了多台支持 DDC/CI 的显示器，可能需要改成 2、3 等。
+          </div>
+          <div class="card soft">
+            <div class="section-title">模式 A</div>
+            <div class="two-col">
+              <label>
+                名称
+                <input name="windowsLabel" value="${escapeHtml(state.config.targets.windows.label)}" placeholder="例如：工作电脑、游戏主机、Windows">
+              </label>
+              <label>
+                输入值
+                <input name="windowsInputValue" type="number" min="1" max="255" step="1" value="${escapeHtml(String(state.config.targets.windows.inputValue))}">
+              </label>
+            </div>
+            <div class="help">常见值：DP1=15，DP2=16，HDMI1=17，HDMI2=18。</div>
+          </div>
+          <div class="card soft">
+            <div class="section-title">模式 B</div>
+            <div class="two-col">
+              <label>
+                名称
+                <input name="macLabel" value="${escapeHtml(state.config.targets.mac.label)}" placeholder="例如：Mac mini、笔记本、Apple TV">
+              </label>
+              <label>
+                输入值
+                <input name="macInputValue" type="number" min="1" max="255" step="1" value="${escapeHtml(String(state.config.targets.mac.inputValue))}">
+              </label>
+            </div>
+            <div class="help">如果你的显示器把 USB-C 当作 DP，通常会用 15 或 16，而不一定是独立值。</div>
+          </div>
+          <div class="card">
+            <div class="help">常见输入值参考</div>
+            <div class="tip-list">
+              ${COMMON_INPUT_VALUES.map((item) => `<span class="pill">${escapeHtml(item.label)}</span>`).join("")}
+            </div>
+          </div>
+          <button type="submit">保存设置</button>
+        </form>
+      </div>
+      <div class="actions-row">
+        <a class="link-button" href="${escapeHtml(getControlPath())}">返回控制页</a>
+      </div>
+    </div>
+  </main>
+</body>
+</html>`;
+}
+
+function renderMonitorHints(monitorNames) {
+  if (monitorNames.length === 0) {
+    return `<div class="help">当前平台没有自动列出显示器名称时，直接手动填写即可。若切换失败，错误提示里也会告诉你当前可用名称。</div>`;
+  }
+
+  return `<div>
+    <div class="help">当前检测到的显示器名称</div>
+    <div class="tip-list">
+      ${monitorNames.map((name) => `<span class="pill">${escapeHtml(name)}</span>`).join("")}
+    </div>
+  </div>`;
+}
+
+function renderStatusBanner(status, targetId, message) {
+  if (status === "success" && targetId && TARGET_IDS.includes(targetId)) {
+    return `<div class="banner success">已切换到 ${escapeHtml(getTarget(targetId).label)}。</div>`;
+  }
+
+  if (status === "error") {
+    const targetLabel = TARGET_IDS.includes(targetId) ? getTarget(targetId).label : "目标模式";
+    const detail = message ? ` ${escapeHtml(message)}` : "";
+    return `<div class="banner error">${escapeHtml(targetLabel)} 切换失败。${detail}</div>`;
+  }
+
+  return "";
+}
+
+function renderSettingsBanner(status, message) {
+  if (status === "success") {
+    return `<div class="banner success">设置已保存。新的切换规则会立刻生效。</div>`;
+  }
+
+  if (status === "error" && message) {
+    return `<div class="banner error">${escapeHtml(message)}</div>`;
+  }
+
+  return "";
+}
+
+function renderSharedStyles() {
+  return `
     :root {
       color-scheme: light;
-      --bg: #f5efe3;
-      --panel: rgba(255, 252, 245, 0.92);
+      --bg: #f4efe4;
+      --panel: rgba(255, 252, 246, 0.94);
       --ink: #1f2a2c;
-      --muted: #5b6769;
+      --muted: #596466;
       --accent: #0d6b62;
       --accent-strong: #08463f;
-      --danger: #9b2f1f;
-      --danger-bg: #fce9e3;
-      --success: #116149;
-      --success-bg: #e8f6ef;
-      --border: rgba(31, 42, 44, 0.12);
+      --accent-warm: #d46d2f;
+      --accent-warm-strong: #9b4519;
+      --danger: #962f1d;
+      --danger-bg: #fbe8e2;
+      --success: #145e47;
+      --success-bg: #e7f5ed;
+      --border: rgba(31, 42, 44, 0.14);
       font-family: "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
     }
     body {
@@ -449,37 +852,73 @@ function renderControlPage(requestUrl) {
       place-items: center;
       background:
         radial-gradient(circle at top left, rgba(13, 107, 98, 0.18), transparent 32%),
-        radial-gradient(circle at bottom right, rgba(230, 122, 46, 0.14), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(212, 109, 47, 0.16), transparent 28%),
         var(--bg);
       color: var(--ink);
     }
     main {
-      width: min(92vw, 560px);
-      padding: 28px;
+      width: min(94vw, 680px);
+      padding: 30px;
       border: 1px solid var(--border);
-      border-radius: 24px;
+      border-radius: 28px;
       background: var(--panel);
       box-shadow: 0 18px 60px rgba(31, 42, 44, 0.12);
       backdrop-filter: blur(10px);
     }
+    .eyebrow {
+      margin-bottom: 10px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
     h1 {
       margin: 0 0 10px;
       font-size: 30px;
+      line-height: 1.15;
     }
     p {
       margin: 0;
       line-height: 1.6;
       color: var(--muted);
     }
+    strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
     .stack {
       display: grid;
       gap: 14px;
-      margin-top: 22px;
+      margin-top: 24px;
+    }
+    .grid {
+      display: grid;
+      gap: 12px;
+    }
+    .meta-grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .card {
+      padding: 16px 18px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--border);
+    }
+    .card.soft {
+      background: rgba(255, 255, 255, 0.56);
     }
     .banner {
       padding: 12px 14px;
       border-radius: 16px;
       font-size: 14px;
+      line-height: 1.5;
     }
     .banner.success {
       background: var(--success-bg);
@@ -488,16 +927,6 @@ function renderControlPage(requestUrl) {
     .banner.error {
       background: var(--danger-bg);
       color: var(--danger);
-    }
-    .card {
-      padding: 16px 18px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.7);
-      border: 1px solid var(--border);
-    }
-    .grid {
-      display: grid;
-      gap: 12px;
     }
     button {
       width: 100%;
@@ -511,59 +940,37 @@ function renderControlPage(requestUrl) {
       background: linear-gradient(135deg, var(--accent), var(--accent-strong));
     }
     button.secondary {
-      background: linear-gradient(135deg, #d56a2a, #9d4215);
+      background: linear-gradient(135deg, var(--accent-warm), var(--accent-warm-strong));
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
     }
     code {
+      display: inline-block;
+      margin-top: 8px;
       word-break: break-all;
       font-size: 13px;
       color: var(--ink);
     }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>${escapeHtml(APP_NAME)}</h1>
-    <p>当前记录的输入源：${escapeHtml(currentLabel)}</p>
-    <div class="stack">
-      ${statusHtml}
-      <div class="card grid">
-        <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/windows">
-          <button type="submit">切到 Windows（DP2）</button>
-        </form>
-        <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/mac">
-          <button class="secondary" type="submit">切到 Mac mini（HDMI1）</button>
-        </form>
-      </div>
-      <div class="card">
-        <p>先把这个页面收藏到手机、平板或另一台电脑。这样即使 Mac 当前没有画面，也能直接从浏览器切回来。</p>
-      </div>
-      <div class="card">
-        <p>控制地址</p>
-        <code>${escapeHtml(addressText)}</code>
-      </div>
-    </div>
-  </main>
-</body>
-</html>`;
-}
-
-function renderStatusBanner(status, target, message) {
-  if (status === "success" && target && TARGETS[target]) {
-    return `<div class="banner success">已切换到 ${escapeHtml(TARGETS[target].label)}。</div>`;
-  }
-
-  if (status === "error") {
-    const targetLabel = target && TARGETS[target] ? TARGETS[target].label : "目标输入";
-    const detail = message ? ` ${escapeHtml(message)}` : "";
-    return `<div class="banner error">${escapeHtml(targetLabel)} 切换失败。${detail}</div>`;
-  }
-
-  return "";
-}
-
-function copyControlUrl(url) {
-  clipboard.writeText(url);
-  notify(`已复制控制地址：${url}`);
+    a {
+      color: var(--accent-strong);
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+    }
+    @media (max-width: 640px) {
+      main {
+        padding: 22px;
+      }
+      .meta-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  `;
 }
 
 function summarizeControlAddress(url) {
@@ -575,45 +982,28 @@ function summarizeControlAddress(url) {
   }
 }
 
+function getTarget(targetId) {
+  return state.config.targets[targetId];
+}
+
 function getCurrentTargetLabel() {
-  return state.lastTarget ? TARGETS[state.lastTarget].label : "尚未通过此应用切换";
+  return state.lastTarget ? getTarget(state.lastTarget).label : "尚未通过此应用切换";
 }
 
 function getControlPath() {
   return `/control/${state.controlToken}`;
 }
 
+function getSettingsPath() {
+  return `/settings/${state.controlToken}`;
+}
+
 function getLocalControlUrl() {
   return `http://127.0.0.1:${CONTROL_PORT}${getControlPath()}`;
 }
 
-function getPreferredLanControlUrl() {
-  const lanAddresses = getLanIpv4Addresses();
-
-  if (lanAddresses.length === 0) {
-    return null;
-  }
-
-  return `http://${lanAddresses[0]}:${CONTROL_PORT}${getControlPath()}`;
-}
-
-function getLanIpv4Addresses() {
-  const networkInterfaces = os.networkInterfaces();
-  const addresses = [];
-
-  for (const entries of Object.values(networkInterfaces)) {
-    if (!entries) {
-      continue;
-    }
-
-    for (const entry of entries) {
-      if (entry.family === "IPv4" && !entry.internal) {
-        addresses.push(entry.address);
-      }
-    }
-  }
-
-  return Array.from(new Set(addresses));
+function getLocalSettingsUrl() {
+  return `http://127.0.0.1:${CONTROL_PORT}${getSettingsPath()}`;
 }
 
 function writeHtml(response, statusCode, html) {
@@ -632,12 +1022,32 @@ function writeJson(response, statusCode, payload) {
   response.end(JSON.stringify(payload));
 }
 
-function consumeRequestBody(request) {
+function readRequestBody(request) {
   return new Promise((resolve, reject) => {
-    request.on("data", () => {});
-    request.on("end", resolve);
+    const chunks = [];
+
+    request.on("data", (chunk) => {
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
     request.on("error", reject);
   });
+}
+
+function normalizeText(value) {
+  return String(value ?? "").trim();
+}
+
+function normalizePositiveInteger(value, fallbackValue) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallbackValue;
+}
+
+function parseInputValue(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isInteger(parsed) ? parsed : NaN;
 }
 
 function escapeHtml(value) {
@@ -660,9 +1070,21 @@ function notify(body) {
   }).show();
 }
 
-function runCommand(file, args) {
+function runCommand(file, args, options = {}) {
+  const execOptions = {
+    windowsHide: true,
+    ...options,
+  };
+
+  if (options.env) {
+    execOptions.env = {
+      ...process.env,
+      ...options.env,
+    };
+  }
+
   return new Promise((resolve, reject) => {
-    execFile(file, args, { windowsHide: true }, (error, stdout, stderr) => {
+    execFile(file, args, execOptions, (error, stdout, stderr) => {
       const combinedOutput = [stdout, stderr].filter(Boolean).join("\n").trim();
 
       if (error) {
@@ -688,18 +1110,61 @@ function getBundledResourcePath(...segments) {
   return path.join(app.getAppPath(), "resources", ...segments);
 }
 
+function createDefaultState() {
+  return {
+    lastTarget: null,
+    controlToken: crypto.randomBytes(12).toString("hex"),
+    config: createDefaultConfig(),
+  };
+}
+
+function createDefaultConfig() {
+  return {
+    monitorName: "G72",
+    macDisplayIndex: 1,
+    targets: {
+      windows: {
+        label: "Windows（DP2）",
+        inputValue: 16,
+      },
+      mac: {
+        label: "Mac mini（HDMI1）",
+        inputValue: 17,
+      },
+    },
+  };
+}
+
 function loadState() {
   try {
     return normalizeState(JSON.parse(fs.readFileSync(getStatePath(), "utf8")));
   } catch {
-    return normalizeState({});
+    return createDefaultState();
   }
 }
 
 function normalizeState(nextState) {
+  const defaults = createDefaultState();
+  const rawConfig = nextState.config || {};
+  const rawTargets = rawConfig.targets || {};
+
   return {
-    lastTarget: nextState.lastTarget || null,
-    controlToken: nextState.controlToken || crypto.randomBytes(12).toString("hex"),
+    lastTarget: TARGET_IDS.includes(nextState.lastTarget) ? nextState.lastTarget : null,
+    controlToken: normalizeText(nextState.controlToken) || defaults.controlToken,
+    config: {
+      monitorName: normalizeText(rawConfig.monitorName) || defaults.config.monitorName,
+      macDisplayIndex: normalizePositiveInteger(rawConfig.macDisplayIndex, defaults.config.macDisplayIndex),
+      targets: {
+        windows: {
+          label: normalizeText(rawTargets.windows?.label) || defaults.config.targets.windows.label,
+          inputValue: normalizePositiveInteger(rawTargets.windows?.inputValue, defaults.config.targets.windows.inputValue),
+        },
+        mac: {
+          label: normalizeText(rawTargets.mac?.label) || defaults.config.targets.mac.label,
+          inputValue: normalizePositiveInteger(rawTargets.mac?.inputValue, defaults.config.targets.mac.inputValue),
+        },
+      },
+    },
   };
 }
 

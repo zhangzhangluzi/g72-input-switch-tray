@@ -1,7 +1,7 @@
 {
   "name": "g72-input-switch-tray",
-  "version": "0.1.6",
-  "description": "用于在 DP2（Windows）和 HDMI1（Mac mini）之间切换 G72 输入源的跨平台托盘应用。",
+  "version": "0.2.0",
+  "description": "用于切换任意支持 DDC/CI 的显示器输入源的跨平台托盘应用。",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
@@ -25,7 +25,7 @@
   },
   "build": {
     "appId": "com.zhangzhangluzi.g72inputswitchtray",
-    "productName": "G72 输入切换",
+    "productName": "显示器输入切换",
     "asar": true,
     "directories": {
       "buildResources": "assets",
@@ -82,7 +82,7 @@
       "perMachine": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "G72 输入切换"
+      "shortcutName": "显示器输入切换"
     }
   }
 }
