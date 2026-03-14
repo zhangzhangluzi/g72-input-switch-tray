@@ -16,7 +16,7 @@ Cross-platform tray app for switching a `G72` monitor between:
 
 ## Platform notes
 
-- Windows switching uses the local `Twinkle Tray` executable and a fixed monitor ID of `UID512` for this setup. The installer does **not** bundle `.NET`.
+- Windows switching is done with a bundled PowerShell DDC/CI helper that maps the target monitor through Win32 and WMI. The installer does **not** bundle `.NET`.
 - macOS switching prefers a bundled `ddcctl` binary built during the macOS GitHub Actions release job.
 - If the bundled macOS helper is unavailable, the app falls back to `betterdisplaycli` and then `ddcctl` from `PATH`.
 

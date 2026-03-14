@@ -6,7 +6,6 @@ const path = require("node:path");
 
 const APP_NAME = "G72 Input Switch Tray";
 const MONITOR_NAME = "G72";
-const WINDOWS_TWINKLE_MONITOR_ID = "UID512";
 const TARGETS = {
   windows: {
     id: "windows",
@@ -146,14 +145,20 @@ async function switchMonitor(target) {
 }
 
 function switchOnWindows(target) {
-  const twinklePath = getTwinklePath();
+  const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
   const args = [
-    `--MonitorID=${WINDOWS_TWINKLE_MONITOR_ID}`,
-    `--VCP=0x60:${target.value}`,
-    "--Overlay",
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    scriptPath,
+    "-MonitorName",
+    MONITOR_NAME,
+    "-InputValue",
+    String(target.value),
   ];
 
-  return runCommand(twinklePath, args);
+  return runCommand("powershell.exe", args);
 }
 
 function switchOnMac(target) {
@@ -285,30 +290,6 @@ function getBundledResourcePath(...segments) {
   }
 
   return path.join(app.getAppPath(), "resources", ...segments);
-}
-
-function getTwinklePath() {
-  const configuredPath = process.env.G72_TWINKLE_PATH;
-  if (configuredPath && fs.existsSync(configuredPath)) {
-    return configuredPath;
-  }
-
-  const defaultPath = path.join(
-    os.homedir(),
-    "AppData",
-    "Local",
-    "Programs",
-    "twinkle-tray",
-    "Twinkle Tray.exe"
-  );
-
-  if (fs.existsSync(defaultPath)) {
-    return defaultPath;
-  }
-
-  throw new Error(
-    "Twinkle Tray was not found. Install Twinkle Tray or set G72_TWINKLE_PATH to its executable."
-  );
 }
 
 function loadState() {
