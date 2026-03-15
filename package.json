@@ -1,6 +1,6 @@
 {
   "name": "g72-input-switch-tray",
-  "version": "0.2.27",
+  "version": "0.2.28",
   "description": "用于切换任意支持 DDC/CI 的显示器输入源的跨平台托盘应用。",
   "main": "src/main.js",
   "scripts": {

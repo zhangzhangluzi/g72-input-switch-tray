@@ -2038,6 +2038,7 @@ function renderSamsungLocalProbeCard(probe) {
           .map((item) => item.name)
           .join("、")}`
       : `官方软件：${probe.officialSoftware.message}`;
+  const officialStoreLine = `官方设备库：${escapeHtml(probe.officialStore?.message || "当前未检测。")}`;
   const usbLine = `USB 证据：${escapeHtml(probe.usbEvidence.message)}`;
   const networkLine = `局域网发现：${escapeHtml(probe.networkDiscovery.message)}`;
   const softwarePills =
@@ -2046,6 +2047,18 @@ function renderSamsungLocalProbeCard(probe) {
           .map((item) => `<span class="pill">${escapeHtml(`${item.name} · ${item.path}`)}</span>`)
           .join("")
       : "";
+  const storePills =
+    probe.officialStore?.devices?.length > 0
+      ? probe.officialStore.devices
+          .map((device) => {
+            const title = device.deviceName || device.serialNumber || device.macAddress || device.host;
+            const suffix = [device.host, device.supportMode].filter(Boolean).join(" · ");
+            return `<span class="pill">${escapeHtml(`${title}${suffix ? ` · ${suffix}` : ""}`)}</span>`;
+          })
+          .join("")
+      : probe.officialStore?.path
+        ? `<span class="pill">${escapeHtml(`ESBSettings · ${probe.officialStore.path}`)}</span>`
+        : "";
   const usbPills =
     probe.usbEvidence.lines.length > 0
       ? probe.usbEvidence.lines.map((line) => `<span class="pill">${escapeHtml(line)}</span>`).join("")
@@ -2068,10 +2081,12 @@ function renderSamsungLocalProbeCard(probe) {
     <div class="help" style="margin-top: 12px;">当前状态：${escapeHtml(statusLabel)}</div>
     <div class="help">${escapeHtml(probe.summary)}</div>
     <div class="help">${escapeHtml(officialSoftwareLine)}</div>
+    <div class="help">${officialStoreLine}</div>
     <div class="help">${usbLine}</div>
     <div class="help">${networkLine}</div>
     <div class="help">${escapeHtml(probe.recommendation)}</div>
     ${softwarePills ? `<div class="tip-list" style="margin-top: 12px;">${softwarePills}</div>` : ""}
+    ${storePills ? `<div class="tip-list" style="margin-top: 12px;">${storePills}</div>` : ""}
     ${usbPills ? `<div class="tip-list" style="margin-top: 12px;">${usbPills}</div>` : ""}
     ${networkPills ? `<div class="tip-list" style="margin-top: 12px;">${networkPills}</div>` : ""}
   </div>`;

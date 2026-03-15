@@ -20,6 +20,10 @@ function normalizeToken(value) {
   return normalizeText(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
+function normalizeBoolean(value) {
+  return typeof value === "boolean" ? value : Boolean(value);
+}
+
 function execCommand(file, args, timeoutMs = 6000) {
   return new Promise((resolve, reject) => {
     execFile(file, args, { timeout: timeoutMs, windowsHide: true }, (error, stdout, stderr) => {
@@ -428,6 +432,117 @@ function buildSoftwareCandidates() {
   return [];
 }
 
+function getEasySettingBoxStoreCandidates() {
+  if (process.platform === "darwin") {
+    return [path.join(os.homedir(), "Library", "ESBSettings.plist")];
+  }
+
+  if (process.platform === "win32") {
+    return [
+      path.join(os.homedir(), "ESBSettings.plist"),
+      path.join(process.env.APPDATA || "", "ESBSettings.plist"),
+      path.join(process.env.LOCALAPPDATA || "", "ESBSettings.plist"),
+    ].filter(Boolean);
+  }
+
+  return [];
+}
+
+async function readPlistObject(plistPath) {
+  const output = await execCommand("/usr/bin/plutil", ["-convert", "json", "-o", "-", plistPath], 8000);
+  return JSON.parse(output);
+}
+
+function normalizeEasySettingBoxDevice(rawDevice) {
+  if (!rawDevice || typeof rawDevice !== "object") {
+    return null;
+  }
+
+  const host = normalizeText(rawDevice.host);
+  const deviceName = normalizeText(rawDevice.deviceName || rawDevice.name);
+  const macAddress = normalizeText(rawDevice.macAddress);
+  const supportMode = normalizeText(rawDevice.supportMode);
+  const serialNumber = normalizeText(rawDevice.serialNumber);
+  const deviceState = normalizeText(rawDevice.deviceState);
+  const autoConnect = normalizeBoolean(rawDevice.autoConnect);
+  const isSelected = normalizeBoolean(rawDevice.isSelected);
+
+  if (!host && !deviceName && !macAddress && !serialNumber) {
+    return null;
+  }
+
+  return {
+    host,
+    deviceName,
+    macAddress,
+    serialNumber,
+    supportMode,
+    deviceState,
+    autoConnect,
+    isSelected,
+  };
+}
+
+async function detectEasySettingBoxStore(monitorName) {
+  const candidates = getEasySettingBoxStoreCandidates().filter((candidate, index, array) => {
+    return array.indexOf(candidate) === index;
+  });
+  const storePath = candidates.find((candidate) => fs.existsSync(candidate));
+
+  if (!storePath) {
+    return {
+      status: "missing",
+      path: "",
+      devices: [],
+      message: "当前主机上还没有看到三星官方软件自己的设备库文件。",
+    };
+  }
+
+  try {
+    const store = await readPlistObject(storePath);
+    const rawDevices = Array.isArray(store.Devices) ? store.Devices : [];
+    const devices = rawDevices
+      .map((device) => normalizeEasySettingBoxDevice(device))
+      .filter(Boolean);
+    const monitorToken = normalizeToken(monitorName);
+    const matchedDevices = monitorToken
+      ? devices.filter((device) =>
+          [device.deviceName, device.serialNumber, device.host].some((value) => {
+            const token = normalizeToken(value);
+            return token && (token.includes(monitorToken) || monitorToken.includes(token));
+          })
+        )
+      : [];
+
+    if (devices.length === 0) {
+      return {
+        status: "empty",
+        path: storePath,
+        devices: [],
+        message: "三星官方软件自己的设备库当前是空的，说明它本机也还没有发现任何可配对的 Smart Monitor 设备。",
+      };
+    }
+
+    return {
+      status: matchedDevices.length > 0 ? "matched" : "detected",
+      path: storePath,
+      devices,
+      matchedDevices,
+      message:
+        matchedDevices.length > 0
+          ? "三星官方软件已经在自己的设备库里记录到了当前共享屏候选。"
+          : "三星官方软件已经记录到 Smart Monitor 设备，但还没和当前共享屏名字精准对上。",
+    };
+  } catch (error) {
+    return {
+      status: "error",
+      path: storePath,
+      devices: [],
+      message: normalizeText(error.message) || "读取三星官方软件设备库失败。",
+    };
+  }
+}
+
 async function detectOfficialSamsungSoftware() {
   const candidates = buildSoftwareCandidates();
   const detected = candidates.filter((candidate, index, array) => {
@@ -450,25 +565,39 @@ async function detectOfficialSamsungSoftware() {
   };
 }
 
-function buildOverallProbeStatus(officialSoftware, usbEvidence, networkDiscovery) {
+function buildOverallProbeStatus(officialSoftware, officialStore, usbEvidence, networkDiscovery) {
   const hasOfficialSoftware = officialSoftware.status === "installed";
+  const hasOfficialStoreDevice = ["matched", "detected"].includes(officialStore.status);
+  const hasMatchedOfficialStoreDevice = officialStore.status === "matched";
   const hasUsbEvidence = usbEvidence.status === "detected";
   const hasSamsungNetworkDevice = networkDiscovery.status === "discovered";
   const hasMatchedDevice = networkDiscovery.devices.some((device) => device.matchedMonitor);
 
-  if (hasOfficialSoftware && (hasUsbEvidence || hasSamsungNetworkDevice)) {
+  if (
+    (hasOfficialSoftware || hasOfficialStoreDevice) &&
+    (hasMatchedOfficialStoreDevice || hasUsbEvidence || hasSamsungNetworkDevice)
+  ) {
     return {
       status: "ready",
-      summary: hasMatchedDevice
+      summary: hasMatchedOfficialStoreDevice || hasMatchedDevice
         ? "本机已经具备三星本地私有链路的关键入口。"
         : "本机已经发现三星本地私有链路入口，但还没把它和当前共享屏精准对上。",
-      recommendation: hasMatchedDevice
+      recommendation: hasMatchedOfficialStoreDevice || hasMatchedDevice
         ? "可以继续沿官方 Easy Setting Box 的本地鉴权 / socket 协议做抓包和逆向，不必再只盯着 DDC。"
         : "下一步应该把发现到的三星设备和当前这块共享屏对上，再继续抓协议。",
     };
   }
 
-  if (hasSamsungNetworkDevice || hasUsbEvidence || hasOfficialSoftware) {
+  if (officialStore.status === "empty" && !hasUsbEvidence && !hasSamsungNetworkDevice) {
+    return {
+      status: "missing",
+      summary: "三星官方软件本机也还没有发现任何 Smart Monitor 设备。",
+      recommendation:
+        "这说明当前主机没有活的三星本地端点可打。软件可以继续做 DDC/CI 和手动切源辅助，但没法凭空创造 USB-B 或 Smart Monitor 网络入口。",
+    };
+  }
+
+  if (hasSamsungNetworkDevice || hasUsbEvidence || hasOfficialSoftware || hasOfficialStoreDevice) {
     return {
       status: "partial",
       summary: "本机只满足了三星本地私有链路的一部分前提。",
@@ -484,17 +613,19 @@ function buildOverallProbeStatus(officialSoftware, usbEvidence, networkDiscovery
 }
 
 async function probeSamsungLocalControl({ monitorName = "" } = {}) {
-  const [officialSoftware, usbEvidence, networkDiscovery] = await Promise.all([
+  const [officialSoftware, officialStore, usbEvidence, networkDiscovery] = await Promise.all([
     detectOfficialSamsungSoftware(),
+    detectEasySettingBoxStore(monitorName),
     detectUsbEvidence(),
     detectSamsungNetworkDevices(monitorName),
   ]);
-  const overall = buildOverallProbeStatus(officialSoftware, usbEvidence, networkDiscovery);
+  const overall = buildOverallProbeStatus(officialSoftware, officialStore, usbEvidence, networkDiscovery);
 
   return {
     platform: process.platform,
     monitorName: normalizeText(monitorName),
     officialSoftware,
+    officialStore,
     usbEvidence,
     networkDiscovery,
     status: overall.status,
