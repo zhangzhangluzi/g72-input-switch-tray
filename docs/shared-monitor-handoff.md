@@ -114,8 +114,15 @@ The current app is still asymmetric because input switching is local-only.
 The app now includes a first peer-confirmation layer:
 
 - each machine exposes a read-only ownership endpoint on the LAN
-- you can paste the other machine's ownership URL into local settings
+- each machine also advertises that endpoint over LAN discovery
+- when exactly one matching peer is discovered, the app uses it automatically
 - if local DDC readback is inconclusive, the app can ask the peer which side currently owns G72
+
+Normal operation should stay zero-config:
+
+- the user should not need to paste a peer URL by hand
+- discovery should happen automatically as long as both apps are running on the same LAN
+- any stored peer URL should be treated only as a legacy/debug fallback, not as the primary setup flow
 
 This improves two failure-prone cases:
 

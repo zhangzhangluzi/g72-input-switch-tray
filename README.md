@@ -8,7 +8,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - macOS: menu bar app with a click menu
 - Switching happens from the tray/menu bar, not from a separate browser switch page
 - Built-in local browser settings page for choosing the monitor name, macOS display index, and two input profiles
-- The tray/menu shows the last requested switch target, not a guaranteed real-time input readback
+- The tray/menu separates "current shared-screen owner" from "last requested switch target"
 - Optional Samsung / MStar compatibility mode for monitors whose real input-switch values do not match the standard MCCS values
 - Optional Windows desktop handoff mode that moves the desktop to the remaining screen when the target monitor switches away, then restores extend mode when that monitor comes back
 - Optional launch at login
@@ -33,8 +33,8 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - On Windows, the app now keeps switch failures user-facing and concise: monitor-name mismatches are reported together with the names Windows currently sees, instead of showing a raw PowerShell stack trace.
 - Windows monitor matching now accepts normalized names, but it no longer falls back to "the only remaining monitor" in a shared-screen setup, so the helper will not accidentally send DDC commands to the Windows fallback screen.
 - On Windows, the app now distinguishes "still enumerated by Windows" from "still owned by Windows". If the shared monitor keeps reporting an attached EDID after switching to Mac, the app reads the current input value back and treats that state as "ownership moved away" instead of assuming Windows still owns the screen.
-- The settings page now shows a real-time "shared monitor ownership" card. It separates "last command sent" from "who currently owns G72", and it can optionally trust a peer machine's read-only ownership endpoint when the local machine's DDC readback is unreliable.
-- Each app now exposes a read-only peer ownership URL on the LAN. If you paste the other machine's URL into the local settings page, the app can confirm successful handoff with the peer before declaring a switch failure.
+- The settings page now shows a real-time "shared monitor ownership" card. It separates "last command sent" from "who currently owns G72", and it can trust an auto-discovered peer machine's read-only ownership state when the local machine's DDC readback is unreliable.
+- Each app now advertises its read-only ownership state on the LAN. When exactly one matching peer is discovered, the app automatically uses that peer for handoff confirmation, so the normal flow does not require manually pasting any URL.
 - For a shared-screen setup, treat the monitor as a single-owner resource: whichever machine currently owns the visible picture is the one that should hand it off.
 - On Windows, if the shared screen is no longer visible to Windows, the tray now treats that as "ownership has moved away" and stops offering local switch actions until the screen comes back.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
@@ -45,8 +45,8 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - When a macOS switch command is accepted but the display clearly stays on the same input, the app now tells you that the configured input value is still wrong and points you back to the built-in probe assistant instead of only surfacing a generic failure.
 - If BetterDisplay CLI is unavailable, the app falls back to the bundled `ddcctl` binary built during the macOS GitHub Actions release job, and then to `ddcctl` from `PATH`.
 - When the app has to use `ddcctl`, it tries the configured macOS display index first, discovers how many external displays `ddcctl` can see, and then probes the remaining valid indices automatically.
-- The app starts a local settings page on port `3847` and binds to `127.0.0.1`.
-- If port `3847` is unavailable on Windows, the local pages automatically fall back to another free local port.
+- The app starts a local settings page on port `3847`. The HTTP server binds on the LAN so peer discovery can read the ownership endpoint, but settings/control endpoints still reject non-loopback access.
+- If port `3847` is unavailable, the local pages automatically fall back to another free local port.
 - macOS does not provide a hidden-screen self-recovery workflow. It only switches while the current Mac still has a visible picture and can launch the app/menu.
 - A longer handoff design note for the "shared screen + Windows fallback screen" model lives in `docs/shared-monitor-handoff.md`.
 

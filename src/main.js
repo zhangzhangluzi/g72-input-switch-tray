@@ -1,6 +1,7 @@
 const { app, Tray, Menu, nativeImage, Notification, dialog, shell, screen } = require("electron");
 const { execFile } = require("node:child_process");
 const crypto = require("node:crypto");
+const dgram = require("node:dgram");
 const fs = require("node:fs");
 const http = require("node:http");
 const https = require("node:https");
@@ -22,6 +23,10 @@ const PREFERRED_CONTROL_PORT = 3847;
 const TRAY_REBUILD_DELAY_MS = 1200;
 const TRAY_HEALTHCHECK_INTERVAL_MS = 5000;
 const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
+const PEER_DISCOVERY_PORT = 38479;
+const PEER_DISCOVERY_MULTICAST = "239.255.72.19";
+const PEER_DISCOVERY_INTERVAL_MS = 5000;
+const PEER_DISCOVERY_STALE_MS = 15000;
 const TARGET_IDS = ["windows", "mac"];
 const COMMON_INPUT_VALUES = [
   { value: 15, label: "15: DP1" },
@@ -45,6 +50,8 @@ let activeControlPort = PREFERRED_CONTROL_PORT;
 let windowsRestoreTimer = null;
 let windowsRestoreInFlight = false;
 let ownershipRefreshTimer = null;
+let peerDiscoverySocket = null;
+let peerDiscoveryTimer = null;
 let windowsMonitorAvailability = {
   status: "unknown",
   names: [],
@@ -57,6 +64,7 @@ let trayRebuildTimer = null;
 let trayHealthTimer = null;
 let explorerSignature = null;
 let sharedMonitorOwnership = createDefaultOwnershipSnapshot();
+let discoveredPeers = new Map();
 let state = createDefaultState();
 
 // Suppress noisy Chromium network-change logs on some Windows systems.
@@ -114,6 +122,20 @@ app.on("before-quit", () => {
     clearInterval(ownershipRefreshTimer);
     ownershipRefreshTimer = null;
   }
+
+  if (peerDiscoveryTimer) {
+    clearInterval(peerDiscoveryTimer);
+    peerDiscoveryTimer = null;
+  }
+
+  if (peerDiscoverySocket) {
+    try {
+      peerDiscoverySocket.close();
+    } catch {
+      // Ignore socket teardown errors during app exit.
+    }
+    peerDiscoverySocket = null;
+  }
 });
 
 app.whenReady().then(() => {
@@ -126,6 +148,7 @@ app.whenReady().then(() => {
   startControlServer();
   startWindowsRestoreWatcher();
   startWindowsTrayWatcher();
+  startPeerDiscovery();
   startOwnershipWatcher();
   createTray();
   refreshMenu();
@@ -1190,10 +1213,6 @@ function getConfigValidationErrors(config) {
     errors.push("Windows 桌面联动配置无效。");
   }
 
-  if (normalizeText(config.peerStatusUrl) && !isValidPeerStatusUrl(config.peerStatusUrl)) {
-    errors.push("对端状态 URL 无效。请填写完整的 http:// 或 https:// 地址。");
-  }
-
   for (const targetId of TARGET_IDS) {
     const target = config.targets?.[targetId];
 
@@ -1594,13 +1613,6 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
             只影响 Windows 版。应用只会在检测到内置屏的安全场景下调用系统“仅第二屏幕”；像台式机双外接屏这种结构，继续强推这条联动很容易黑屏。
           </div>
           ${peerStatusHtml}
-          <label>
-            对端状态 URL
-            <input name="peerStatusUrl" value="${escapeHtml(state.config.peerStatusUrl)}" placeholder="例如：http://192.168.31.8:3847/api/abcdef1234567890/ownership">
-          </label>
-          <div class="help">
-            选填。填上另一台电脑的“只读状态 URL”后，本机在本地读值不可靠时，会向对端确认 G72 是否已经成功交接。
-          </div>
           <div class="card soft">
             <div class="section-title">模式 A</div>
             <div class="two-col">
@@ -1752,17 +1764,48 @@ function renderOwnershipStatusCard(ownershipSnapshot) {
 }
 
 function renderPeerStatusCard() {
-  const peerUrls = getLocalPeerStatusUrls();
-  const peerUrlHtml =
-    peerUrls.length > 0
-      ? peerUrls.map((url) => `<span class="pill">${escapeHtml(url)}</span>`).join("")
-      : `<span class="help">当前没有检测到可分享的局域网地址。</span>`;
+  const discoveredPeersHtml = renderDiscoveredPeerPills();
 
   return `<div class="card soft">
     <div class="section-title">双端协同</div>
-    <div class="help" style="margin-top: 12px;">把下面任一地址填到另一台电脑的“对端状态 URL”，就能让两边在本地读值不稳定时互相确认 G72 是否已经交接成功。</div>
-    <div class="tip-list">${peerUrlHtml}</div>
+    <div class="help" style="margin-top: 12px;">应用会自动在局域网里发现另一台运行中的客户端，并在本地读值不稳定时自动向对端确认 G72 当前归属，不需要手填地址。</div>
+    <div class="help">${getPeerDiscoveryStatusText()}</div>
+    <div class="help" style="margin-top: 12px;">当前已发现的对端</div>
+    <div class="tip-list">${discoveredPeersHtml}</div>
   </div>`;
+}
+
+function renderDiscoveredPeerPills() {
+  const candidates = getActivePeerCandidates();
+  if (candidates.length === 0) {
+    return `<span class="help">暂未发现对端。只要另一台电脑打开应用并在同一局域网，通常几秒内就会自动出现。</span>`;
+  }
+
+  return candidates
+    .map((peer) => {
+      const ownershipText =
+        peer.ownership && ["windows", "mac"].includes(peer.ownership.owner)
+          ? `，它当前判断为 ${getTarget(peer.ownership.owner).label}`
+          : "";
+      return `<span class="pill">${escapeHtml(
+        `${peer.hostName || peer.address} · ${peer.platform || "unknown"} · ${peer.monitorName || "未标注显示器"}${ownershipText}`
+      )}</span>`;
+    })
+    .join("");
+}
+
+function getPeerDiscoveryStatusText() {
+  const candidates = getActivePeerCandidates();
+  if (candidates.length === 1) {
+    const peer = candidates[0];
+    return `已自动识别到对端：${peer.hostName || peer.address}（${peer.platform}）。切换失败时，本机会优先拿它的实时归属结果来做二次确认。`;
+  }
+
+  if (candidates.length > 1) {
+    return "检测到了多个可能的对端候选。当前不会随便选一台来确认归属，避免把别的机器误认成共享屏伙伴。";
+  }
+
+  return "还没发现可自动配对的对端，所以当前仍以本机读值为主。";
 }
 
 function renderMacProbeAssistant(macProbeDiagnostics) {
@@ -2607,6 +2650,107 @@ async function waitForDisplayCount(expectedCount, errorMessage) {
   throw new Error(errorMessage);
 }
 
+function startPeerDiscovery() {
+  peerDiscoverySocket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+
+  peerDiscoverySocket.on("error", (error) => {
+    appendDiagnosticLog("Peer discovery socket error", error);
+  });
+
+  peerDiscoverySocket.on("message", (message, remoteInfo) => {
+    handlePeerDiscoveryMessage(message, remoteInfo);
+  });
+
+  peerDiscoverySocket.bind(PEER_DISCOVERY_PORT, () => {
+    if (!peerDiscoverySocket) {
+      return;
+    }
+
+    try {
+      peerDiscoverySocket.addMembership(PEER_DISCOVERY_MULTICAST);
+      peerDiscoverySocket.setMulticastTTL(1);
+      peerDiscoverySocket.setMulticastLoopback(true);
+    } catch (error) {
+      appendDiagnosticLog("Failed to join peer discovery multicast group", error);
+    }
+  });
+
+  void broadcastPeerPresence();
+  peerDiscoveryTimer = setInterval(() => {
+    void broadcastPeerPresence();
+    pruneDiscoveredPeers();
+  }, PEER_DISCOVERY_INTERVAL_MS);
+}
+
+async function broadcastPeerPresence() {
+  if (!peerDiscoverySocket) {
+    return;
+  }
+
+  try {
+    const localOwnership = await getLocalOwnershipSnapshot();
+    const payload = Buffer.from(
+      JSON.stringify({
+        appId: APP_ID,
+        peerToken: state.peerToken,
+        platform: process.platform,
+        hostName: os.hostname(),
+        monitorName: state.config.monitorName,
+        controlPort: activeControlPort,
+        ownership: localOwnership,
+      })
+    );
+
+    peerDiscoverySocket.send(payload, PEER_DISCOVERY_PORT, PEER_DISCOVERY_MULTICAST);
+  } catch (error) {
+    appendDiagnosticLog("Failed to broadcast peer presence", error);
+  }
+}
+
+function handlePeerDiscoveryMessage(message, remoteInfo) {
+  let payload = null;
+
+  try {
+    payload = JSON.parse(String(message));
+  } catch {
+    return;
+  }
+
+  if (!payload || payload.appId !== APP_ID || normalizeText(payload.peerToken) === state.peerToken) {
+    return;
+  }
+
+  const peerKey = `${normalizeText(payload.peerToken)}@${remoteInfo.address}`;
+  discoveredPeers.set(peerKey, {
+    peerToken: normalizeText(payload.peerToken),
+    address: remoteInfo.address,
+    controlPort: Number.isInteger(payload.controlPort) ? payload.controlPort : PREFERRED_CONTROL_PORT,
+    platform: normalizeText(payload.platform),
+    hostName: normalizeText(payload.hostName),
+    monitorName: normalizeText(payload.monitorName),
+    lastSeenAt: Date.now(),
+    ownership: payload.ownership || null,
+  });
+
+  void refreshSharedMonitorOwnership();
+}
+
+function pruneDiscoveredPeers() {
+  const now = Date.now();
+  let changed = false;
+
+  for (const [peerKey, peer] of discoveredPeers.entries()) {
+    if (now - peer.lastSeenAt > PEER_DISCOVERY_STALE_MS) {
+      discoveredPeers.delete(peerKey);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    void refreshSharedMonitorOwnership();
+  }
+}
+
 function startOwnershipWatcher() {
   void refreshSharedMonitorOwnership();
   ownershipRefreshTimer = setInterval(() => {
@@ -2637,7 +2781,7 @@ function updateSharedMonitorOwnership(nextSnapshot) {
 async function getEffectiveOwnershipSnapshot({ includePeer = true } = {}) {
   const localSnapshot = await getLocalOwnershipSnapshot();
 
-  if (!includePeer || !normalizeText(state.config.peerStatusUrl)) {
+  if (!includePeer || !resolvePeerStatusUrl()) {
     return localSnapshot;
   }
 
@@ -2707,7 +2851,7 @@ async function getMacOwnershipSnapshot() {
 }
 
 async function fetchPeerOwnershipSnapshot() {
-  const peerStatusUrl = normalizeText(state.config.peerStatusUrl);
+  const peerStatusUrl = resolvePeerStatusUrl();
   if (!peerStatusUrl) {
     return null;
   }
@@ -2736,7 +2880,7 @@ async function fetchPeerOwnershipSnapshot() {
 }
 
 async function confirmPeerOwnership(targetId) {
-  if (!parseTargetId(targetId) || !normalizeText(state.config.peerStatusUrl)) {
+  if (!parseTargetId(targetId) || !resolvePeerStatusUrl()) {
     return {
       confirmed: false,
       snapshot: null,
@@ -2748,6 +2892,48 @@ async function confirmPeerOwnership(targetId) {
     confirmed: Boolean(peerSnapshot && peerSnapshot.owner === targetId),
     snapshot: peerSnapshot,
   };
+}
+
+function resolvePeerStatusUrl() {
+  const discoveredPeerUrl = getAutoDiscoveredPeerStatusUrl();
+  if (discoveredPeerUrl) {
+    return discoveredPeerUrl;
+  }
+
+  return isValidPeerStatusUrl(state.config.peerStatusUrl)
+    ? normalizeText(state.config.peerStatusUrl)
+    : "";
+}
+
+function getAutoDiscoveredPeerStatusUrl() {
+  const peer = getAutoDiscoveredPeerCandidate();
+  if (!peer) {
+    return "";
+  }
+
+  return `http://${peer.address}:${peer.controlPort}/api/${peer.peerToken}/ownership`;
+}
+
+function getAutoDiscoveredPeerCandidate() {
+  const candidates = getActivePeerCandidates();
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function getActivePeerCandidates() {
+  const now = Date.now();
+  const configuredMonitorName = normalizeText(state.config.monitorName).toLowerCase();
+
+  return Array.from(discoveredPeers.values())
+    .filter((peer) => now - peer.lastSeenAt <= PEER_DISCOVERY_STALE_MS)
+    .filter((peer) => peer.platform && peer.platform !== process.platform)
+    .filter((peer) => {
+      if (!configuredMonitorName) {
+        return true;
+      }
+
+      return normalizeText(peer.monitorName).toLowerCase() === configuredMonitorName;
+    })
+    .sort((left, right) => right.lastSeenAt - left.lastSeenAt);
 }
 
 function requestJson(urlString, timeoutMs) {
