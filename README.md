@@ -29,6 +29,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - Some monitors, especially Samsung / MStar models, continue reporting an active connection to the current computer even after the picture switches away. The app no longer treats “still attached” as a failure for those screens.
 - For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
 - On Windows, desktop handoff uses the system display switcher to move the desktop off the departing monitor, and retries extend mode until that monitor is available again.
+- Windows desktop handoff now treats `DisplaySwitch.exe /external` as safe only when Windows still has an internal display; on desktop-style "two external monitors" layouts it stays disabled to avoid black-screening the wrong output.
 - On Windows, the app now keeps switch failures user-facing and concise: monitor-name mismatches are reported together with the names Windows currently sees, instead of showing a raw PowerShell stack trace.
 - Windows monitor matching now accepts normalized names, but it no longer falls back to "the only remaining monitor" in a shared-screen setup, so the helper will not accidentally send DDC commands to the Windows fallback screen.
 - For a shared-screen setup, treat the monitor as a single-owner resource: whichever machine currently owns the visible picture is the one that should hand it off.

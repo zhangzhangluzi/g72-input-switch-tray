@@ -1272,6 +1272,13 @@ async function getMonitorDiagnostics() {
       });
   }
 
+  if (state.config.windowsDisplayHandoffMode !== "off") {
+    const handoffDisabledReason = getWindowsDisplayHandoffDisabledReason();
+    if (handoffDisabledReason) {
+      diagnostics.configWarnings.push(handoffDisabledReason);
+    }
+  }
+
   return diagnostics;
 }
 
@@ -1486,17 +1493,17 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
           <label>
             Windows 桌面联动
             <select name="windowsDisplayHandoffMode">
-              ${renderNamedOption("auto", "自动判断", state.config.windowsDisplayHandoffMode)}
+              ${renderNamedOption("auto", "自动判断（仅安全场景启用）", state.config.windowsDisplayHandoffMode)}
               ${renderNamedOption("off", "关闭联动", state.config.windowsDisplayHandoffMode)}
               ${renderNamedOption(
                 "external",
-                "切到模式 B 时改为仅用副屏",
+                "强制联动（仅建议带内置屏）",
                 state.config.windowsDisplayHandoffMode
               )}
             </select>
           </label>
           <div class="help">
-            只影响 Windows 版。启用后，切到模式 B 时应用会调用系统“仅第二屏幕”把桌面迁到剩余屏幕；等目标显示器回到 Windows 后，再自动恢复扩展显示。
+            只影响 Windows 版。应用只会在检测到内置屏的安全场景下调用系统“仅第二屏幕”；像台式机双外接屏这种结构，继续强推这条联动很容易黑屏。
           </div>
           <div class="card soft">
             <div class="section-title">模式 A</div>
@@ -1605,9 +1612,7 @@ function renderMonitorDiagnostics(diagnostics) {
   const compatibilityHelp = shouldUseSamsungMstarCompat(state.config)
     ? "当前已启用 Samsung / MStar 兼容补发。像这台 G72 这种切走后仍会保持 Windows 连接的屏，兼容补发比“判断是否断开”更可靠。"
     : "如果这台屏手动菜单能切、软件却没反应，建议把兼容模式改成 Samsung / MStar 再试。";
-  const windowsHandoffHelp = shouldUseWindowsDisplayHandoff(state.config)
-    ? "当前已启用 Windows 桌面联动。切到模式 B 后，应用会把 Windows 改成仅用剩余屏幕；等这台屏回到 Windows 后，再自动恢复扩展显示。"
-    : "如果切到另一台设备后 Windows 主屏内容还留在原位，可以把“Windows 桌面联动”改成自动判断或强制开启。";
+  const windowsHandoffHelp = getWindowsDisplayHandoffHelpText(state.config);
 
   return `<div class="card soft">
     <div class="section-title">显示器诊断</div>
@@ -2251,19 +2256,92 @@ function shouldUseWindowsDisplayHandoff(config) {
     return false;
   }
 
-  if (config.windowsDisplayHandoffMode === "external") {
-    return true;
-  }
-
   if (config.windowsDisplayHandoffMode === "off") {
     return false;
   }
 
-  try {
-    return screen.getAllDisplays().length === 2;
-  } catch {
+  if (!canUseWindowsDisplayHandoffSafely()) {
     return false;
   }
+
+  if (config.windowsDisplayHandoffMode === "external") {
+    return true;
+  }
+
+  return getWindowsDisplayLayoutInfo().displayCount === 2;
+}
+
+function getWindowsDisplayLayoutInfo() {
+  if (process.platform !== "win32") {
+    return {
+      displayCount: 0,
+      internalDisplayCount: 0,
+      externalDisplayCount: 0,
+    };
+  }
+
+  try {
+    const displays = screen.getAllDisplays();
+    const internalDisplayCount = displays.filter((display) => display.internal).length;
+    return {
+      displayCount: displays.length,
+      internalDisplayCount,
+      externalDisplayCount: Math.max(0, displays.length - internalDisplayCount),
+    };
+  } catch {
+    return {
+      displayCount: 0,
+      internalDisplayCount: 0,
+      externalDisplayCount: 0,
+    };
+  }
+}
+
+function canUseWindowsDisplayHandoffSafely() {
+  const layoutInfo = getWindowsDisplayLayoutInfo();
+  return layoutInfo.internalDisplayCount >= 1 && layoutInfo.externalDisplayCount >= 1;
+}
+
+function getWindowsDisplayHandoffDisabledReason() {
+  if (process.platform !== "win32") {
+    return "";
+  }
+
+  const layoutInfo = getWindowsDisplayLayoutInfo();
+  if (layoutInfo.displayCount === 0) {
+    return "当前没有读到可用的 Windows 显示器拓扑，先不自动联动。";
+  }
+
+  if (layoutInfo.internalDisplayCount === 0) {
+    return "当前 Windows 没有检测到内置屏；继续调用“仅第二屏幕”容易把桌面切黑，所以已自动停用联动。";
+  }
+
+  if (layoutInfo.externalDisplayCount === 0) {
+    return "当前 Windows 没有检测到外接屏，桌面联动没有可切换目标。";
+  }
+
+  return "";
+}
+
+function getWindowsDisplayHandoffHelpText(config) {
+  if (process.platform !== "win32") {
+    return "如果切到另一台设备后 Windows 主屏内容还留在原位，可以在 Windows 版里调整“桌面联动”设置。";
+  }
+
+  if (shouldUseWindowsDisplayHandoff(config)) {
+    return "当前已启用 Windows 桌面联动。切到模式 B 后，应用只会在安全的内置屏场景下调用系统切屏；等这台屏回到 Windows 后，再自动恢复扩展显示。";
+  }
+
+  if (config.windowsDisplayHandoffMode === "off") {
+    return "当前已关闭 Windows 桌面联动。切到另一台设备后，Windows 桌面布局将保持原状。";
+  }
+
+  const disabledReason = getWindowsDisplayHandoffDisabledReason();
+  if (disabledReason) {
+    return disabledReason;
+  }
+
+  return "如果切到另一台设备后 Windows 主屏内容还留在原位，可以把“Windows 桌面联动”改成自动判断或强制开启。";
 }
 
 function getSamsungMstarCandidates(inputValue) {

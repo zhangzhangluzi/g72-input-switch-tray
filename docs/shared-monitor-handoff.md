@@ -22,6 +22,11 @@ This is a Windows-only concern. It is not the same thing as monitor input switch
 - When Windows switches the shared monitor away to the other device, the Windows app can call `DisplaySwitch.exe /external` so the desktop moves to the remaining screen.
 - When the shared monitor later comes back to Windows, the Windows app can call `DisplaySwitch.exe /extend` to restore extended desktop mode.
 
+Safety constraint:
+
+- `DisplaySwitch.exe /external` is only considered safe when Windows also has an internal display.
+- On desktop-style setups where both monitors are external, forcing `/external` can black-screen the wrong output, so the app should leave desktop topology alone.
+
 Implication:
 
 - The Windows app must be running if you want automatic desktop topology recovery on Windows.
@@ -97,7 +102,7 @@ Treat the handoff as three ordered phases, not one blended action:
 ### Recommended flow: Windows -> Mac
 
 1. Windows sends the DDC input-switch command.
-2. After the switch-away delay, Windows moves the desktop to the remaining screen with `/external`.
+2. After the switch-away delay, Windows moves the desktop to the remaining screen with `/external` only when the current Windows machine has a safe internal-display fallback.
 3. Windows marks a pending restore.
 4. When the shared monitor later comes back, Windows restores `/extend`.
 
