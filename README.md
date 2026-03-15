@@ -55,7 +55,6 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - When a macOS switch command is accepted but the display clearly stays on the same input, the app now tells you that the configured input value is still wrong and points you back to the built-in probe assistant instead of only surfacing a generic failure.
 - If BetterDisplay CLI is unavailable, the app falls back to the bundled `ddcctl` binary built during the macOS GitHub Actions release job, and then to `ddcctl` from `PATH`.
 - When the app has to use `ddcctl`, it tries the configured macOS display index first, discovers how many external displays `ddcctl` can see, and then probes the remaining valid indices automatically.
-- The settings page now also shows a "Samsung local private path" diagnostics card. It checks whether the current machine can see a plausible local Samsung control entry point through official software, the official Easy Setting Box device store, USB evidence, or Smart Monitor network discovery before you spend more time on protocol reverse engineering.
 - The app starts a local settings page on port `3847`. The HTTP server binds on the LAN so peer discovery can read the ownership endpoint, but settings/control endpoints still reject non-loopback access.
 - If port `3847` is unavailable, the local pages automatically fall back to another free local port.
 - macOS does not provide a hidden-screen self-recovery workflow. It only switches while the current Mac still has a visible picture and can launch the app/menu.

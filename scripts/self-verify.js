@@ -262,10 +262,17 @@ function main() {
   if (process.platform === "darwin") {
     verifyMacDdcctlFallbackScript();
 
-    const appPaths = [
-      path.resolve(__dirname, "..", "release", "mac-arm64", "显示器输入切换.app"),
-      "/Applications/显示器输入切换.app",
-    ].filter((appPath) => fs.existsSync(appPath));
+    const builtAppPath = path.resolve(
+      __dirname,
+      "..",
+      "release",
+      "mac-arm64",
+      "显示器输入切换.app"
+    );
+    const installedAppPath = "/Applications/显示器输入切换.app";
+    const appPaths = fs.existsSync(builtAppPath)
+      ? [builtAppPath]
+      : [installedAppPath].filter((appPath) => fs.existsSync(appPath));
 
     if (appPaths.length === 0) {
       throw new Error("No macOS app bundle was found for self verification.");

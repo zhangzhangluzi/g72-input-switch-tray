@@ -12,7 +12,6 @@ const {
   normalizeMonitorToken,
   normalizeText,
 } = require("./monitor-name-helpers");
-const { probeSamsungLocalControl } = require("./samsung-local-probe");
 const {
   createWindowsSharedMonitorTransferHint,
   createWindowsSwitchMenuModel,
@@ -32,7 +31,6 @@ const PEER_DISCOVERY_STALE_MS = 15000;
 const PEER_CONFIRMATION_TIMEOUT_MS = 4000;
 const PEER_CONFIRMATION_POLL_MS = 250;
 const LOCAL_HANDOFF_INFERENCE_WINDOW_MS = 10 * 60 * 1000;
-const SAMSUNG_LOCAL_PROBE_TTL_MS = 30 * 1000;
 const TARGET_IDS = ["windows", "mac"];
 const COMMON_INPUT_VALUES = [
   { value: 15, label: "15: DP1" },
@@ -71,9 +69,6 @@ let trayHealthTimer = null;
 let explorerSignature = null;
 let sharedMonitorOwnership = createDefaultOwnershipSnapshot();
 let discoveredPeers = new Map();
-let samsungLocalProbeCache = null;
-let samsungLocalProbeCachedAt = 0;
-let samsungLocalProbeInFlight = null;
 let state = createDefaultState();
 
 // Suppress noisy Chromium network-change logs on some Windows systems.
@@ -917,7 +912,6 @@ async function handleControlRequest(request, response) {
 
   if (requestUrl.pathname === "/health") {
     const ownership = await getEffectiveOwnershipSnapshot();
-    const samsungLocalProbe = await getSamsungLocalProbe();
     return writeJson(response, 200, {
       ok: true,
       appName: APP_NAME,
@@ -925,7 +919,6 @@ async function handleControlRequest(request, response) {
       lastTarget: state.lastTarget,
       monitorName: state.config.monitorName,
       ownership,
-      samsungLocalProbe,
     });
   }
 
@@ -983,12 +976,11 @@ async function handleControlRequest(request, response) {
   }
 
   if (requestUrl.pathname === settingsPath) {
-    const [monitors, diagnostics, macProbeDiagnostics, ownershipSnapshot, samsungLocalProbe] = await Promise.all([
+    const [monitors, diagnostics, macProbeDiagnostics, ownershipSnapshot] = await Promise.all([
       getAvailableMonitorNames(),
       getMonitorDiagnostics(),
       getMacProbeDiagnostics(),
       getEffectiveOwnershipSnapshot(),
-      getSamsungLocalProbe(),
     ]);
     return writeHtml(
       response,
@@ -998,8 +990,7 @@ async function handleControlRequest(request, response) {
         monitors,
         diagnostics,
         macProbeDiagnostics,
-        ownershipSnapshot,
-        samsungLocalProbe
+        ownershipSnapshot
       )
     );
   }
@@ -1103,7 +1094,6 @@ async function handleConfigSave(request, response, requestUrl) {
 
   state.config = config;
   state.macInputProbe = createMacInputProbeResult();
-  clearSamsungLocalProbeCache();
   saveState(state);
   refreshMenu();
   if (process.platform === "win32") {
@@ -1700,17 +1690,15 @@ function renderSettingsPage(
   monitorNames,
   diagnostics,
   macProbeDiagnostics,
-  ownershipSnapshot,
-  samsungLocalProbe
+  ownershipSnapshot
 ) {
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
   const statusHtml = renderSettingsBanner(status, message);
   const switchOutcomeHtml = renderSwitchOutcomeCard();
   const monitorHintHtml = renderMonitorHints(monitorNames);
-  const diagnosticsHtml = renderMonitorDiagnostics(diagnostics, samsungLocalProbe);
+  const diagnosticsHtml = renderMonitorDiagnostics(diagnostics);
   const manualHandoffHtml = renderManualHandoffCard();
-  const samsungLocalProbeHtml = renderSamsungLocalProbeCard(samsungLocalProbe);
   const macProbeHtml = renderMacProbeAssistant(macProbeDiagnostics);
   const ownershipHtml = renderOwnershipStatusCard(ownershipSnapshot);
   const peerStatusHtml = renderPeerStatusCard();
@@ -1847,7 +1835,6 @@ function renderSettingsPage(
       ${ownershipHtml}
       ${diagnosticsHtml}
       ${manualHandoffHtml}
-      ${samsungLocalProbeHtml}
       ${macProbeHtml}
       <div class="card">
         <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/config">
@@ -1963,7 +1950,7 @@ function renderMonitorHints(monitorNames) {
   </div>`;
 }
 
-function renderMonitorDiagnostics(diagnostics, samsungLocalProbe) {
+function renderMonitorDiagnostics(diagnostics) {
   if (!diagnostics) {
     return "";
   }
@@ -2001,10 +1988,6 @@ function renderMonitorDiagnostics(diagnostics, samsungLocalProbe) {
     ? "当前已启用 Samsung / MStar 兼容补发。像这台 G72 这种切走后仍会保持 Windows 连接的屏，兼容补发比“判断是否断开”更可靠。"
     : "如果这台屏手动菜单能切、软件却没反应，建议把兼容模式改成 Samsung / MStar 再试。";
   const windowsHandoffHelp = getWindowsDisplayHandoffHelpText(state.config);
-  const samsungProbeHelp =
-    samsungLocalProbe?.status === "ready"
-      ? "本机还检测到了三星本地私有入口，后续可以在不依赖另一台电脑的前提下继续沿官方协议做本地切源。"
-      : "如果你想继续推进三星官方私有协议，下面的“三星本地私有入口”卡片会告诉你当前这台主机有没有 USB / Smart Monitor 入口。";
 
   return `<div class="card soft">
     <div class="section-title">显示器诊断</div>
@@ -2015,80 +1998,7 @@ function renderMonitorDiagnostics(diagnostics, samsungLocalProbe) {
     <div class="help" style="margin-top: 12px;">${currentValueLine}</div>
     <div class="help">${currentValueHelp}</div>
     <div class="help">${compatibilityHelp}</div>
-    <div class="help">${samsungProbeHelp}</div>
     <div class="help">${windowsHandoffHelp}</div>
-  </div>`;
-}
-
-function renderSamsungLocalProbeCard(probe) {
-  if (!probe) {
-    return "";
-  }
-
-  const statusLabels = {
-    ready: "已具备可继续逆向的本地入口",
-    partial: "只具备部分本地入口",
-    missing: "当前没有本地三星私有入口",
-    error: "本地探测失败",
-  };
-  const statusLabel = statusLabels[probe.status] || "状态未知";
-  const officialSoftwareLine =
-    probe.officialSoftware.status === "installed"
-      ? `官方软件：已找到 ${probe.officialSoftware.items
-          .map((item) => item.name)
-          .join("、")}`
-      : `官方软件：${probe.officialSoftware.message}`;
-  const officialStoreLine = `官方设备库：${escapeHtml(probe.officialStore?.message || "当前未检测。")}`;
-  const usbLine = `USB 证据：${escapeHtml(probe.usbEvidence.message)}`;
-  const networkLine = `局域网发现：${escapeHtml(probe.networkDiscovery.message)}`;
-  const softwarePills =
-    probe.officialSoftware.items.length > 0
-      ? probe.officialSoftware.items
-          .map((item) => `<span class="pill">${escapeHtml(`${item.name} · ${item.path}`)}</span>`)
-          .join("")
-      : "";
-  const storePills =
-    probe.officialStore?.devices?.length > 0
-      ? probe.officialStore.devices
-          .map((device) => {
-            const title = device.deviceName || device.serialNumber || device.macAddress || device.host;
-            const suffix = [device.host, device.supportMode].filter(Boolean).join(" · ");
-            return `<span class="pill">${escapeHtml(`${title}${suffix ? ` · ${suffix}` : ""}`)}</span>`;
-          })
-          .join("")
-      : probe.officialStore?.path
-        ? `<span class="pill">${escapeHtml(`ESBSettings · ${probe.officialStore.path}`)}</span>`
-        : "";
-  const usbPills =
-    probe.usbEvidence.lines.length > 0
-      ? probe.usbEvidence.lines.map((line) => `<span class="pill">${escapeHtml(line)}</span>`).join("")
-      : "";
-  const networkPills =
-    probe.networkDiscovery.devices.length > 0
-      ? probe.networkDiscovery.devices
-          .map((device) => {
-            const title =
-              device.friendlyName || device.modelName || device.deviceType || device.address;
-            const suffix = device.matchedMonitor ? " · 已匹配当前共享屏" : "";
-            return `<span class="pill">${escapeHtml(`${title} @ ${device.address}${suffix}`)}</span>`;
-          })
-          .join("")
-      : "";
-
-  return `<div class="card soft">
-    <div class="section-title">三星本地私有入口</div>
-    <div class="help" style="margin-top: 12px;">这块卡片检查的是“当前这台主机自己能不能直接连到三星显示器的私有控制链路”，不是双机协同，也不是让你手填任何地址。</div>
-    <div class="help" style="margin-top: 12px;">当前状态：${escapeHtml(statusLabel)}</div>
-    <div class="help">${escapeHtml(probe.summary)}</div>
-    <div class="help">${escapeHtml(officialSoftwareLine)}</div>
-    <div class="help">${officialStoreLine}</div>
-    <div class="help">${usbLine}</div>
-    <div class="help">${networkLine}</div>
-    <div class="help">${escapeHtml(probe.recommendation)}</div>
-    ${softwarePills ? `<div class="tip-list" style="margin-top: 12px;">${softwarePills}</div>` : ""}
-    ${storePills ? `<div class="tip-list" style="margin-top: 12px;">${storePills}</div>` : ""}
-    ${usbPills ? `<div class="tip-list" style="margin-top: 12px;">${usbPills}</div>` : ""}
-    ${networkPills ? `<div class="tip-list" style="margin-top: 12px;">${networkPills}</div>` : ""}
   </div>`;
 }
 
@@ -3765,70 +3675,6 @@ function requestJson(urlString, timeoutMs, options = {}) {
     request.on("error", reject);
     request.end();
   });
-}
-
-function clearSamsungLocalProbeCache() {
-  samsungLocalProbeCache = null;
-  samsungLocalProbeCachedAt = 0;
-}
-
-async function getSamsungLocalProbe(force = false) {
-  const now = Date.now();
-
-  if (
-    !force &&
-    samsungLocalProbeCache &&
-    now - samsungLocalProbeCachedAt <= SAMSUNG_LOCAL_PROBE_TTL_MS
-  ) {
-    return samsungLocalProbeCache;
-  }
-
-  if (samsungLocalProbeInFlight) {
-    return samsungLocalProbeInFlight;
-  }
-
-  samsungLocalProbeInFlight = probeSamsungLocalControl({
-    monitorName: state.config.monitorName,
-  })
-    .then((probe) => {
-      samsungLocalProbeCache = probe;
-      samsungLocalProbeCachedAt = Date.now();
-      return probe;
-    })
-    .catch((error) => {
-      const probe = {
-        platform: process.platform,
-        monitorName: state.config.monitorName,
-        officialSoftware: {
-          status: "error",
-          items: [],
-          message: "三星本地私有入口探测失败。",
-        },
-        usbEvidence: {
-          status: "error",
-          lines: [],
-          message: normalizeText(error.message) || "三星本地私有入口探测失败。",
-        },
-        networkDiscovery: {
-          status: "error",
-          devices: [],
-          message: normalizeText(error.message) || "三星本地私有入口探测失败。",
-        },
-        status: "error",
-        summary: "三星本地私有入口探测失败。",
-        recommendation: "请稍后重试；如果持续失败，再查看日志确认是 USB 检测还是网络探测出了问题。",
-        updatedAt: new Date().toISOString(),
-      };
-      samsungLocalProbeCache = probe;
-      samsungLocalProbeCachedAt = Date.now();
-      appendDiagnosticLog("Samsung local probe failed", error);
-      return probe;
-    })
-    .finally(() => {
-      samsungLocalProbeInFlight = null;
-    });
-
-  return samsungLocalProbeInFlight;
 }
 
 function normalizePeerOwnershipSnapshot(ownership, fallbackPlatform = "") {
