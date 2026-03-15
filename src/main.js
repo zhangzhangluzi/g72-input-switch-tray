@@ -549,6 +549,10 @@ async function switchOnWindows(targetId, target) {
   const useDisplayHandoff = shouldUseWindowsDisplayHandoff(state.config);
   await assertWindowsSharedMonitorAvailableForSwitch();
   let desktopHandedOff = false;
+  const attachedDisplayCountBeforeSwitch =
+    useDisplayHandoff && targetId !== "windows"
+      ? await getCurrentWindowsAttachedDisplayCount()
+      : null;
 
   if (useDisplayHandoff && targetId === "windows") {
     await restoreWindowsDesktopToTargetMonitor();
@@ -580,7 +584,10 @@ async function switchOnWindows(targetId, target) {
       targetId !== "windows" &&
       shouldAttemptWindowsDesktopHandoffRecovery(error)
     ) {
-      desktopHandedOff = await attemptWindowsDesktopHandoffRecovery(targetId);
+      desktopHandedOff = await attemptWindowsDesktopHandoffRecovery(
+        targetId,
+        attachedDisplayCountBeforeSwitch
+      );
       if (desktopHandedOff) {
         return;
       }
@@ -599,7 +606,7 @@ async function switchOnWindows(targetId, target) {
   if (useDisplayHandoff && targetId !== "windows" && !desktopHandedOff && !state.windowsDesktop.pendingRestore) {
     await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
     await handOffWindowsDesktop();
-    markPendingWindowsDesktopRestore();
+    markPendingWindowsDesktopRestore(attachedDisplayCountBeforeSwitch);
   }
 }
 
@@ -609,10 +616,11 @@ async function prepareManualHandoffOnWindows(targetId, target) {
   }
 
   await assertWindowsSharedMonitorAvailableForSwitch();
+  const attachedDisplayCountBeforeHandoff = await getCurrentWindowsAttachedDisplayCount();
 
   if (shouldUseWindowsDisplayHandoff(state.config)) {
     await handOffWindowsDesktop();
-    markPendingWindowsDesktopRestore();
+    markPendingWindowsDesktopRestore(attachedDisplayCountBeforeHandoff);
     return `Windows 本机已准备好手动交接，并已把桌面退回主显示器。现在请直接用显示器按键把 ${state.config.monitorName} 切到 ${target.label}。`;
   }
 
@@ -3016,8 +3024,8 @@ async function handOffWindowsDesktop() {
 }
 
 async function restoreWindowsDesktopToTargetMonitor() {
-  await runWindowsDisplaySwitch("/extend");
-  await waitForDisplayCount(2, "Windows 没有恢复到扩展显示。");
+  const expectedCount = getExpectedWindowsRestoreDisplayCount();
+  await extendWindowsDesktopToExpectedCount(expectedCount, "Windows 没有恢复到扩展显示。");
 }
 
 async function prepareWindowsDesktopForIncomingOwnership() {
@@ -3028,32 +3036,20 @@ async function prepareWindowsDesktopForIncomingOwnership() {
     };
   }
 
-  markPendingWindowsDesktopRestore();
+  markPendingWindowsDesktopRestore(getExpectedWindowsRestoreDisplayCount());
+  const expectedCount = getExpectedWindowsRestoreDisplayCount();
 
   try {
-    await runWindowsDisplaySwitch("/extend");
-    await waitForDisplayCount(2, "Windows 预热共享屏输出后仍没有恢复到扩展显示。");
+    await extendWindowsDesktopToExpectedCount(
+      expectedCount,
+      "Windows 预热共享屏输出后仍没有恢复到扩展显示。"
+    );
   } catch (error) {
-    appendDiagnosticLog("DisplaySwitch /extend did not restore Windows shared display path; trying topology helper", error);
-
-    try {
-      const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
-      await runCommand("powershell.exe", [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        topologyScriptPath,
-        "-ExtendAll",
-      ]);
-      await waitForDisplayCount(2, "Windows 预热共享屏输出后仍没有恢复到扩展显示。");
-    } catch (fallbackError) {
-      appendDiagnosticLog("Failed to prime Windows shared display path", fallbackError);
-      return {
-        prepared: false,
-        detail: fallbackError.message,
-      };
-    }
+    appendDiagnosticLog("Failed to prime Windows shared display path", error);
+    return {
+      prepared: false,
+      detail: error.message,
+    };
   }
 
   try {
@@ -3106,6 +3102,27 @@ async function waitForDisplayCount(expectedCount, errorMessage) {
   }
 
   throw new Error(errorMessage);
+}
+
+async function extendWindowsDesktopToExpectedCount(expectedCount, errorMessage) {
+  try {
+    await runWindowsDisplaySwitch("/extend");
+    await waitForDisplayCount(expectedCount, errorMessage);
+    return;
+  } catch (error) {
+    appendDiagnosticLog("DisplaySwitch /extend did not restore Windows shared display path; trying topology helper", error);
+  }
+
+  const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
+  await runCommand("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    topologyScriptPath,
+    "-ExtendAll",
+  ]);
+  await waitForDisplayCount(expectedCount, errorMessage);
 }
 
 async function getWindowsTopologyDisplays() {
@@ -3300,10 +3317,12 @@ async function getEffectiveOwnershipSnapshot({ includePeer = true } = {}) {
     return localSnapshot;
   }
 
+  if (localSnapshot.owner !== "unknown") {
+    return localSnapshot;
+  }
+
   if (peerSnapshot.owner !== "unknown") {
-    if (localSnapshot.owner === "unknown" || localSnapshot.owner !== peerSnapshot.owner) {
-      return peerSnapshot;
-    }
+    return peerSnapshot;
   }
 
   return localSnapshot;
@@ -3465,17 +3484,8 @@ function shouldAttemptWindowsDesktopHandoffRecovery(error) {
   return !/当前配置无效|当前平台不受支持/u.test(message);
 }
 
-async function attemptWindowsDesktopHandoffRecovery(targetId) {
+async function attemptWindowsDesktopHandoffRecovery(targetId, expectedRestoreDisplayCount = null) {
   if (process.platform !== "win32" || targetId === "windows") {
-    return false;
-  }
-
-  try {
-    await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
-    await handOffWindowsDesktop();
-    markPendingWindowsDesktopRestore();
-  } catch (error) {
-    appendDiagnosticLog("Windows desktop handoff recovery failed", error);
     return false;
   }
 
@@ -3490,6 +3500,14 @@ async function attemptWindowsDesktopHandoffRecovery(targetId) {
 
   if (ownershipConfirmation.snapshot) {
     updateSharedMonitorOwnership(ownershipConfirmation.snapshot);
+  }
+
+  try {
+    await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
+    await handOffWindowsDesktop();
+    markPendingWindowsDesktopRestore(expectedRestoreDisplayCount);
+  } catch (error) {
+    appendDiagnosticLog("Windows desktop handoff recovery failed", error);
   }
 
   return true;
@@ -3971,12 +3989,26 @@ async function attemptPendingWindowsDesktopRestore() {
   }
 }
 
-function markPendingWindowsDesktopRestore() {
-  if (state.windowsDesktop.pendingRestore) {
+function markPendingWindowsDesktopRestore(expectedAttachedDisplayCount = null) {
+  const normalizedExpectedCount =
+    Number.isInteger(expectedAttachedDisplayCount) && expectedAttachedDisplayCount > 1
+      ? expectedAttachedDisplayCount
+      : state.windowsDesktop.expectedAttachedDisplayCount;
+  const nextExpectedCount =
+    Number.isInteger(normalizedExpectedCount) && normalizedExpectedCount > 1
+      ? normalizedExpectedCount
+      : 0;
+  const changed =
+    !state.windowsDesktop.pendingRestore ||
+    state.windowsDesktop.expectedAttachedDisplayCount !== nextExpectedCount;
+
+  state.windowsDesktop.pendingRestore = true;
+  state.windowsDesktop.expectedAttachedDisplayCount = nextExpectedCount;
+
+  if (!changed) {
     return;
   }
 
-  state.windowsDesktop.pendingRestore = true;
   saveState(state);
   refreshMenu();
 }
@@ -3987,8 +4019,27 @@ function clearPendingWindowsDesktopRestore() {
   }
 
   state.windowsDesktop.pendingRestore = false;
+  state.windowsDesktop.expectedAttachedDisplayCount = 0;
   saveState(state);
   refreshMenu();
+}
+
+async function getCurrentWindowsAttachedDisplayCount() {
+  const topologyDisplays = await getWindowsTopologyDisplays();
+  const attachedDisplayCount = getAttachedWindowsTopologyDisplayCount(topologyDisplays);
+  if (Number.isInteger(attachedDisplayCount) && attachedDisplayCount > 0) {
+    return attachedDisplayCount;
+  }
+
+  const electronDisplayCount = getWindowsDisplayCount();
+  return electronDisplayCount > 0 ? electronDisplayCount : null;
+}
+
+function getExpectedWindowsRestoreDisplayCount() {
+  return Number.isInteger(state.windowsDesktop.expectedAttachedDisplayCount) &&
+    state.windowsDesktop.expectedAttachedDisplayCount > 1
+    ? state.windowsDesktop.expectedAttachedDisplayCount
+    : 2;
 }
 
 function getWindowsDisplayCount() {
@@ -4095,6 +4146,7 @@ function createDefaultState() {
 function createDefaultWindowsDesktopState() {
   return {
     pendingRestore: false,
+    expectedAttachedDisplayCount: 0,
   };
 }
 
@@ -4165,6 +4217,10 @@ function normalizeState(nextState) {
     peerToken: normalizeText(nextState.peerToken) || defaults.peerToken,
     windowsDesktop: {
       pendingRestore: Boolean(nextState.windowsDesktop?.pendingRestore),
+      expectedAttachedDisplayCount: normalizePositiveInteger(
+        nextState.windowsDesktop?.expectedAttachedDisplayCount,
+        0
+      ),
     },
     lastSwitchOutcome: createSwitchOutcome(nextState.lastSwitchOutcome),
     macInputProbe: normalizeMacInputProbeState(nextState.macInputProbe, defaults.macInputProbe),
