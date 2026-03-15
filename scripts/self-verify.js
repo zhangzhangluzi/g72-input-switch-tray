@@ -27,7 +27,7 @@ function verifyWindowsMenuModel() {
   assert.equal(handoffItems.length, 1);
   assert.equal(handoffItems[0].kind, "handoffHint");
   assert.equal(handoffItems[0].enabled, true);
-  assert.match(handoffItems[0].label, /交给另一台电脑/);
+  assert.match(handoffItems[0].label, /当前判断共享屏不在 Windows 侧/);
 
   const targetItems = createWindowsSwitchMenuModel({
     windowsSharedMonitorMissing: false,
@@ -80,11 +80,11 @@ function verifyWindowsMenuModel() {
 
   const hint = createWindowsSharedMonitorTransferHint({
     monitorName: "G72",
-    message: "G72 仍然被 Windows 枚举到，但当前输入回报是 HDMI1 (17)，说明这块共享屏的画面已经交给 Mac 了。请在 Mac 端或显示器菜单里切回 Windows。",
+    message: "G72 仍然被 Windows 枚举到，但当前输入回报是 HDMI1 (17)，软件当前据此推断这块共享屏的画面已经交给 Mac 了。请在 Mac 端或显示器菜单里切回 Windows。",
   });
-  assert.equal(hint.message, "G72 当前已交给另一台电脑");
+  assert.equal(hint.message, "G72 当前判断不在 Windows 侧");
   assert.match(hint.detail, /谁当前拥有这块共享屏/);
-  assert.match(hint.detail, /已经交给 Mac/);
+  assert.match(hint.detail, /推断这块共享屏的画面已经交给 Mac/);
 
   assert.equal(
     doesMonitorListContainConfiguredMonitor(["G72 Max", "G52 Max"], "G72"),

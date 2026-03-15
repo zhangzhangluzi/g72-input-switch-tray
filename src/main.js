@@ -241,7 +241,7 @@ function refreshMenu() {
   const windowsSharedMonitorMessage = windowsSharedMonitorMissing
     ? sharedMonitorOwnership.message ||
       windowsMonitorAvailability.message ||
-      `${state.config.monitorName || "共享屏"} 当前不在 Windows 侧，请到 Mac 端或显示器菜单切回。`
+      `${state.config.monitorName || "共享屏"} 当前看起来不在 Windows 侧，请到 Mac 端或显示器菜单切回。`
     : "";
   const switchMenuItems = createWindowsSwitchMenuModel({
     windowsSharedMonitorMissing,
@@ -303,7 +303,7 @@ function refreshMenu() {
 
   const menu = Menu.buildFromTemplate([
     {
-      label: `当前所有权：${getCurrentOwnershipMenuLabel()}`,
+      label: `当前推断归属：${getCurrentOwnershipMenuLabel()}`,
       enabled: false,
     },
     {
@@ -327,7 +327,7 @@ function refreshMenu() {
     ...(process.platform === "win32" && state.windowsDesktop.pendingRestore
       ? [
           {
-            label: `Windows 桌面：已交给副屏，等待 ${state.config.monitorName || "目标显示器"} 回来后自动恢复`,
+            label: `Windows 桌面：当前只保留主屏；等软件判断 ${state.config.monitorName || "目标显示器"} 回来后再尝试恢复扩展`,
             enabled: false,
           },
         ]
@@ -371,7 +371,7 @@ function refreshMenu() {
         ]
       : []),
     {
-      label: "说明：当前所有权尽量按实时归属判断；最近切换请求只表示历史动作",
+      label: "说明：这里显示的是软件当前推断归属；最近切换请求只表示历史动作",
       enabled: false,
     },
     { type: "separator" },
@@ -481,7 +481,7 @@ async function switchMonitor(targetId, options = {}) {
 
     state.lastTarget = targetId;
     state.macInputProbe = createMacInputProbeResult();
-    recordSwitchOutcome("success", targetId, `已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
+    recordSwitchOutcome("success", targetId, `本机切换流程已执行，并已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
     saveState(state);
     await refreshSharedMonitorOwnership().catch((error) => {
       appendDiagnosticLog("Failed to refresh shared ownership after switch", error);
@@ -489,7 +489,7 @@ async function switchMonitor(targetId, options = {}) {
     refreshMenu();
 
     if (notifyOnSuccess) {
-      notify(`已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
+      notify(`本机切换流程已执行，并已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
     }
   } catch (error) {
     const userFacingError = createUserFacingSwitchError(targetId, error);
@@ -500,7 +500,7 @@ async function switchMonitor(targetId, options = {}) {
     if (showErrorDialog) {
       dialog.showErrorBox(
         APP_NAME,
-        `${target.label} 切换命令发送失败。\n\n${userFacingError.message}`
+        `${target.label} 切换失败。\n\n${userFacingError.message}`
       );
     }
 
@@ -1751,7 +1751,7 @@ async function assertWindowsSharedMonitorAvailableForSwitch() {
   }
 
   if (availability.status === "away") {
-    throw new Error(availability.message || `${state.config.monitorName} 当前画面已交给另一台电脑。`);
+    throw new Error(availability.message || `${state.config.monitorName} 当前画面看起来已交给另一台电脑。`);
   }
 
   const availableText = names.length > 0 ? names.join("、") : "<none>";
@@ -2025,7 +2025,7 @@ function renderSettingsPage(
   <main>
     <div class="eyebrow">Local Setup · v${escapeHtml(app.getVersion())}</div>
     <h1>${escapeHtml(APP_NAME)} 设置</h1>
-    <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。下面的“共享屏当前归属”会尽量显示实时所有权；“最近切换请求”只保留历史动作，不再代表当前画面归属。</p>
+    <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。下面的“共享屏当前推断归属”会尽量显示软件根据本机/对端证据得出的实时判断；“最近切换请求”只保留历史动作，不再代表当前画面归属。</p>
     <div class="stack">
       ${statusHtml}
       ${switchOutcomeHtml}
@@ -2233,23 +2233,23 @@ function renderOwnershipStatusCard(ownershipSnapshot) {
   const snapshot = ownershipSnapshot || createDefaultOwnershipSnapshot();
   const ownerTargetId = ["windows", "mac"].includes(snapshot.owner) ? snapshot.owner : null;
   const ownerLine = ownerTargetId
-    ? `共享屏当前归属：${escapeHtml(getTarget(ownerTargetId).label)}`
-    : "共享屏当前归属：暂时无法确认";
+    ? `共享屏当前推断归属：${escapeHtml(getTarget(ownerTargetId).label)}`
+    : "共享屏当前推断归属：暂时无法确认";
   const inputLine = Number.isInteger(snapshot.currentInputValue)
     ? `当前输入回报：${escapeHtml(describeInputValue(snapshot.currentInputValue))}`
     : "当前输入回报：暂时不可用";
   const sourceLine =
     snapshot.source === "peer"
-      ? "这次归属来自对端确认。当前机器上的本地回读结果不够可靠，所以优先采用了另一台机器的确认。"
-      : "这次归属来自当前机器的本地判断。";
+      ? "这次推断结果来自对端确认。当前机器上的本地回读结果不够可靠，所以暂时采用了另一台机器的确认。"
+      : "这次推断结果来自当前机器的本地判断。";
   const detailLine = snapshot.message
     ? escapeHtml(snapshot.message)
     : ownerTargetId
-      ? `已根据输入值把 G72 判定为 ${escapeHtml(getTarget(ownerTargetId).label)}。`
-      : "当显示器继续保留逻辑连接、或者 DDC 回读不稳定时，这里的归属可能会暂时显示为未知。";
+      ? `软件当前根据输入值把 G72 推断为 ${escapeHtml(getTarget(ownerTargetId).label)}。`
+      : "当显示器继续保留逻辑连接、或者 DDC 回读不稳定时，这里的推断归属可能会暂时显示为未知。";
 
   return `<div class="card soft">
-    <div class="section-title">共享屏当前归属</div>
+    <div class="section-title">共享屏当前推断归属</div>
     <div class="help" style="margin-top: 12px;">${ownerLine}</div>
     <div class="help">${inputLine}</div>
     <div class="help">${escapeHtml(sourceLine)}</div>
@@ -2268,7 +2268,7 @@ function renderSwitchOutcomeCard() {
     ? getTarget(state.lastSwitchOutcome.targetId).label
     : "未指定目标";
   const lines = [
-    `最近结果：${isManualPrep ? "已准备手动交接" : isSuccess ? "成功" : "失败"}`,
+    `最近结果：${isManualPrep ? "本机准备已完成" : isSuccess ? "流程已执行" : "未完成"}`,
     `目标：${escapeHtml(targetLabel)}`,
   ];
 
@@ -2284,9 +2284,9 @@ function renderPeerStatusCard() {
 
   return `<div class="card soft">
     <div class="section-title">双端协同</div>
-    <div class="help" style="margin-top: 12px;">局域网协同只是增强确认，不是唯一依据。就算局域网不通，应用也会优先按本机输入回读和本机显示拓扑判断 G72 当前归属；只有本机判断不够可靠时，才会用局域网里的对端状态来补强。</div>
+    <div class="help" style="margin-top: 12px;">局域网协同只是增强确认，不是唯一依据。就算局域网不通，应用也会优先按本机输入回读和本机显示拓扑推断 G72 当前推断归属；只有本机判断不够可靠时，才会用局域网里的对端状态来补强。</div>
     <div class="help">${getPeerDiscoveryStatusText()}</div>
-    <div class="help" style="margin-top: 12px;">当前已发现的对端</div>
+    <div class="help" style="margin-top: 12px;">当前已发现的对端候选</div>
     <div class="tip-list">${discoveredPeersHtml}</div>
   </div>`;
 }
@@ -2314,7 +2314,7 @@ function getPeerDiscoveryStatusText() {
   const candidates = getActivePeerCandidates();
   if (candidates.length === 1) {
     const peer = candidates[0];
-    return `已自动识别到对端：${peer.hostName || peer.address}（${peer.platform}）。当本机判断不够确定时，会用它的实时归属结果做二次确认。`;
+    return `已自动识别到对端：${peer.hostName || peer.address}（${peer.platform}）。当本机判断不够确定时，会用它的实时推断结果做二次确认。`;
   }
 
   if (candidates.length > 1) {
@@ -2645,15 +2645,15 @@ function getCurrentTargetLabel() {
 
 function getLastSwitchOutcomeMenuLabel() {
   if (state.lastSwitchOutcome.status === "success" && state.lastSwitchOutcome.mode === "manual_prep") {
-    return "最近结果：已准备手动交接";
+    return "最近结果：本机准备已完成";
   }
 
   if (state.lastSwitchOutcome.status === "success") {
-    return "最近结果：成功";
+    return "最近结果：流程已执行";
   }
 
   if (state.lastSwitchOutcome.status === "error") {
-    return "最近结果：失败（详情见下方）";
+    return "最近结果：未完成（详情见下方）";
   }
 
   return "最近结果：暂无";
@@ -3552,7 +3552,7 @@ async function tickManualSession() {
     if (snapshot.owner === state.manualSession.expectedOwnerTargetId) {
       finishManualSession(
         "success",
-        `已检测到 ${state.config.monitorName} 完成手动${state.manualSession.kind === "transfer" ? "移交" : "接收"}，当前归属：${getTarget(
+        `软件当前判断 ${state.config.monitorName} 已完成手动${state.manualSession.kind === "transfer" ? "移交" : "接收"}，当前推断归属：${getTarget(
           state.manualSession.expectedOwnerTargetId
         ).label}。`,
         state.manualSession.expectedOwnerTargetId,
@@ -3718,7 +3718,7 @@ async function getMacOwnershipSnapshot(options = {}) {
         source: "local",
         platform: process.platform,
         status: "missing",
-        message: `Mac 当前已经看不到共享屏；本机根据当前显示拓扑判断共享屏已经交给 ${getTarget(
+        message: `Mac 当前已经看不到共享屏；本机根据当前显示拓扑推断共享屏已经交给 ${getTarget(
           inferredOwnerTargetId
         ).label}。`,
         currentInputValue: null,
@@ -4180,7 +4180,7 @@ async function createWindowsMonitorAvailabilitySnapshot(monitorNames, options = 
     return {
       status: "away",
       names: monitorNames,
-      message: `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据当前只剩主屏的状态，判断共享屏已经交给 Mac。`,
+      message: `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据当前只剩主屏的状态，推断共享屏已经交给 Mac。`,
       owner: "mac",
       currentInputValue: null,
     };
@@ -4198,8 +4198,8 @@ async function createWindowsMonitorAvailabilitySnapshot(monitorNames, options = 
       names: monitorNames,
       message:
         inferredOwnerTargetId === "mac"
-          ? `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据当前显示拓扑判断共享屏已经交给 Mac。现在看到的是 ${visibleText}。`
-          : `${state.config.monitorName} 当前不在 Windows 侧；现在看到的是 ${visibleText}。请到 Mac 端或显示器菜单切回。`,
+          ? `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据当前显示拓扑推断共享屏已经交给 Mac。现在看到的是 ${visibleText}。`
+          : `${state.config.monitorName} 当前看起来不在 Windows 侧；现在看到的是 ${visibleText}。请到 Mac 端或显示器菜单切回。`,
       owner: inferredOwnerTargetId || "unknown",
       currentInputValue: null,
     };
@@ -4235,7 +4235,7 @@ async function createWindowsMonitorAvailabilitySnapshot(monitorNames, options = 
       names: monitorNames,
       message: `${state.config.monitorName} 仍然被 Windows 枚举到，但当前输入回报是 ${describeInputValue(
         currentInputValue
-      )}，说明这块共享屏的画面已经交给 Mac 了。请在 Mac 端或显示器菜单里切回 Windows。`,
+      )}，软件当前据此推断这块共享屏的画面已经交给 Mac 了。请在 Mac 端或显示器菜单里切回 Windows。`,
       owner: "mac",
       currentInputValue,
     };
@@ -4323,7 +4323,7 @@ async function attemptPendingWindowsDesktopRestore() {
 
     await restoreWindowsDesktopToTargetMonitor();
     clearPendingWindowsDesktopRestore();
-    notify(`已检测到 ${state.config.monitorName} 回到 Windows，桌面已恢复为扩展显示。`);
+    notify(`软件当前判断 ${state.config.monitorName} 已回到 Windows，并已把桌面恢复为扩展显示。`);
   } catch {
     // Keep waiting. The monitor may have reappeared but not finished handshaking yet.
   } finally {
