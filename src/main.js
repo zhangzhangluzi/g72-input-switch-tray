@@ -449,6 +449,7 @@ async function switchMonitor(targetId, options = {}) {
 async function switchOnWindows(targetId, target) {
   const useDisplayHandoff = shouldUseWindowsDisplayHandoff(state.config);
   await assertWindowsSharedMonitorAvailableForSwitch();
+  let desktopHandedOff = false;
 
   if (useDisplayHandoff && targetId === "windows") {
     await restoreWindowsDesktopToTargetMonitor();
@@ -475,17 +476,28 @@ async function switchOnWindows(targetId, target) {
       await verifyWindowsSwitchOutcome(targetId, target, expectedValues);
     });
   } catch (error) {
-    const peerConfirmation = await confirmPeerOwnership(targetId);
-    if (!peerConfirmation.confirmed) {
+    if (
+      useDisplayHandoff &&
+      targetId !== "windows" &&
+      shouldAttemptWindowsDesktopHandoffRecovery(error)
+    ) {
+      desktopHandedOff = await attemptWindowsDesktopHandoffRecovery(targetId);
+      if (desktopHandedOff) {
+        return;
+      }
+    }
+
+    const ownershipConfirmation = await confirmTargetOwnership(targetId);
+    if (!ownershipConfirmation.confirmed) {
       throw error;
     }
 
-    if (peerConfirmation.snapshot) {
-      updateSharedMonitorOwnership(peerConfirmation.snapshot);
+    if (ownershipConfirmation.snapshot) {
+      updateSharedMonitorOwnership(ownershipConfirmation.snapshot);
     }
   }
 
-  if (useDisplayHandoff && targetId !== "windows") {
+  if (useDisplayHandoff && targetId !== "windows" && !desktopHandedOff && !state.windowsDesktop.pendingRestore) {
     await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
     await handOffWindowsDesktop();
     markPendingWindowsDesktopRestore();
@@ -503,10 +515,10 @@ function switchOnMac(targetId, target) {
       },
     })
   ).catch(async (error) => {
-    const peerConfirmation = await confirmPeerOwnership(targetId);
-    if (peerConfirmation.confirmed) {
-      if (peerConfirmation.snapshot) {
-        updateSharedMonitorOwnership(peerConfirmation.snapshot);
+    const ownershipConfirmation = await confirmTargetOwnership(targetId);
+    if (ownershipConfirmation.confirmed) {
+      if (ownershipConfirmation.snapshot) {
+        updateSharedMonitorOwnership(ownershipConfirmation.snapshot);
       }
       return;
     }
@@ -2714,7 +2726,13 @@ async function waitForDisplayCount(expectedCount, errorMessage) {
 
   while (Date.now() - startedAt < 8000) {
     try {
-      if (screen.getAllDisplays().length === expectedCount) {
+      const topologyDisplays = await getWindowsTopologyDisplays();
+      const attachedDisplayCount = getAttachedWindowsTopologyDisplayCount(topologyDisplays);
+      if (Number.isInteger(attachedDisplayCount)) {
+        if (attachedDisplayCount === expectedCount) {
+          return;
+        }
+      } else if (screen.getAllDisplays().length === expectedCount) {
         return;
       }
     } catch {
@@ -2725,6 +2743,58 @@ async function waitForDisplayCount(expectedCount, errorMessage) {
   }
 
   throw new Error(errorMessage);
+}
+
+async function getWindowsTopologyDisplays() {
+  if (process.platform !== "win32") {
+    return [];
+  }
+
+  const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
+
+  try {
+    const output = await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      topologyScriptPath,
+      "-Summary",
+    ]);
+    const parsed = JSON.parse(output);
+    const displays = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+    return displays
+      .map((display) => normalizeWindowsTopologyDisplay(display))
+      .filter(Boolean);
+  } catch (error) {
+    appendDiagnosticLog("Failed to read Windows display topology summary", error);
+    return [];
+  }
+}
+
+function normalizeWindowsTopologyDisplay(display) {
+  if (!display || typeof display !== "object") {
+    return null;
+  }
+
+  return {
+    deviceName: normalizeText(display.DeviceName),
+    deviceString: normalizeText(display.DeviceString),
+    attached: Boolean(display.Attached),
+    primary: Boolean(display.Primary),
+    width: Number.isFinite(display.Width) ? display.Width : 0,
+    height: Number.isFinite(display.Height) ? display.Height : 0,
+    positionX: Number.isFinite(display.PositionX) ? display.PositionX : 0,
+    positionY: Number.isFinite(display.PositionY) ? display.PositionY : 0,
+  };
+}
+
+function getAttachedWindowsTopologyDisplayCount(displays) {
+  if (!Array.isArray(displays) || displays.length === 0) {
+    return null;
+  }
+
+  return displays.filter((display) => display.attached).length;
 }
 
 function startPeerDiscovery() {
@@ -2888,9 +2958,21 @@ async function getLocalOwnershipSnapshot() {
   return createDefaultOwnershipSnapshot();
 }
 
-async function getWindowsOwnershipSnapshot() {
+async function getTargetedLocalOwnershipSnapshot(targetId) {
+  if (process.platform === "win32") {
+    return getWindowsOwnershipSnapshot({ attemptedTargetId: targetId });
+  }
+
+  if (process.platform === "darwin") {
+    return getMacOwnershipSnapshot({ attemptedTargetId: targetId });
+  }
+
+  return createDefaultOwnershipSnapshot();
+}
+
+async function getWindowsOwnershipSnapshot(options = {}) {
   const names = await getAvailableMonitorNames();
-  const availability = await createWindowsMonitorAvailabilitySnapshot(names);
+  const availability = await createWindowsMonitorAvailabilitySnapshot(names, options);
   return {
     owner: availability.owner || "unknown",
     source: "local",
@@ -2902,19 +2984,19 @@ async function getWindowsOwnershipSnapshot() {
   };
 }
 
-async function getMacOwnershipSnapshot() {
+async function getMacOwnershipSnapshot(options = {}) {
   const currentInputResult = await getMacCurrentInputResult();
   if (!currentInputResult.ok) {
-    const inferredOwnerTargetId = inferMacOwnerFromLocalDisplayState();
+    const inferredOwnerTargetId = inferMacOwnerFromLocalDisplayState(options.attemptedTargetId);
     if (inferredOwnerTargetId) {
       return {
         owner: inferredOwnerTargetId,
         source: "local",
         platform: process.platform,
         status: "missing",
-        message: `Mac 当前已经看不到共享屏，且最近一次成功切换目标是 ${getTarget(
+        message: `Mac 当前已经看不到共享屏；本机根据当前显示拓扑判断共享屏已经交给 ${getTarget(
           inferredOwnerTargetId
-        ).label}；本机判断共享屏已经交给对端。`,
+        ).label}。`,
         currentInputValue: null,
         updatedAt: new Date().toISOString(),
       };
@@ -2961,7 +3043,7 @@ async function fetchPeerOwnershipSnapshot() {
   return getAutoDiscoveredPeerBroadcastSnapshot();
 }
 
-async function confirmPeerOwnership(targetId) {
+async function confirmTargetOwnership(targetId, { includePeer = true, timeoutMs = PEER_CONFIRMATION_TIMEOUT_MS } = {}) {
   if (!parseTargetId(targetId)) {
     return {
       confirmed: false,
@@ -2972,15 +3054,28 @@ async function confirmPeerOwnership(targetId) {
   const startedAt = Date.now();
   let lastSnapshot = null;
 
-  while (Date.now() - startedAt < PEER_CONFIRMATION_TIMEOUT_MS) {
-    const peerSnapshot = await fetchPeerOwnershipSnapshot();
-    if (peerSnapshot) {
-      lastSnapshot = peerSnapshot;
-      if (peerSnapshot.owner === targetId) {
+  while (Date.now() - startedAt < timeoutMs) {
+    const localSnapshot = await getTargetedLocalOwnershipSnapshot(targetId);
+    if (localSnapshot) {
+      lastSnapshot = localSnapshot;
+      if (localSnapshot.owner === targetId) {
         return {
           confirmed: true,
-          snapshot: peerSnapshot,
+          snapshot: localSnapshot,
         };
+      }
+    }
+
+    if (includePeer) {
+      const peerSnapshot = await fetchPeerOwnershipSnapshot();
+      if (peerSnapshot) {
+        lastSnapshot = peerSnapshot;
+        if (peerSnapshot.owner === targetId) {
+          return {
+            confirmed: true,
+            snapshot: peerSnapshot,
+          };
+        }
       }
     }
 
@@ -2991,6 +3086,50 @@ async function confirmPeerOwnership(targetId) {
     confirmed: false,
     snapshot: lastSnapshot,
   };
+}
+
+function shouldAttemptWindowsDesktopHandoffRecovery(error) {
+  const message = normalizeText(error?.message);
+
+  if (!message) {
+    return false;
+  }
+
+  if (shouldAbortCandidateRetries(error)) {
+    return false;
+  }
+
+  return !/当前配置无效|当前平台不受支持/u.test(message);
+}
+
+async function attemptWindowsDesktopHandoffRecovery(targetId) {
+  if (process.platform !== "win32" || targetId === "windows") {
+    return false;
+  }
+
+  try {
+    await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
+    await handOffWindowsDesktop();
+    markPendingWindowsDesktopRestore();
+  } catch (error) {
+    appendDiagnosticLog("Windows desktop handoff recovery failed", error);
+    return false;
+  }
+
+  const ownershipConfirmation = await confirmTargetOwnership(targetId, {
+    includePeer: true,
+    timeoutMs: 4000,
+  });
+
+  if (!ownershipConfirmation.confirmed) {
+    return false;
+  }
+
+  if (ownershipConfirmation.snapshot) {
+    updateSharedMonitorOwnership(ownershipConfirmation.snapshot);
+  }
+
+  return true;
 }
 
 function getPeerStatusUrls() {
@@ -3230,7 +3369,7 @@ async function updateWindowsMonitorAvailability(names) {
   return windowsMonitorAvailability;
 }
 
-async function createWindowsMonitorAvailabilitySnapshot(monitorNames) {
+async function createWindowsMonitorAvailabilitySnapshot(monitorNames, options = {}) {
   if (process.platform !== "win32") {
     return {
       status: "unknown",
@@ -3251,11 +3390,14 @@ async function createWindowsMonitorAvailabilitySnapshot(monitorNames) {
     };
   }
 
-  if (shouldInferWindowsAwayFromTopology()) {
+  const topologyDisplays = await getWindowsTopologyDisplays();
+  const attachedDisplayCount = getAttachedWindowsTopologyDisplayCount(topologyDisplays);
+
+  if (shouldInferWindowsAwayFromTopology(attachedDisplayCount, options.attemptedTargetId)) {
     return {
       status: "away",
       names: monitorNames,
-      message: `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据最近一次成功切换和当前只剩主屏的状态，判断共享屏已经交给 Mac。`,
+      message: `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据当前只剩主屏的状态，判断共享屏已经交给 Mac。`,
       owner: "mac",
       currentInputValue: null,
     };
@@ -3263,13 +3405,17 @@ async function createWindowsMonitorAvailabilitySnapshot(monitorNames) {
 
   if (!doesMonitorListContainConfiguredMonitor(monitorNames, state.config.monitorName)) {
     const visibleText = monitorNames.length > 0 ? monitorNames.join("、") : "没有检测到任何显示器";
-    const inferredOwnerTargetId = inferWindowsOwnerFromLocalDisplayState(monitorNames);
+    const inferredOwnerTargetId = inferWindowsOwnerFromLocalDisplayState(
+      monitorNames,
+      attachedDisplayCount,
+      options.attemptedTargetId
+    );
     return {
       status: "missing",
       names: monitorNames,
       message:
         inferredOwnerTargetId === "mac"
-          ? `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据最近一次成功切换和当前只剩主屏的状态，判断共享屏已经交给 Mac。现在看到的是 ${visibleText}。`
+          ? `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据当前显示拓扑判断共享屏已经交给 Mac。现在看到的是 ${visibleText}。`
           : `${state.config.monitorName} 当前不在 Windows 侧；现在看到的是 ${visibleText}。请到 Mac 端或显示器菜单切回。`,
       owner: inferredOwnerTargetId || "unknown",
       currentInputValue: null,
@@ -3430,27 +3576,45 @@ function getWindowsDisplayCount() {
   }
 }
 
-function inferWindowsOwnerFromLocalDisplayState(monitorNames = []) {
-  const recentTargetId = getRecentSuccessfulTargetId();
+function inferWindowsOwnerFromLocalDisplayState(
+  monitorNames = [],
+  attachedDisplayCount = null,
+  attemptedTargetId = null
+) {
+  const recentTargetId = attemptedTargetId || getRecentSuccessfulTargetId();
   if (recentTargetId !== "mac") {
     return null;
   }
 
-  const displayCount = getWindowsDisplayCount();
-  const otherNamesVisible = Array.isArray(monitorNames) && monitorNames.length > 0;
-  if (displayCount <= 1 || state.windowsDesktop.pendingRestore || !otherNamesVisible) {
+  const displayCount =
+    Number.isInteger(attachedDisplayCount) && attachedDisplayCount >= 0
+      ? attachedDisplayCount
+      : getWindowsDisplayCount();
+  const configuredMonitorVisible = doesMonitorListContainConfiguredMonitor(
+    Array.isArray(monitorNames) ? monitorNames : [],
+    state.config.monitorName
+  );
+
+  if (displayCount <= 1 || !configuredMonitorVisible) {
     return "mac";
   }
 
   return null;
 }
 
-function shouldInferWindowsAwayFromTopology() {
-  return getWindowsDisplayCount() <= 1 && inferWindowsOwnerFromLocalDisplayState();
+function shouldInferWindowsAwayFromTopology(attachedDisplayCount = null, attemptedTargetId = null) {
+  const displayCount =
+    Number.isInteger(attachedDisplayCount) && attachedDisplayCount >= 0
+      ? attachedDisplayCount
+      : getWindowsDisplayCount();
+  return (
+    displayCount <= 1 &&
+    inferWindowsOwnerFromLocalDisplayState([], displayCount, attemptedTargetId) === "mac"
+  );
 }
 
-function inferMacOwnerFromLocalDisplayState() {
-  const recentTargetId = getRecentSuccessfulTargetId();
+function inferMacOwnerFromLocalDisplayState(attemptedTargetId = null) {
+  const recentTargetId = attemptedTargetId || getRecentSuccessfulTargetId();
   if (recentTargetId !== "windows") {
     return null;
   }

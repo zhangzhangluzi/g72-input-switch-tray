@@ -125,6 +125,8 @@ That LAN layer is only a secondary signal:
 - Windows should first use local input readback and local desktop-topology changes
 - macOS should first use local input readback and, in single-screen setups, whether its shared display disappeared after a successful handoff
 - peer confirmation is for the cases where local evidence is still ambiguous
+- for an in-flight switch, the app should use the current requested target as the local inference hint instead of waiting for that switch to be recorded as the last successful action
+- Windows desktop handoff verification should read back the real Win32 topology state, not only Electron's display cache
 
 Normal operation should stay zero-config:
 
