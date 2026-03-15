@@ -5,6 +5,14 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const {
+  doesMonitorListContainConfiguredMonitor,
+  normalizeText,
+} = require("./monitor-name-helpers");
+const {
+  createWindowsSharedMonitorTransferHint,
+  createWindowsSwitchMenuModel,
+} = require("./tray-menu-helpers");
 
 const APP_NAME = "显示器输入切换";
 const APP_ID = "com.zhangzhangluzi.g72inputswitchtray";
@@ -186,29 +194,29 @@ function refreshMenu() {
     ? windowsMonitorAvailability.message ||
       `${state.config.monitorName || "共享屏"} 当前不在 Windows 侧，请到 Mac 端或显示器菜单切回。`
     : "";
-  const switchMenuItems = windowsSharedMonitorMissing
-    ? [
-        {
-          label: "共享屏当前已交给另一台电脑，查看交接说明",
-          click: () => showWindowsSharedMonitorTransferHint(windowsSharedMonitorMessage),
-        },
-      ]
-    : [
-        {
-          label: getTarget("windows").label,
-          type: "radio",
-          checked: state.lastTarget === "windows",
-          enabled: configErrors.length === 0,
-          click: () => handleTraySwitch("windows"),
-        },
-        {
-          label: getTarget("mac").label,
-          type: "radio",
-          checked: state.lastTarget === "mac",
-          enabled: configErrors.length === 0,
-          click: () => handleTraySwitch("mac"),
-        },
-      ];
+  const switchMenuItems = createWindowsSwitchMenuModel({
+    windowsSharedMonitorMissing,
+    hasConfigErrors: configErrors.length > 0,
+    lastTarget: state.lastTarget,
+    windowsLabel: getTarget("windows").label,
+    macLabel: getTarget("mac").label,
+  }).map((item) => {
+    if (item.kind === "handoffHint") {
+      return {
+        label: item.label,
+        enabled: item.enabled,
+        click: () => showWindowsSharedMonitorTransferHint(windowsSharedMonitorMessage),
+      };
+    }
+
+    return {
+      label: item.label,
+      type: item.type,
+      checked: item.checked,
+      enabled: item.enabled,
+      click: () => handleTraySwitch(item.targetId),
+    };
+  });
 
   const menu = Menu.buildFromTemplate([
     {
@@ -298,19 +306,16 @@ function refreshMenu() {
 }
 
 function showWindowsSharedMonitorTransferHint(message = "") {
-  const monitorName = state.config.monitorName || "共享屏";
-  const detail = [
-    message || `${monitorName} 当前不在 Windows 侧，请到 Mac 端或显示器菜单切回。`,
-    "",
-    "现在的交接规则是：谁当前拥有这块共享屏，谁负责把它交出去。",
-    "如果它已经切到 Mac，请在 Mac 端菜单栏或显示器菜单里把它切回 Windows。",
-  ].join("\n");
+  const hint = createWindowsSharedMonitorTransferHint({
+    monitorName: state.config.monitorName,
+    message,
+  });
 
   void dialog.showMessageBox({
     type: "info",
     title: APP_NAME,
-    message: `${monitorName} 当前不在 Windows 侧`,
-    detail,
+    message: hint.message,
+    detail: hint.detail,
     buttons: ["知道了"],
     defaultId: 0,
   });
@@ -859,30 +864,59 @@ async function runMacInputProbe(targetId, candidate) {
   await delay(250);
   const afterResult = await getMacCurrentInputResult();
   const expectedValues = getExpectedProbeInputValues(candidate);
+  const beforeValue = beforeResult.ok ? beforeResult.value : null;
+  const matchedExpectedValue = afterResult.ok && expectedValues.includes(afterResult.value);
+  const unchangedValue =
+    afterResult.ok && beforeResult.ok && afterResult.value === beforeResult.value;
 
-  if (afterResult.ok && expectedValues.includes(afterResult.value)) {
+  if (matchedExpectedValue) {
+    if (commandError && unchangedValue) {
+      return createMacInputProbeResult({
+        targetId,
+        candidate,
+        status: "error",
+        beforeValue,
+        afterValue: afterResult.value,
+        expectedValues,
+        commandError,
+        message: `测试 ${candidate} 时底层命令返回了错误，当前输入虽然仍是 ${describeInputValue(
+          afterResult.value
+        )}，但无法确认这次切换是否真的成功。`,
+      });
+    }
+
     return createMacInputProbeResult({
       targetId,
       candidate,
       status: "matched",
-      beforeValue: beforeResult.ok ? beforeResult.value : null,
+      beforeValue,
       afterValue: afterResult.value,
       expectedValues,
       commandError,
-      message: `值 ${candidate} 已命中 ${getTargetSlotName(targetId)} 的候选集合，当前输入回报为 ${describeInputValue(afterResult.value)}。`,
+      message: commandError
+        ? `测试 ${candidate} 时底层命令返回了错误，但当前输入回报已经命中 ${getTargetSlotName(
+            targetId
+          )} 的候选集合：${describeInputValue(afterResult.value)}。请结合画面实际变化确认。`
+        : `值 ${candidate} 已命中 ${getTargetSlotName(targetId)} 的候选集合，当前输入回报为 ${describeInputValue(
+            afterResult.value
+          )}。`,
     });
   }
 
-  if (afterResult.ok && beforeResult.ok && afterResult.value === beforeResult.value) {
+  if (unchangedValue) {
     return createMacInputProbeResult({
       targetId,
       candidate,
-      status: "unchanged",
+      status: commandError ? "error" : "unchanged",
       beforeValue: beforeResult.value,
       afterValue: afterResult.value,
       expectedValues,
       commandError,
-      message: `测试 ${candidate} 后，显示器当前输入仍是 ${describeInputValue(afterResult.value)}。`,
+      message: commandError
+        ? `测试 ${candidate} 时底层命令失败，显示器当前输入仍是 ${describeInputValue(
+            afterResult.value
+          )}。`
+        : `测试 ${candidate} 后，显示器当前输入仍是 ${describeInputValue(afterResult.value)}。`,
     });
   }
 
@@ -890,12 +924,18 @@ async function runMacInputProbe(targetId, candidate) {
     return createMacInputProbeResult({
       targetId,
       candidate,
-      status: "different",
-      beforeValue: beforeResult.ok ? beforeResult.value : null,
+      status: commandError ? "error" : "different",
+      beforeValue,
       afterValue: afterResult.value,
       expectedValues,
       commandError,
-      message: `测试 ${candidate} 后，当前输入回报为 ${describeInputValue(afterResult.value)}，没有匹配预期集合 ${expectedValues.join(" / ")}。`,
+      message: commandError
+        ? `测试 ${candidate} 时底层命令失败，当前输入回报为 ${describeInputValue(
+            afterResult.value
+          )}，没有匹配预期集合 ${expectedValues.join(" / ")}。`
+        : `测试 ${candidate} 后，当前输入回报为 ${describeInputValue(
+            afterResult.value
+          )}，没有匹配预期集合 ${expectedValues.join(" / ")}。`,
     });
   }
 
@@ -1119,44 +1159,6 @@ async function getAvailableMonitorNames() {
   } catch {
     return [];
   }
-}
-
-function normalizeMonitorToken(value) {
-  return normalizeText(value).replace(/[^0-9A-Za-z]+/g, "").toLowerCase();
-}
-
-function doesMonitorListContainConfiguredMonitor(monitorNames, configuredName) {
-  const requestedName = normalizeText(configuredName);
-  if (!requestedName) {
-    return false;
-  }
-
-  const requestedToken = normalizeMonitorToken(requestedName);
-  const exactMatches = monitorNames.filter(
-    (name) => normalizeText(name).toLowerCase() === requestedName.toLowerCase()
-  );
-  if (exactMatches.length === 1) {
-    return true;
-  }
-
-  if (!requestedToken) {
-    return false;
-  }
-
-  const normalizedMatches = monitorNames.filter((name) => normalizeMonitorToken(name) === requestedToken);
-  if (normalizedMatches.length === 1) {
-    return true;
-  }
-
-  const partialMatches = monitorNames.filter((name) => {
-    const candidateToken = normalizeMonitorToken(name);
-    return (
-      candidateToken &&
-      (candidateToken.includes(requestedToken) || requestedToken.includes(candidateToken))
-    );
-  });
-
-  return partialMatches.length === 1;
 }
 
 async function assertWindowsSharedMonitorAvailableForSwitch() {
@@ -1724,6 +1726,10 @@ function renderMacProbeResult(result) {
     lines.push(`候选集合：${escapeHtml(result.expectedValues.join(" / "))}`);
   }
 
+  if (result.commandError) {
+    lines.push(`底层返回：${escapeHtml(result.commandError)}`);
+  }
+
   return `<div class="banner ${statusClass}" style="margin-top: 14px;">${lines.join("<br>")}</div>`;
 }
 
@@ -1958,10 +1964,6 @@ function readRequestBody(request) {
     });
     request.on("error", reject);
   });
-}
-
-function normalizeText(value) {
-  return String(value ?? "").trim();
 }
 
 function normalizePositiveInteger(value, fallbackValue) {
@@ -2415,7 +2417,7 @@ async function attemptPendingWindowsDesktopRestore() {
 
   try {
     const names = await getAvailableMonitorNames();
-    if (!names.includes(state.config.monitorName)) {
+    if (!doesMonitorListContainConfiguredMonitor(names, state.config.monitorName)) {
       return;
     }
 

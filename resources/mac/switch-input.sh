@@ -6,8 +6,9 @@ INPUT_VALUE="$COMMAND"
 DISPLAY_NAME="${DISPLAY_NAME:-}"
 DISPLAY_INDEX="${DISPLAY_INDEX:-1}"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-BUNDLED_DDCCTL="$SCRIPT_DIR/../bin/ddcctl"
+BUNDLED_DDCCTL="${BUNDLED_DDCCTL_PATH:-$SCRIPT_DIR/../bin/ddcctl}"
 BETTERDISPLAY_APP_PATH="${BETTERDISPLAY_APP_PATH:-}"
+DISABLE_BETTERDISPLAY="${DISABLE_BETTERDISPLAY:-0}"
 LAST_ERROR=""
 LAST_ERROR_PRIORITY=0
 DISPLAY_INDEX_CANDIDATES=""
@@ -115,6 +116,12 @@ resolve_betterdisplay() {
   if [ -n "$BETTERDISPLAY_PATH" ] && [ -n "$BETTERDISPLAY_MODE" ]; then
     return 0
   fi
+
+  case "$DISABLE_BETTERDISPLAY" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 1
+      ;;
+  esac
 
   if [ -z "$DISPLAY_NAME" ]; then
     return 1
@@ -341,7 +348,11 @@ try_ddcctl_binary() {
 
   for display_index in $candidate_list; do
     if output=$("$binary_path" -d "$display_index" -i "$INPUT_VALUE" 2>&1); then
-      return 0
+      if verify_ddcctl_switch_binary "$binary_path" "$display_index"; then
+        return 0
+      fi
+
+      continue
     fi
 
     if is_ddcctl_usage_output "$output"; then
@@ -352,6 +363,41 @@ try_ddcctl_binary() {
     remember_error "$output" 2
   done
 
+  return 1
+}
+
+verify_ddcctl_switch_binary() {
+  binary_path="$1"
+  display_index="$2"
+  expected_values=$(get_expected_input_values)
+
+  sleep 1
+
+  if ! output=$("$binary_path" -d "$display_index" -i "?" 2>&1); then
+    if is_ddcctl_usage_output "$output"; then
+      remember_error "$output" 1
+    else
+      remember_error "ddcctl 已发送输入切换命令，但无法重新读回当前输入值：${output}" 3
+    fi
+    return 1
+  fi
+
+  current_value=$(extract_ddcctl_current_value "$output")
+
+  case "$current_value" in
+    ''|*[!0-9]*)
+      remember_error "ddcctl 写入后返回了无法识别的当前输入值：${output}" 3
+      return 1
+      ;;
+  esac
+
+  for expected_value in $expected_values; do
+    if [ "$current_value" = "$expected_value" ]; then
+      return 0
+    fi
+  done
+
+  remember_error "ddcctl 已发送输入切换命令，但当前输入仍是 ${current_value}，未匹配目标值集合：${expected_values}" 3
   return 1
 }
 

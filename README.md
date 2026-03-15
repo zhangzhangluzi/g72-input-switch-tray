@@ -58,6 +58,7 @@ npm start
 ```bash
 npm run dist:win
 npm run dist:mac
+npm run verify:self
 ```
 
 Tag a release with a `v` prefix, for example `v0.2.0`, and GitHub Actions will publish Windows and macOS release artifacts to GitHub Releases.
