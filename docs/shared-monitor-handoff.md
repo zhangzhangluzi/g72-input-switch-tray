@@ -111,7 +111,22 @@ Treat the handoff as three ordered phases, not one blended action:
 
 The current app is still asymmetric because input switching is local-only.
 
-If we want true dual-machine coordination, add an optional peer handshake layer:
+The app now includes a first peer-confirmation layer:
+
+- each machine exposes a read-only ownership endpoint on the LAN
+- you can paste the other machine's ownership URL into local settings
+- if local DDC readback is inconclusive, the app can ask the peer which side currently owns G72
+
+This improves two failure-prone cases:
+
+- Windows says "still attached" even though the picture has already moved to Mac
+- macOS or Windows reports a stale input value immediately after a successful handoff
+
+Remaining limitation:
+
+- desktop topology repair on Windows is still local-only; peer confirmation does not force Windows itself to drop a ghost display path
+
+If we want even tighter dual-machine coordination after this, add an optional peer handshake layer:
 
 - macOS can call a Windows "prepare" endpoint before attempting `Mac -> Windows`
 - Windows can call a macOS "prepare" endpoint before attempting `Windows -> Mac`
