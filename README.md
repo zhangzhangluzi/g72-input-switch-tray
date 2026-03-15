@@ -10,7 +10,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - Built-in local browser settings page for choosing the monitor name, macOS display index, and two input profiles
 - The tray/menu separates "current shared-screen owner" from "last requested switch target"
 - Optional Samsung / MStar compatibility mode for monitors whose real input-switch values do not match the standard MCCS values
-- Optional Windows desktop handoff mode that moves the desktop to the remaining screen when the target monitor switches away, then restores extend mode when that monitor comes back
+- Optional Windows desktop handoff mode that moves the desktop back to the Windows primary screen when the shared monitor switches away, then restores extend mode when that monitor comes back
 - Optional launch at login
 - Windows uninstall entry via the packaged NSIS uninstaller
 - macOS self-uninstall command from the app menu
@@ -29,7 +29,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - Some monitors, especially Samsung / MStar models, continue reporting an active connection to the current computer even after the picture switches away. The app no longer treats “still attached” as a failure for those screens.
 - For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
 - On Windows, desktop handoff uses the system display switcher to move the desktop off the departing monitor, and retries extend mode until that monitor is available again.
-- Windows desktop handoff now treats `DisplaySwitch.exe /external` as safe only when Windows still has an internal display; on desktop-style "two external monitors" layouts it stays disabled to avoid black-screening the wrong output.
+- Windows desktop handoff now uses the system "PC screen only" path to move Windows back to its primary display when the shared monitor switches away, then restores `extend` when the shared monitor comes back.
 - On Windows, the app now keeps switch failures user-facing and concise: monitor-name mismatches are reported together with the names Windows currently sees, instead of showing a raw PowerShell stack trace.
 - Windows monitor matching now accepts normalized names, but it no longer falls back to "the only remaining monitor" in a shared-screen setup, so the helper will not accidentally send DDC commands to the Windows fallback screen.
 - On Windows, the app now distinguishes "still enumerated by Windows" from "still owned by Windows". If the shared monitor keeps reporting an attached EDID after switching to Mac, the app reads the current input value back and treats that state as "ownership moved away" instead of assuming Windows still owns the screen.
@@ -37,6 +37,7 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - Each app now advertises its read-only ownership state on the LAN. When exactly one matching peer is discovered, the app automatically uses that peer for handoff confirmation, so the normal flow does not require manually pasting any URL.
 - For a shared-screen setup, treat the monitor as a single-owner resource: whichever machine currently owns the visible picture is the one that should hand it off.
 - On Windows, if the shared screen is no longer visible to Windows, the tray now treats that as "ownership has moved away" and stops offering local switch actions until the screen comes back.
+- If you want Windows to truly drop the shared screen from desktop topology during `Windows -> Mac`, set the Windows fallback screen as the primary display; the handoff path now returns Windows to that primary display.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching now prefers BetterDisplay command-line control when it is available, because name-based matching is more reliable than a fixed display index on some Macs.
 - If `betterdisplaycli` is not installed but `BetterDisplay.app` is present in `/Applications` or `~/Applications`, the app uses the BetterDisplay bundle binary directly.

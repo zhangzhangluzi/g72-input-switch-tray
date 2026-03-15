@@ -3,7 +3,6 @@
 function createWindowsSwitchMenuModel({
   windowsSharedMonitorMissing,
   hasConfigErrors,
-  lastTarget,
   currentOwnerTargetId,
   windowsLabel,
   macLabel,
@@ -24,7 +23,7 @@ function createWindowsSwitchMenuModel({
       targetId: "windows",
       label: windowsLabel,
       type: "radio",
-      checked: (currentOwnerTargetId || lastTarget) === "windows",
+      checked: currentOwnerTargetId === "windows",
       enabled: !hasConfigErrors,
     },
     {
@@ -32,7 +31,7 @@ function createWindowsSwitchMenuModel({
       targetId: "mac",
       label: macLabel,
       type: "radio",
-      checked: (currentOwnerTargetId || lastTarget) === "mac",
+      checked: currentOwnerTargetId === "mac",
       enabled: !hasConfigErrors,
     },
   ];

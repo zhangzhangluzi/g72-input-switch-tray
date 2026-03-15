@@ -33,6 +33,7 @@ function verifyWindowsMenuModel() {
     windowsSharedMonitorMissing: false,
     hasConfigErrors: false,
     lastTarget: "windows",
+    currentOwnerTargetId: "windows",
     windowsLabel: "Windows（DP2）",
     macLabel: "Mac mini（HDMI1）",
   });
@@ -61,6 +62,20 @@ function verifyWindowsMenuModel() {
         type: "radio",
       },
     ]
+  );
+
+  const unknownOwnerItems = createWindowsSwitchMenuModel({
+    windowsSharedMonitorMissing: false,
+    hasConfigErrors: false,
+    lastTarget: "mac",
+    currentOwnerTargetId: null,
+    windowsLabel: "Windows（DP2）",
+    macLabel: "Mac mini（HDMI1）",
+  });
+
+  assert.deepEqual(
+    unknownOwnerItems.map((item) => item.checked),
+    [false, false]
   );
 
   const hint = createWindowsSharedMonitorTransferHint({

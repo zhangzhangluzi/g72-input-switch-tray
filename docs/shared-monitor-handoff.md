@@ -19,13 +19,13 @@ Implication:
 
 This is a Windows-only concern. It is not the same thing as monitor input switching.
 
-- When Windows switches the shared monitor away to the other device, the Windows app can call `DisplaySwitch.exe /external` so the desktop moves to the remaining screen.
+- When Windows switches the shared monitor away to the other device, the Windows app can call `DisplaySwitch.exe /internal` so the desktop falls back to Windows' primary display.
 - When the shared monitor later comes back to Windows, the Windows app can call `DisplaySwitch.exe /extend` to restore extended desktop mode.
 
-Safety constraint:
+Operational constraint:
 
-- `DisplaySwitch.exe /external` is only considered safe when Windows also has an internal display.
-- On desktop-style setups where both monitors are external, forcing `/external` can black-screen the wrong output, so the app should leave desktop topology alone.
+- This handoff only lands on the display Windows considers primary.
+- If the fallback screen should stay alive after `Windows -> Mac`, make that fallback screen the Windows primary display.
 
 Implication:
 
@@ -64,7 +64,7 @@ Result:
 
 - `switchMonitor()` dispatches to `switchOnWindows()` on Windows.
 - `switchOnWindows()` sends the local DDC command.
-- If Windows desktop handoff is enabled, it also manages `/external` when switching away and `/extend` when the shared monitor returns.
+- If Windows desktop handoff is enabled, it also manages `/internal` when switching away and `/extend` when the shared monitor returns.
 
 Result:
 
@@ -103,7 +103,7 @@ Treat the handoff as three ordered phases, not one blended action:
 ### Recommended flow: Windows -> Mac
 
 1. Windows sends the DDC input-switch command.
-2. After the switch-away delay, Windows moves the desktop to the remaining screen with `/external` only when the current Windows machine has a safe internal-display fallback.
+2. After the switch-away delay, Windows moves the desktop back to its primary display with `/internal`.
 3. Windows marks a pending restore.
 4. When the shared monitor later comes back, Windows restores `/extend`.
 
