@@ -127,6 +127,7 @@ That LAN layer is only a secondary signal:
 - peer confirmation is for the cases where local evidence is still ambiguous
 - for an in-flight switch, the app should use the current requested target as the local inference hint instead of waiting for that switch to be recorded as the last successful action
 - Windows desktop handoff verification should read back the real Win32 topology state, not only Electron's display cache
+- if Windows has already detached the shared screen from topology, macOS-to-Windows handoff can optionally ask the discovered Windows peer to restore the shared output path before sending DDC so the monitor sees a stable incoming signal
 
 Normal operation should stay zero-config:
 

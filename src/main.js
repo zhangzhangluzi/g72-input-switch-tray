@@ -507,14 +507,23 @@ async function switchOnWindows(targetId, target) {
 function switchOnMac(targetId, target) {
   const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
   const candidates = getInputCandidates(target);
-  return runCandidateSequence(candidates, (candidate) =>
-    runCommand("/bin/sh", [scriptPath, String(candidate)], {
-      env: {
-        DISPLAY_NAME: state.config.monitorName,
-        DISPLAY_INDEX: String(state.config.macDisplayIndex),
-      },
+  return Promise.resolve()
+    .then(async () => {
+      if (targetId === "windows") {
+        await preparePeerForIncomingOwnership(targetId);
+      }
     })
-  ).catch(async (error) => {
+    .then(() =>
+      runCandidateSequence(candidates, (candidate) =>
+        runCommand("/bin/sh", [scriptPath, String(candidate)], {
+          env: {
+            DISPLAY_NAME: state.config.monitorName,
+            DISPLAY_INDEX: String(state.config.macDisplayIndex),
+          },
+        })
+      )
+    )
+    .catch(async (error) => {
     const ownershipConfirmation = await confirmTargetOwnership(targetId);
     if (ownershipConfirmation.confirmed) {
       if (ownershipConfirmation.snapshot) {
@@ -770,6 +779,8 @@ async function handleControlRequest(request, response) {
   const macProbePath = `/api/${state.controlToken}/probe/mac`;
   const macProbeApplyPath = `/api/${state.controlToken}/probe/mac/apply`;
   const peerOwnershipPath = getPeerOwnershipPath();
+  const peerPrepareWindowsPath = getPeerPreparePath("windows");
+  const peerPrepareMacPath = getPeerPreparePath("mac");
 
   if (requestUrl.pathname === "/health") {
     const ownership = await getEffectiveOwnershipSnapshot();
@@ -788,6 +799,14 @@ async function handleControlRequest(request, response) {
       ok: true,
       ownership: await getEffectiveOwnershipSnapshot({ includePeer: false }),
     });
+  }
+
+  if (
+    [peerPrepareWindowsPath, peerPrepareMacPath].includes(requestUrl.pathname) &&
+    request.method === "POST"
+  ) {
+    const targetId = requestUrl.pathname.endsWith("/windows") ? "windows" : "mac";
+    return handlePeerPrepareRequest(response, targetId);
   }
 
   if (!isLoopbackRequest(request)) {
@@ -864,6 +883,25 @@ async function handleControlRequest(request, response) {
 
   response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
   response.end("未找到对应页面。");
+}
+
+async function handlePeerPrepareRequest(response, targetId) {
+  if (targetId === "windows" && process.platform === "win32") {
+    const result = await prepareWindowsDesktopForIncomingOwnership();
+    return writeJson(response, 200, {
+      ok: true,
+      prepared: result.prepared,
+      ownership: await getEffectiveOwnershipSnapshot({ includePeer: false }),
+      detail: result.detail,
+    });
+  }
+
+  return writeJson(response, 200, {
+    ok: true,
+    prepared: false,
+    ownership: await getEffectiveOwnershipSnapshot({ includePeer: false }),
+    detail: "当前平台没有需要执行的共享屏接管预热动作。",
+  });
 }
 
 async function handleControlSwitch(request, response, requestUrl, targetId) {
@@ -2240,6 +2278,10 @@ function getPeerOwnershipPath() {
   return `/api/${state.peerToken}/ownership`;
 }
 
+function getPeerPreparePath(targetId) {
+  return `/api/${state.peerToken}/prepare/${targetId}`;
+}
+
 function getLocalSettingsUrl() {
   return `http://127.0.0.1:${activeControlPort}${getSettingsPath()}`;
 }
@@ -2712,6 +2754,46 @@ async function restoreWindowsDesktopToTargetMonitor() {
   await waitForDisplayCount(2, "Windows 没有恢复到扩展显示。");
 }
 
+async function prepareWindowsDesktopForIncomingOwnership() {
+  if (process.platform !== "win32") {
+    return {
+      prepared: false,
+      detail: "当前平台不是 Windows，无需预热共享屏接管。",
+    };
+  }
+
+  markPendingWindowsDesktopRestore();
+
+  try {
+    await runWindowsDisplaySwitch("/extend");
+  } catch (error) {
+    appendDiagnosticLog("Failed to prime Windows shared display path", error);
+    return {
+      prepared: false,
+      detail: error.message,
+    };
+  }
+
+  try {
+    await delay(1000);
+    const names = await getAvailableMonitorNames();
+    const availability = await updateWindowsMonitorAvailability(names);
+    return {
+      prepared: true,
+      detail:
+        availability.status === "visible"
+          ? `${state.config.monitorName} 已在 Windows 侧恢复为可见，等待显示器切回。`
+          : `${state.config.monitorName} 的 Windows 输出链路已预热，等待显示器切回。`,
+    };
+  } catch (error) {
+    appendDiagnosticLog("Failed to refresh Windows availability after priming shared display path", error);
+    return {
+      prepared: true,
+      detail: "Windows 已尝试恢复共享屏输出链路，等待显示器切回。",
+    };
+  }
+}
+
 function runWindowsDisplaySwitch(mode) {
   const displaySwitchPath = path.join(
     process.env.WINDIR || "C:\\Windows",
@@ -3132,6 +3214,30 @@ async function attemptWindowsDesktopHandoffRecovery(targetId) {
   return true;
 }
 
+async function preparePeerForIncomingOwnership(targetId) {
+  if (!parseTargetId(targetId)) {
+    return false;
+  }
+
+  for (const peerPrepareUrl of getPeerPrepareUrls(targetId)) {
+    try {
+      const payload = await requestJson(peerPrepareUrl, 3000, {
+        method: "POST",
+      });
+      const peerSnapshot = normalizePeerOwnershipSnapshot(payload?.ownership);
+      if (peerSnapshot) {
+        updateSharedMonitorOwnership(peerSnapshot);
+      }
+
+      return Boolean(payload?.ok);
+    } catch (error) {
+      appendDiagnosticLog(`Failed to prepare peer for ${targetId} ownership`, error);
+    }
+  }
+
+  return false;
+}
+
 function getPeerStatusUrls() {
   const autoDiscoveredUrls = getAutoDiscoveredPeerStatusUrls();
   if (autoDiscoveredUrls.length > 0) {
@@ -3147,6 +3253,43 @@ function getPeerStatusUrls() {
 function getAutoDiscoveredPeerStatusUrls() {
   const peers = getAutoDiscoveredPeerEntries();
   return peers.map((peer) => `http://${peer.address}:${peer.controlPort}/api/${peer.peerToken}/ownership`);
+}
+
+function getPeerPrepareUrls(targetId) {
+  const autoDiscoveredUrls = getAutoDiscoveredPeerEntries().map(
+    (peer) => `http://${peer.address}:${peer.controlPort}/api/${peer.peerToken}/prepare/${targetId}`
+  );
+
+  if (autoDiscoveredUrls.length > 0) {
+    return autoDiscoveredUrls;
+  }
+
+  const fallbackUrl = isValidPeerStatusUrl(state.config.peerStatusUrl)
+    ? normalizeText(state.config.peerStatusUrl)
+    : "";
+  const derivedFallbackUrl = derivePeerPrepareUrl(fallbackUrl, targetId);
+  return derivedFallbackUrl ? [derivedFallbackUrl] : [];
+}
+
+function derivePeerPrepareUrl(peerStatusUrl, targetId) {
+  if (!peerStatusUrl) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(peerStatusUrl);
+    const match = parsed.pathname.match(/^\/api\/([^/]+)\/ownership$/);
+    if (!match) {
+      return "";
+    }
+
+    parsed.pathname = `/api/${match[1]}/prepare/${targetId}`;
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return "";
+  }
 }
 
 function getAutoDiscoveredPeerEntries() {
@@ -3214,43 +3357,42 @@ function getRawActivePeerCandidates() {
   return Array.from(groupedPeers.values()).sort((left, right) => right.lastSeenAt - left.lastSeenAt);
 }
 
-function requestJson(urlString, timeoutMs) {
+function requestJson(urlString, timeoutMs, options = {}) {
+  const { method = "GET" } = options;
   return new Promise((resolve, reject) => {
     const url = new URL(urlString);
     const client = url.protocol === "https:" ? https : http;
-    const request = client.get(
-      url,
-      {
-        timeout: timeoutMs,
-        headers: {
-          "Accept": "application/json",
-        },
+    const request = client.request(url, {
+      method,
+      timeout: timeoutMs,
+      headers: {
+        "Accept": "application/json",
       },
-      (response) => {
-        let body = "";
-        response.setEncoding("utf8");
-        response.on("data", (chunk) => {
-          body += chunk;
-        });
-        response.on("end", () => {
-          if (response.statusCode < 200 || response.statusCode >= 300) {
-            reject(new Error(`Peer returned HTTP ${response.statusCode || 0}`));
-            return;
-          }
+    }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        body += chunk;
+      });
+      response.on("end", () => {
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`Peer returned HTTP ${response.statusCode || 0}`));
+          return;
+        }
 
-          try {
-            resolve(JSON.parse(body));
-          } catch (error) {
-            reject(error);
-          }
-        });
-      }
-    );
+        try {
+          resolve(JSON.parse(body));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
 
     request.on("timeout", () => {
       request.destroy(new Error("Peer request timed out."));
     });
     request.on("error", reject);
+    request.end();
   });
 }
 
