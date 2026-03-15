@@ -12,6 +12,7 @@ const {
   normalizeMonitorToken,
   normalizeText,
 } = require("./monitor-name-helpers");
+const { probeSamsungLocalControl } = require("./samsung-local-probe");
 const {
   createWindowsSharedMonitorTransferHint,
   createWindowsSwitchMenuModel,
@@ -31,6 +32,7 @@ const PEER_DISCOVERY_STALE_MS = 15000;
 const PEER_CONFIRMATION_TIMEOUT_MS = 4000;
 const PEER_CONFIRMATION_POLL_MS = 250;
 const LOCAL_HANDOFF_INFERENCE_WINDOW_MS = 10 * 60 * 1000;
+const SAMSUNG_LOCAL_PROBE_TTL_MS = 30 * 1000;
 const TARGET_IDS = ["windows", "mac"];
 const COMMON_INPUT_VALUES = [
   { value: 15, label: "15: DP1" },
@@ -69,6 +71,9 @@ let trayHealthTimer = null;
 let explorerSignature = null;
 let sharedMonitorOwnership = createDefaultOwnershipSnapshot();
 let discoveredPeers = new Map();
+let samsungLocalProbeCache = null;
+let samsungLocalProbeCachedAt = 0;
+let samsungLocalProbeInFlight = null;
 let state = createDefaultState();
 
 // Suppress noisy Chromium network-change logs on some Windows systems.
@@ -258,6 +263,9 @@ function refreshMenu() {
       click: () => handleTraySwitch(item.targetId),
     };
   });
+  const manualHandoffTargetId = getManualHandoffTargetIdForCurrentPlatform();
+  const manualHandoffDisabledReason = getManualHandoffDisabledReason();
+  const manualHandoffTarget = manualHandoffTargetId ? getTarget(manualHandoffTargetId) : null;
 
   const menu = Menu.buildFromTemplate([
     {
@@ -326,6 +334,23 @@ function refreshMenu() {
     },
     { type: "separator" },
     ...switchMenuItems,
+    ...(manualHandoffTarget
+      ? [
+          {
+            label: `手动切源辅助：交给 ${manualHandoffTarget.label}`,
+            enabled: !manualHandoffDisabledReason && configErrors.length === 0,
+            click: () => handleTrayManualHandoff(),
+          },
+          ...(manualHandoffDisabledReason
+            ? [
+                {
+                  label: manualHandoffDisabledReason,
+                  enabled: false,
+                },
+              ]
+            : []),
+        ]
+      : []),
     { type: "separator" },
     {
       label: "打开本机设置页",
@@ -390,6 +415,19 @@ function handleTraySwitch(targetId) {
   });
 }
 
+function handleTrayManualHandoff() {
+  const targetId = getManualHandoffTargetIdForCurrentPlatform();
+  if (!targetId) {
+    return;
+  }
+
+  void prepareManualHandoff(targetId, {
+    showErrorDialog: false,
+  }).catch((error) => {
+    appendDiagnosticLog(`Manual handoff preparation failed (${targetId})`, error);
+  });
+}
+
 async function switchMonitor(targetId, options = {}) {
   const { notifyOnSuccess = true, showErrorDialog = false } = options;
   const target = getTarget(targetId);
@@ -440,6 +478,72 @@ async function switchMonitor(targetId, options = {}) {
         APP_NAME,
         `${target.label} 切换命令发送失败。\n\n${userFacingError.message}`
       );
+    }
+
+    throw userFacingError;
+  }
+}
+
+async function prepareManualHandoff(targetId, options = {}) {
+  const { notifyOnSuccess = true, showErrorDialog = false } = options;
+  const target = getTarget(targetId);
+  const configErrors = getConfigValidationErrors(state.config);
+
+  if (configErrors.length > 0) {
+    const error = new Error(configErrors.join(" "));
+    state.lastSwitchOutcome = createSwitchOutcome({
+      status: "error",
+      targetId,
+      mode: "manual_prep",
+      message: error.message,
+    });
+    saveState(state);
+    refreshMenu();
+
+    if (showErrorDialog) {
+      dialog.showErrorBox(APP_NAME, `当前配置无效。\n\n${error.message}`);
+    }
+
+    throw error;
+  }
+
+  try {
+    let message = "";
+
+    if (process.platform === "win32") {
+      message = await prepareManualHandoffOnWindows(targetId, target);
+    } else if (process.platform === "darwin") {
+      message = await prepareManualHandoffOnMac(targetId, target);
+    } else {
+      throw new Error(`当前平台不受支持：${process.platform}`);
+    }
+
+    state.macInputProbe = createMacInputProbeResult();
+    state.lastSwitchOutcome = createSwitchOutcome({
+      status: "success",
+      targetId,
+      mode: "manual_prep",
+      message,
+    });
+    saveState(state);
+    refreshMenu();
+
+    if (notifyOnSuccess) {
+      notify(message);
+    }
+  } catch (error) {
+    const userFacingError = createUserFacingSwitchError(targetId, error);
+    state.lastSwitchOutcome = createSwitchOutcome({
+      status: "error",
+      targetId,
+      mode: "manual_prep",
+      message: userFacingError.message,
+    });
+    saveState(state);
+    refreshMenu();
+
+    if (showErrorDialog) {
+      dialog.showErrorBox(APP_NAME, `手动交接准备失败。\n\n${userFacingError.message}`);
     }
 
     throw userFacingError;
@@ -504,6 +608,22 @@ async function switchOnWindows(targetId, target) {
   }
 }
 
+async function prepareManualHandoffOnWindows(targetId, target) {
+  if (targetId !== "mac") {
+    throw new Error(`Windows 当前只支持把共享屏手动交给 ${getTarget("mac").label}。`);
+  }
+
+  await assertWindowsSharedMonitorAvailableForSwitch();
+
+  if (shouldUseWindowsDisplayHandoff(state.config)) {
+    await handOffWindowsDesktop();
+    markPendingWindowsDesktopRestore();
+    return `Windows 本机已准备好手动交接，并已把桌面退回主显示器。现在请直接用显示器按键把 ${state.config.monitorName} 切到 ${target.label}。`;
+  }
+
+  return `Windows 本机已准备好手动交接。现在请直接用显示器按键把 ${state.config.monitorName} 切到 ${target.label}。`;
+}
+
 function switchOnMac(targetId, target) {
   const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
   const candidates = getInputCandidates(target);
@@ -534,6 +654,17 @@ function switchOnMac(targetId, target) {
 
     throw error;
   });
+}
+
+async function prepareManualHandoffOnMac(targetId, target) {
+  if (targetId !== "windows") {
+    throw new Error(`macOS 当前只支持把共享屏手动交给 ${getTarget("windows").label}。`);
+  }
+
+  const peerPrepared = await preparePeerForIncomingOwnership(targetId);
+  return peerPrepared
+    ? `已通知 Windows 预热共享屏输出。现在请直接用显示器按键把 ${state.config.monitorName} 切到 ${target.label}。`
+    : `当前没有可协同的 Windows 客户端在线，但这不影响手动切源。现在请直接用显示器按键把 ${state.config.monitorName} 切到 ${target.label}。`;
 }
 
 function createUserFacingSwitchError(targetId, error) {
@@ -776,6 +907,8 @@ async function handleControlRequest(request, response) {
   const monitorsPath = `/api/${state.controlToken}/monitors`;
   const windowsPath = `/api/${state.controlToken}/switch/windows`;
   const macPath = `/api/${state.controlToken}/switch/mac`;
+  const manualWindowsPath = `/api/${state.controlToken}/manual/windows`;
+  const manualMacPath = `/api/${state.controlToken}/manual/mac`;
   const macProbePath = `/api/${state.controlToken}/probe/mac`;
   const macProbeApplyPath = `/api/${state.controlToken}/probe/mac/apply`;
   const peerOwnershipPath = getPeerOwnershipPath();
@@ -784,6 +917,7 @@ async function handleControlRequest(request, response) {
 
   if (requestUrl.pathname === "/health") {
     const ownership = await getEffectiveOwnershipSnapshot();
+    const samsungLocalProbe = await getSamsungLocalProbe();
     return writeJson(response, 200, {
       ok: true,
       appName: APP_NAME,
@@ -791,6 +925,7 @@ async function handleControlRequest(request, response) {
       lastTarget: state.lastTarget,
       monitorName: state.config.monitorName,
       ownership,
+      samsungLocalProbe,
     });
   }
 
@@ -848,16 +983,24 @@ async function handleControlRequest(request, response) {
   }
 
   if (requestUrl.pathname === settingsPath) {
-    const [monitors, diagnostics, macProbeDiagnostics, ownershipSnapshot] = await Promise.all([
+    const [monitors, diagnostics, macProbeDiagnostics, ownershipSnapshot, samsungLocalProbe] = await Promise.all([
       getAvailableMonitorNames(),
       getMonitorDiagnostics(),
       getMacProbeDiagnostics(),
       getEffectiveOwnershipSnapshot(),
+      getSamsungLocalProbe(),
     ]);
     return writeHtml(
       response,
       200,
-      renderSettingsPage(requestUrl, monitors, diagnostics, macProbeDiagnostics, ownershipSnapshot)
+      renderSettingsPage(
+        requestUrl,
+        monitors,
+        diagnostics,
+        macProbeDiagnostics,
+        ownershipSnapshot,
+        samsungLocalProbe
+      )
     );
   }
 
@@ -879,6 +1022,14 @@ async function handleControlRequest(request, response) {
 
   if (requestUrl.pathname === macPath) {
     return handleControlSwitch(request, response, requestUrl, "mac");
+  }
+
+  if (requestUrl.pathname === manualWindowsPath) {
+    return handleManualHandoffRequest(request, response, requestUrl, "windows");
+  }
+
+  if (requestUrl.pathname === manualMacPath) {
+    return handleManualHandoffRequest(request, response, requestUrl, "mac");
   }
 
   response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
@@ -952,6 +1103,7 @@ async function handleConfigSave(request, response, requestUrl) {
 
   state.config = config;
   state.macInputProbe = createMacInputProbeResult();
+  clearSamsungLocalProbeCache();
   saveState(state);
   refreshMenu();
   if (process.platform === "win32") {
@@ -961,6 +1113,37 @@ async function handleConfigSave(request, response, requestUrl) {
   redirectToSettingsPage(response, requestUrl, {
     status: "success",
   });
+}
+
+async function handleManualHandoffRequest(request, response, requestUrl, targetId) {
+  if (!["GET", "POST"].includes(request.method || "GET")) {
+    response.writeHead(405, {
+      Allow: "GET, POST",
+      "Content-Type": "text/plain; charset=utf-8",
+    });
+    response.end("当前接口只支持 GET 或 POST。");
+    return;
+  }
+
+  if (request.method === "POST") {
+    await readRequestBody(request);
+  }
+
+  try {
+    await prepareManualHandoff(targetId, {
+      notifyOnSuccess: false,
+      showErrorDialog: false,
+    });
+    redirectToSettingsPage(response, requestUrl, {
+      status: "success",
+      message: state.lastSwitchOutcome.message,
+    });
+  } catch (error) {
+    redirectToSettingsPage(response, requestUrl, {
+      status: "error",
+      message: error.message,
+    });
+  }
 }
 
 async function handleMacProbe(request, response, requestUrl) {
@@ -1512,13 +1695,22 @@ function redirectToPath(response, requestUrl, pathName, query) {
   response.end();
 }
 
-function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagnostics, ownershipSnapshot) {
+function renderSettingsPage(
+  requestUrl,
+  monitorNames,
+  diagnostics,
+  macProbeDiagnostics,
+  ownershipSnapshot,
+  samsungLocalProbe
+) {
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
   const statusHtml = renderSettingsBanner(status, message);
   const switchOutcomeHtml = renderSwitchOutcomeCard();
   const monitorHintHtml = renderMonitorHints(monitorNames);
-  const diagnosticsHtml = renderMonitorDiagnostics(diagnostics);
+  const diagnosticsHtml = renderMonitorDiagnostics(diagnostics, samsungLocalProbe);
+  const manualHandoffHtml = renderManualHandoffCard();
+  const samsungLocalProbeHtml = renderSamsungLocalProbeCard(samsungLocalProbe);
   const macProbeHtml = renderMacProbeAssistant(macProbeDiagnostics);
   const ownershipHtml = renderOwnershipStatusCard(ownershipSnapshot);
   const peerStatusHtml = renderPeerStatusCard();
@@ -1654,6 +1846,8 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
       ${switchOutcomeHtml}
       ${ownershipHtml}
       ${diagnosticsHtml}
+      ${manualHandoffHtml}
+      ${samsungLocalProbeHtml}
       ${macProbeHtml}
       <div class="card">
         <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/config">
@@ -1769,7 +1963,7 @@ function renderMonitorHints(monitorNames) {
   </div>`;
 }
 
-function renderMonitorDiagnostics(diagnostics) {
+function renderMonitorDiagnostics(diagnostics, samsungLocalProbe) {
   if (!diagnostics) {
     return "";
   }
@@ -1807,6 +2001,10 @@ function renderMonitorDiagnostics(diagnostics) {
     ? "当前已启用 Samsung / MStar 兼容补发。像这台 G72 这种切走后仍会保持 Windows 连接的屏，兼容补发比“判断是否断开”更可靠。"
     : "如果这台屏手动菜单能切、软件却没反应，建议把兼容模式改成 Samsung / MStar 再试。";
   const windowsHandoffHelp = getWindowsDisplayHandoffHelpText(state.config);
+  const samsungProbeHelp =
+    samsungLocalProbe?.status === "ready"
+      ? "本机还检测到了三星本地私有入口，后续可以在不依赖另一台电脑的前提下继续沿官方协议做本地切源。"
+      : "如果你想继续推进三星官方私有协议，下面的“三星本地私有入口”卡片会告诉你当前这台主机有没有 USB / Smart Monitor 入口。";
 
   return `<div class="card soft">
     <div class="section-title">显示器诊断</div>
@@ -1817,7 +2015,98 @@ function renderMonitorDiagnostics(diagnostics) {
     <div class="help" style="margin-top: 12px;">${currentValueLine}</div>
     <div class="help">${currentValueHelp}</div>
     <div class="help">${compatibilityHelp}</div>
+    <div class="help">${samsungProbeHelp}</div>
     <div class="help">${windowsHandoffHelp}</div>
+  </div>`;
+}
+
+function renderSamsungLocalProbeCard(probe) {
+  if (!probe) {
+    return "";
+  }
+
+  const statusLabels = {
+    ready: "已具备可继续逆向的本地入口",
+    partial: "只具备部分本地入口",
+    missing: "当前没有本地三星私有入口",
+    error: "本地探测失败",
+  };
+  const statusLabel = statusLabels[probe.status] || "状态未知";
+  const officialSoftwareLine =
+    probe.officialSoftware.status === "installed"
+      ? `官方软件：已找到 ${probe.officialSoftware.items
+          .map((item) => item.name)
+          .join("、")}`
+      : `官方软件：${probe.officialSoftware.message}`;
+  const usbLine = `USB 证据：${escapeHtml(probe.usbEvidence.message)}`;
+  const networkLine = `局域网发现：${escapeHtml(probe.networkDiscovery.message)}`;
+  const softwarePills =
+    probe.officialSoftware.items.length > 0
+      ? probe.officialSoftware.items
+          .map((item) => `<span class="pill">${escapeHtml(`${item.name} · ${item.path}`)}</span>`)
+          .join("")
+      : "";
+  const usbPills =
+    probe.usbEvidence.lines.length > 0
+      ? probe.usbEvidence.lines.map((line) => `<span class="pill">${escapeHtml(line)}</span>`).join("")
+      : "";
+  const networkPills =
+    probe.networkDiscovery.devices.length > 0
+      ? probe.networkDiscovery.devices
+          .map((device) => {
+            const title =
+              device.friendlyName || device.modelName || device.deviceType || device.address;
+            const suffix = device.matchedMonitor ? " · 已匹配当前共享屏" : "";
+            return `<span class="pill">${escapeHtml(`${title} @ ${device.address}${suffix}`)}</span>`;
+          })
+          .join("")
+      : "";
+
+  return `<div class="card soft">
+    <div class="section-title">三星本地私有入口</div>
+    <div class="help" style="margin-top: 12px;">这块卡片检查的是“当前这台主机自己能不能直接连到三星显示器的私有控制链路”，不是双机协同，也不是让你手填任何地址。</div>
+    <div class="help" style="margin-top: 12px;">当前状态：${escapeHtml(statusLabel)}</div>
+    <div class="help">${escapeHtml(probe.summary)}</div>
+    <div class="help">${escapeHtml(officialSoftwareLine)}</div>
+    <div class="help">${usbLine}</div>
+    <div class="help">${networkLine}</div>
+    <div class="help">${escapeHtml(probe.recommendation)}</div>
+    ${softwarePills ? `<div class="tip-list" style="margin-top: 12px;">${softwarePills}</div>` : ""}
+    ${usbPills ? `<div class="tip-list" style="margin-top: 12px;">${usbPills}</div>` : ""}
+    ${networkPills ? `<div class="tip-list" style="margin-top: 12px;">${networkPills}</div>` : ""}
+  </div>`;
+}
+
+function renderManualHandoffCard() {
+  const targetId = getManualHandoffTargetIdForCurrentPlatform();
+  if (!targetId) {
+    return "";
+  }
+
+  const target = getTarget(targetId);
+  const canPrepare = canPrepareManualHandoffForCurrentPlatform();
+  const formAction = `/api/${encodeURIComponent(state.controlToken)}/manual/${encodeURIComponent(targetId)}`;
+  const introText =
+    process.platform === "win32"
+      ? `当自动切源不稳定时，先让软件在 Windows 侧完成本机桌面交接，再由你按显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`
+      : `当自动切源不稳定时，先让软件通知 Windows 预热输出，再由你按显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`;
+  const disabledReason = getManualHandoffDisabledReason();
+  const buttonLabel =
+    process.platform === "win32"
+      ? `准备手动交给 ${target.label}`
+      : `准备手动交还给 ${target.label}`;
+
+  return `<div class="card soft">
+    <div class="section-title">手动切源辅助</div>
+    <div class="help" style="margin-top: 12px;">${escapeHtml(introText)}</div>
+    <div class="help">${
+      canPrepare
+        ? "这一步不会假装“已经切源成功”，它只负责把当前这台主机该做的准备动作先做掉。"
+        : escapeHtml(disabledReason)
+    }</div>
+    <form method="post" action="${formAction}" style="margin-top: 14px;">
+      <button type="submit"${canPrepare ? "" : " disabled"}>${escapeHtml(buttonLabel)}</button>
+    </form>
   </div>`;
 }
 
@@ -1855,11 +2144,12 @@ function renderSwitchOutcomeCard() {
   }
 
   const isSuccess = state.lastSwitchOutcome.status === "success";
+  const isManualPrep = state.lastSwitchOutcome.mode === "manual_prep";
   const targetLabel = state.lastSwitchOutcome.targetId
     ? getTarget(state.lastSwitchOutcome.targetId).label
     : "未指定目标";
   const lines = [
-    `最近切换结果：${isSuccess ? "成功" : "失败"}`,
+    `最近结果：${isManualPrep ? "已准备手动交接" : isSuccess ? "成功" : "失败"}`,
     `目标：${escapeHtml(targetLabel)}`,
   ];
 
@@ -2235,6 +2525,10 @@ function getCurrentTargetLabel() {
 }
 
 function getLastSwitchOutcomeMenuLabel() {
+  if (state.lastSwitchOutcome.status === "success" && state.lastSwitchOutcome.mode === "manual_prep") {
+    return "最近结果：已准备手动交接";
+  }
+
   if (state.lastSwitchOutcome.status === "success") {
     return "最近结果：成功";
   }
@@ -2250,6 +2544,53 @@ function getCurrentOwnerTargetId() {
   return ["windows", "mac"].includes(sharedMonitorOwnership.owner)
     ? sharedMonitorOwnership.owner
     : null;
+}
+
+function getLocalPlatformTargetId() {
+  if (process.platform === "win32") {
+    return "windows";
+  }
+
+  if (process.platform === "darwin") {
+    return "mac";
+  }
+
+  return null;
+}
+
+function getManualHandoffTargetIdForCurrentPlatform() {
+  const localTargetId = getLocalPlatformTargetId();
+  if (localTargetId === "windows") {
+    return "mac";
+  }
+
+  if (localTargetId === "mac") {
+    return "windows";
+  }
+
+  return null;
+}
+
+function getManualHandoffDisabledReason() {
+  const localTargetId = getLocalPlatformTargetId();
+  if (!localTargetId) {
+    return "当前平台没有实现手动切源辅助。";
+  }
+
+  const currentOwnerTargetId = getCurrentOwnerTargetId();
+  if (currentOwnerTargetId && currentOwnerTargetId !== localTargetId) {
+    return "当前共享屏不在这台主机手里，所以这里不能替另一台电脑做交接准备。";
+  }
+
+  if (process.platform === "win32" && ["missing", "away"].includes(windowsMonitorAvailability.status)) {
+    return `${state.config.monitorName} 当前不在 Windows 侧，不能从这边准备把它交出去。`;
+  }
+
+  return "";
+}
+
+function canPrepareManualHandoffForCurrentPlatform() {
+  return !getManualHandoffDisabledReason();
 }
 
 function getCurrentOwnershipMenuLabel() {
@@ -3411,6 +3752,70 @@ function requestJson(urlString, timeoutMs, options = {}) {
   });
 }
 
+function clearSamsungLocalProbeCache() {
+  samsungLocalProbeCache = null;
+  samsungLocalProbeCachedAt = 0;
+}
+
+async function getSamsungLocalProbe(force = false) {
+  const now = Date.now();
+
+  if (
+    !force &&
+    samsungLocalProbeCache &&
+    now - samsungLocalProbeCachedAt <= SAMSUNG_LOCAL_PROBE_TTL_MS
+  ) {
+    return samsungLocalProbeCache;
+  }
+
+  if (samsungLocalProbeInFlight) {
+    return samsungLocalProbeInFlight;
+  }
+
+  samsungLocalProbeInFlight = probeSamsungLocalControl({
+    monitorName: state.config.monitorName,
+  })
+    .then((probe) => {
+      samsungLocalProbeCache = probe;
+      samsungLocalProbeCachedAt = Date.now();
+      return probe;
+    })
+    .catch((error) => {
+      const probe = {
+        platform: process.platform,
+        monitorName: state.config.monitorName,
+        officialSoftware: {
+          status: "error",
+          items: [],
+          message: "三星本地私有入口探测失败。",
+        },
+        usbEvidence: {
+          status: "error",
+          lines: [],
+          message: normalizeText(error.message) || "三星本地私有入口探测失败。",
+        },
+        networkDiscovery: {
+          status: "error",
+          devices: [],
+          message: normalizeText(error.message) || "三星本地私有入口探测失败。",
+        },
+        status: "error",
+        summary: "三星本地私有入口探测失败。",
+        recommendation: "请稍后重试；如果持续失败，再查看日志确认是 USB 检测还是网络探测出了问题。",
+        updatedAt: new Date().toISOString(),
+      };
+      samsungLocalProbeCache = probe;
+      samsungLocalProbeCachedAt = Date.now();
+      appendDiagnosticLog("Samsung local probe failed", error);
+      return probe;
+    })
+    .finally(() => {
+      samsungLocalProbeInFlight = null;
+    });
+
+  return samsungLocalProbeInFlight;
+}
+
 function normalizePeerOwnershipSnapshot(ownership, fallbackPlatform = "") {
   if (!ownership || !["windows", "mac", "unknown"].includes(ownership.owner)) {
     return null;
@@ -3788,7 +4193,11 @@ function inferMacOwnerFromLocalDisplayState(attemptedTargetId = null) {
 }
 
 function getRecentSuccessfulTargetId() {
-  if (state.lastSwitchOutcome.status !== "success" || !state.lastSwitchOutcome.targetId) {
+  if (
+    state.lastSwitchOutcome.status !== "success" ||
+    state.lastSwitchOutcome.mode !== "switch" ||
+    !state.lastSwitchOutcome.targetId
+  ) {
     return null;
   }
 
@@ -3863,12 +4272,14 @@ function createDefaultOwnershipSnapshot() {
 function createSwitchOutcome({
   status = "idle",
   targetId = null,
+  mode = "switch",
   message = "",
   updatedAt = null,
 } = {}) {
   return {
     status: ["idle", "success", "error"].includes(status) ? status : "idle",
     targetId: parseTargetId(targetId),
+    mode: ["switch", "manual_prep"].includes(normalizeText(mode)) ? normalizeText(mode) : "switch",
     message: normalizeText(message),
     updatedAt: normalizeText(updatedAt) || new Date().toISOString(),
   };

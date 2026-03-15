@@ -104,6 +104,20 @@ function readPlistJson(plistPath) {
   return JSON.parse(run("/usr/bin/plutil", ["-convert", "json", "-o", "-", plistPath]));
 }
 
+function isMacPathHidden(appPath) {
+  try {
+    return run("/usr/bin/mdls", ["-name", "kMDItemFSInvisible", "-raw", appPath]) === "1";
+  } catch {
+    // Fall through to filesystem flags below.
+  }
+
+  try {
+    return run("/usr/bin/stat", ["-f", "%Sf", appPath]).split(",").includes("hidden");
+  } catch {
+    return false;
+  }
+}
+
 function verifyMacHelperApps(appBundlePath) {
   if (!fs.existsSync(appBundlePath)) {
     throw new Error(`App bundle not found: ${appBundlePath}`);
@@ -128,11 +142,10 @@ function verifyMacHelperApps(appBundlePath) {
     const plistPath = path.join(helperPath, "Contents", "Info.plist");
     const iconPath = path.join(helperPath, "Contents", "Resources", "icon.icns");
     const plist = readPlistJson(plistPath);
-    const invisible = run("/usr/bin/mdls", ["-name", "kMDItemFSInvisible", "-raw", helperPath]);
 
     assert.equal(plist.CFBundleIconFile, "icon.icns");
     assert.equal(fs.existsSync(iconPath), true, `${iconPath} should exist`);
-    assert.equal(invisible, "1");
+    assert.equal(isMacPathHidden(helperPath), true);
     assert.match(plist.CFBundleName, /^显示器输入切换 Helper/u);
   }
 
