@@ -267,7 +267,39 @@ function refreshMenu() {
       click: () => handleTraySwitch(item.targetId),
     };
   });
-  const manualHandoffContext = getManualHandoffContextForCurrentPlatform();
+  const manualHandoffModel = getManualHandoffModelForCurrentPlatform();
+  const manualHandoffSubmenu = manualHandoffModel.actions.length
+    ? [
+        {
+          label: "手动交接辅助",
+          submenu: [
+            {
+              label: summarizeMenuMessage(manualHandoffModel.introText || "手动交接会先做本机准备动作，再由你用显示器按钮完成切源。"),
+              enabled: false,
+            },
+            ...(manualHandoffModel.recommendation
+              ? [
+                  {
+                    label: summarizeMenuMessage(manualHandoffModel.recommendation),
+                    enabled: false,
+                  },
+                ]
+              : []),
+            ...manualHandoffModel.actions.map((item) => ({
+              label: item.buttonLabel,
+              enabled: configErrors.length === 0 && !item.disabledReason,
+              click: () => handleTrayManualHandoffAction(item.targetId, item.action),
+            })),
+            ...manualHandoffModel.actions
+              .filter((item) => item.disabledReason)
+              .map((item) => ({
+                label: `${item.buttonLabel}：${summarizeMenuMessage(item.disabledReason)}`,
+                enabled: false,
+              })),
+          ],
+        },
+      ]
+    : [];
 
   const menu = Menu.buildFromTemplate([
     {
@@ -344,23 +376,7 @@ function refreshMenu() {
     },
     { type: "separator" },
     ...switchMenuItems,
-    ...(manualHandoffContext.targetId
-      ? [
-          {
-            label: `手动切源辅助：${manualHandoffContext.buttonLabel}`,
-            enabled: !manualHandoffContext.disabledReason && configErrors.length === 0,
-            click: () => handleTrayManualHandoff(),
-          },
-          ...(manualHandoffContext.disabledReason
-            ? [
-                {
-                  label: manualHandoffContext.disabledReason,
-                  enabled: false,
-                },
-              ]
-            : []),
-        ]
-      : []),
+    ...manualHandoffSubmenu,
     { type: "separator" },
     {
       label: "打开本机设置页",
@@ -425,16 +441,12 @@ function handleTraySwitch(targetId) {
   });
 }
 
-function handleTrayManualHandoff() {
-  const targetId = getManualHandoffTargetIdForCurrentPlatform();
-  if (!targetId) {
-    return;
-  }
-
+function handleTrayManualHandoffAction(targetId, preferredAction) {
   void prepareManualHandoff(targetId, {
     showErrorDialog: false,
+    preferredAction,
   }).catch((error) => {
-    appendDiagnosticLog(`Manual handoff preparation failed (${targetId})`, error);
+    appendDiagnosticLog(`Manual handoff preparation failed (${preferredAction || "auto"}:${targetId})`, error);
   });
 }
 
@@ -497,7 +509,7 @@ async function switchMonitor(targetId, options = {}) {
 }
 
 async function prepareManualHandoff(targetId, options = {}) {
-  const { notifyOnSuccess = true, showErrorDialog = false } = options;
+  const { notifyOnSuccess = true, showErrorDialog = false, preferredAction = null } = options;
   const target = getTarget(targetId);
   const configErrors = getConfigValidationErrors(state.config);
 
@@ -520,7 +532,7 @@ async function prepareManualHandoff(targetId, options = {}) {
   }
 
   try {
-    const plan = resolveManualHandoffPlan(targetId);
+    const plan = resolveManualHandoffPlan(targetId, preferredAction);
     const result =
       plan.kind === "transfer"
         ? await prepareManualTransfer(plan, target)
@@ -565,9 +577,12 @@ async function prepareManualHandoff(targetId, options = {}) {
   }
 }
 
-function resolveManualHandoffPlan(targetId) {
+function resolveManualHandoffPlan(targetId, preferredAction = null) {
   const localTargetId = getLocalPlatformTargetId();
   const parsedTargetId = parseTargetId(targetId);
+  const parsedAction = parseManualHandoffAction(preferredAction);
+  const currentOwnerTargetId = getCurrentOwnerTargetId();
+  const oppositeTargetId = getOppositeTargetId(localTargetId);
 
   if (!localTargetId) {
     throw new Error("当前平台没有实现手动切源辅助。");
@@ -581,9 +596,44 @@ function resolveManualHandoffPlan(targetId) {
     throw new Error(`当前有一笔手动交接正在等待完成（剩余 ${getManualSessionRemainingSeconds()} 秒）。`);
   }
 
-  const currentOwnerTargetId = getCurrentOwnerTargetId();
+  if (parsedAction === "receive") {
+    if (parsedTargetId !== localTargetId) {
+      throw new Error(`“接收”只能在 ${getTarget(localTargetId).label} 这一侧执行。`);
+    }
+
+    if (currentOwnerTargetId === localTargetId) {
+      throw new Error(`共享屏已经在 ${getTarget(localTargetId).label} 侧，不需要点接收。`);
+    }
+
+    return {
+      kind: "receive",
+      localTargetId,
+      targetId: localTargetId,
+      sourceTargetId: currentOwnerTargetId || oppositeTargetId,
+      expectedOwnerTargetId: localTargetId,
+    };
+  }
+
+  if (parsedAction === "transfer") {
+    if (parsedTargetId !== oppositeTargetId) {
+      throw new Error(`“移交”只能把共享屏交给 ${getTarget(oppositeTargetId).label}。`);
+    }
+
+    if (currentOwnerTargetId && currentOwnerTargetId !== localTargetId) {
+      throw new Error("当前共享屏看起来不在这台主机手里，请在另一侧点移交；如果只是识别不准，请改用这里的“接收”入口。");
+    }
+
+    return {
+      kind: "transfer",
+      localTargetId,
+      targetId: oppositeTargetId,
+      sourceTargetId: localTargetId,
+      expectedOwnerTargetId: oppositeTargetId,
+    };
+  }
+
   if (!currentOwnerTargetId) {
-    throw new Error("当前共享屏归属未知，请先看哪台电脑正在显示 G72，再在对应一侧点移交、另一侧点接收。");
+    throw new Error("当前共享屏归属未知。现在请直接按你眼前看到的实际画面操作：持有画面的一侧点移交，另一侧点接收。");
   }
 
   if (parsedTargetId === localTargetId) {
@@ -1242,14 +1292,18 @@ async function handleManualHandoffRequest(request, response, requestUrl, targetI
     return;
   }
 
+  let preferredAction = parseManualHandoffAction(requestUrl.searchParams.get("action"));
   if (request.method === "POST") {
-    await readRequestBody(request);
+    const body = await readRequestBody(request);
+    const form = new URLSearchParams(body);
+    preferredAction = parseManualHandoffAction(form.get("action")) || preferredAction;
   }
 
   try {
     await prepareManualHandoff(targetId, {
       notifyOnSuccess: false,
       showErrorDialog: false,
+      preferredAction,
     });
     redirectToSettingsPage(response, requestUrl, {
       status: "success",
@@ -1618,6 +1672,22 @@ function getTargetSlotName(targetId) {
 
 function parseTargetId(value) {
   return TARGET_IDS.includes(value) ? value : null;
+}
+
+function parseManualHandoffAction(value) {
+  return ["transfer", "receive"].includes(value) ? value : null;
+}
+
+function getOppositeTargetId(targetId) {
+  if (targetId === "windows") {
+    return "mac";
+  }
+
+  if (targetId === "mac") {
+    return "windows";
+  }
+
+  return null;
 }
 
 function normalizePeerStatusUrl(value) {
@@ -2130,28 +2200,31 @@ function renderMonitorDiagnostics(diagnostics) {
 }
 
 function renderManualHandoffCard() {
-  const context = getManualHandoffContextForCurrentPlatform();
-
-  const canPrepare = canPrepareManualHandoffForCurrentPlatform();
+  const model = getManualHandoffModelForCurrentPlatform();
   const sessionHelp = state.manualSession.active
     ? `当前有一笔手动交接在等待完成，剩余 ${getManualSessionRemainingSeconds()} 秒；超过 30 秒会自动回收本机这边已经做过的准备动作。`
     : "这一步不会假装“已经切源成功”，它只负责把当前这台主机该做的准备动作先做掉。";
-  const formHtml = context.targetId
-    ? `<form method="post" action="/api/${encodeURIComponent(state.controlToken)}/manual/${encodeURIComponent(
-        context.targetId
+  const formHtml = model.actions
+    .map((action) => {
+      const disabled = action.disabledReason ? " disabled" : "";
+      const reasonHtml = action.disabledReason
+        ? `<div class="help" style="margin-top: 8px;">${escapeHtml(action.disabledReason)}</div>`
+        : "";
+
+      return `<form method="post" action="/api/${encodeURIComponent(state.controlToken)}/manual/${encodeURIComponent(
+        action.targetId
       )}" style="margin-top: 14px;">
-        <button type="submit"${canPrepare ? "" : " disabled"}>${escapeHtml(context.buttonLabel)}</button>
-      </form>`
-    : "";
+        <input type="hidden" name="action" value="${escapeHtml(action.action)}" />
+        <button type="submit"${disabled}>${escapeHtml(action.buttonLabel)}</button>
+        ${reasonHtml}
+      </form>`;
+    })
+    .join("");
 
   return `<div class="card soft">
     <div class="section-title">手动切源辅助</div>
-    <div class="help" style="margin-top: 12px;">${escapeHtml(context.introText)}</div>
-    <div class="help">${
-      canPrepare
-        ? escapeHtml(sessionHelp)
-        : escapeHtml(context.disabledReason)
-    }</div>
+    <div class="help" style="margin-top: 12px;">${escapeHtml(model.introText || model.disabledReason)}</div>
+    <div class="help">${escapeHtml(model.recommendation || sessionHelp)}</div>
     ${formHtml}
   </div>`;
 }
@@ -2604,73 +2677,92 @@ function getLocalPlatformTargetId() {
   return null;
 }
 
-function getManualHandoffTargetIdForCurrentPlatform() {
-  return getManualHandoffContextForCurrentPlatform().targetId;
-}
-
-function getManualHandoffContextForCurrentPlatform() {
+function getManualHandoffModelForCurrentPlatform() {
   const localTargetId = getLocalPlatformTargetId();
   if (!localTargetId) {
     return {
-      action: null,
-      targetId: null,
       introText: "",
-      buttonLabel: "",
+      recommendation: "",
+      actions: [],
       disabledReason: "当前平台没有实现手动切源辅助。",
     };
   }
 
+  const oppositeTargetId = getOppositeTargetId(localTargetId);
+  const currentOwnerTargetId = getCurrentOwnerTargetId();
+  const activeReason = state.manualSession.active
+    ? `当前有一笔手动交接正在等待完成（剩余 ${getManualSessionRemainingSeconds()} 秒）。`
+    : "";
+
   if (state.manualSession.active) {
     return {
-      action: null,
-      targetId: state.manualSession.expectedOwnerTargetId,
       introText: "当前已有一笔手动交接在等待完成或超时回收。",
-      buttonLabel: "手动交接进行中",
-      disabledReason: `当前有一笔手动交接正在等待完成（剩余 ${getManualSessionRemainingSeconds()} 秒）。`,
+      recommendation: activeReason,
+      actions: [
+        {
+          action: "transfer",
+          targetId: oppositeTargetId,
+          buttonLabel: `准备移交给 ${getTarget(oppositeTargetId).label}`,
+          disabledReason: activeReason,
+        },
+        {
+          action: "receive",
+          targetId: localTargetId,
+          buttonLabel: `准备接收来自 ${getTarget(oppositeTargetId).label}`,
+          disabledReason: activeReason,
+        },
+      ],
+      disabledReason: activeReason,
     };
   }
 
-  const currentOwnerTargetId = getCurrentOwnerTargetId();
-  if (!currentOwnerTargetId) {
-    return {
-      action: null,
-      targetId: null,
-      introText: "这套手动模式现在改成了“双端分别点击”：当前持有画面的这侧点“移交”，另一侧点“接收”。",
-      buttonLabel: "",
-      disabledReason: "当前共享屏归属未知，请先看哪台电脑正在显示 G72，再在对应一侧点移交、另一侧点接收。",
-    };
-  }
+  const transferAction = {
+    action: "transfer",
+    targetId: oppositeTargetId,
+    buttonLabel: `准备移交给 ${getTarget(oppositeTargetId).label}`,
+    disabledReason:
+      currentOwnerTargetId && currentOwnerTargetId !== localTargetId
+        ? "当前共享屏看起来不在这台主机手里；如果只是识别不准，请改用下面的“准备接收”。"
+        : "",
+  };
+  const receiveAction = {
+    action: "receive",
+    targetId: localTargetId,
+    buttonLabel: `准备接收来自 ${getTarget(oppositeTargetId).label}`,
+    disabledReason:
+      currentOwnerTargetId === localTargetId
+        ? `共享屏已经在 ${getTarget(localTargetId).label} 侧，不需要点接收。`
+        : "",
+  };
 
   if (currentOwnerTargetId === localTargetId) {
-    const targetId = localTargetId === "windows" ? "mac" : "windows";
     return {
-      action: "transfer",
-      targetId,
-      introText: `当前这台主机持有 G72。先在这里点击“移交”，再去 ${getTarget(
-        targetId
-      ).label} 那一侧点击“接收”，最后用显示器按钮完成切源。`,
-      buttonLabel: `准备移交给 ${getTarget(targetId).label}`,
+      introText: `当前这台主机持有 G72。先在这里点“移交”，再去 ${getTarget(
+        oppositeTargetId
+      ).label} 那一侧点“接收”，最后用显示器按钮完成切源。`,
+      recommendation: `建议当前先点“${transferAction.buttonLabel}”。`,
+      actions: [transferAction, receiveAction],
+      disabledReason: "",
+    };
+  }
+
+  if (currentOwnerTargetId === oppositeTargetId) {
+    return {
+      introText: `当前这台主机没有持有 G72。先在这里点“接收”，让本机把共享屏接入逻辑准备好；然后回到 ${getTarget(
+        oppositeTargetId
+      ).label} 那一侧点“移交”，最后再用显示器按钮切源。`,
+      recommendation: `建议当前先点“${receiveAction.buttonLabel}”。`,
+      actions: [transferAction, receiveAction],
       disabledReason: "",
     };
   }
 
   return {
-    action: "receive",
-    targetId: localTargetId,
-    introText: `当前这台主机不持有 G72。先在这里点击“接收”，让本机把共享屏接入逻辑准备好；然后回到 ${getTarget(
-      currentOwnerTargetId
-    ).label} 那一侧点击“移交”，最后再用显示器按钮切源。`,
-    buttonLabel: `准备接收来自 ${getTarget(currentOwnerTargetId).label}`,
+    introText: "当前共享屏归属暂时识别不准。手动模式下不再靠这个判断决定有没有按钮：哪边现在正显示 G72，哪边就点“移交”；另一边点“接收”。",
+    recommendation: "归属未知时，两侧都可以按你眼前看到的实际画面手动操作。",
+    actions: [transferAction, receiveAction],
     disabledReason: "",
   };
-}
-
-function getManualHandoffDisabledReason() {
-  return getManualHandoffContextForCurrentPlatform().disabledReason;
-}
-
-function canPrepareManualHandoffForCurrentPlatform() {
-  return Boolean(getManualHandoffContextForCurrentPlatform().action) && !getManualHandoffDisabledReason();
 }
 
 function getManualSessionRemainingSeconds() {
