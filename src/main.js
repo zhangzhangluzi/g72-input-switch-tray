@@ -1,21 +1,14 @@
 const { app, Tray, Menu, nativeImage, Notification, dialog, shell, screen } = require("electron");
 const { execFile } = require("node:child_process");
 const crypto = require("node:crypto");
-const dgram = require("node:dgram");
 const fs = require("node:fs");
 const http = require("node:http");
-const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
 const {
   doesMonitorListContainConfiguredMonitor,
-  normalizeMonitorToken,
   normalizeText,
 } = require("./monitor-name-helpers");
-const {
-  createWindowsSharedMonitorTransferHint,
-  createWindowsSwitchMenuModel,
-} = require("./tray-menu-helpers");
 
 const APP_NAME = "显示器输入切换";
 const APP_ID = "com.zhangzhangluzi.g72inputswitchtray";
@@ -24,10 +17,6 @@ const PREFERRED_CONTROL_PORT = 3847;
 const TRAY_REBUILD_DELAY_MS = 1200;
 const TRAY_HEALTHCHECK_INTERVAL_MS = 5000;
 const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
-const PEER_DISCOVERY_PORT = 38479;
-const PEER_DISCOVERY_MULTICAST = "239.255.72.19";
-const PEER_DISCOVERY_INTERVAL_MS = 2000;
-const PEER_DISCOVERY_STALE_MS = 15000;
 const PEER_CONFIRMATION_TIMEOUT_MS = 4000;
 const PEER_CONFIRMATION_POLL_MS = 250;
 const LOCAL_HANDOFF_INFERENCE_WINDOW_MS = 10 * 60 * 1000;
@@ -55,8 +44,6 @@ let activeControlPort = PREFERRED_CONTROL_PORT;
 let windowsRestoreTimer = null;
 let windowsRestoreInFlight = false;
 let ownershipRefreshTimer = null;
-let peerDiscoverySocket = null;
-let peerDiscoveryTimer = null;
 let windowsMonitorAvailability = {
   status: "unknown",
   names: [],
@@ -69,7 +56,6 @@ let trayRebuildTimer = null;
 let trayHealthTimer = null;
 let explorerSignature = null;
 let sharedMonitorOwnership = createDefaultOwnershipSnapshot();
-let discoveredPeers = new Map();
 let manualSessionTimer = null;
 let manualSessionInFlight = false;
 let state = createDefaultState();
@@ -134,20 +120,6 @@ app.on("before-quit", () => {
     clearInterval(manualSessionTimer);
     manualSessionTimer = null;
   }
-
-  if (peerDiscoveryTimer) {
-    clearInterval(peerDiscoveryTimer);
-    peerDiscoveryTimer = null;
-  }
-
-  if (peerDiscoverySocket) {
-    try {
-      peerDiscoverySocket.close();
-    } catch {
-      // Ignore socket teardown errors during app exit.
-    }
-    peerDiscoverySocket = null;
-  }
 });
 
 app.whenReady().then(() => {
@@ -160,7 +132,6 @@ app.whenReady().then(() => {
   startControlServer();
   startWindowsRestoreWatcher();
   startWindowsTrayWatcher();
-  startPeerDiscovery();
   startOwnershipWatcher();
   startManualSessionWatcher();
   createTray();
@@ -233,40 +204,6 @@ function refreshMenu() {
   const openAtLogin = app.getLoginItemSettings().openAtLogin;
   const configErrors = getConfigValidationErrors(state.config);
   const localSettingsUrl = getLocalSettingsUrl();
-  const currentOwnerTargetId = getCurrentOwnerTargetId();
-  const windowsSharedMonitorMissing =
-    process.platform === "win32" &&
-    configErrors.length === 0 &&
-    (["missing", "away"].includes(windowsMonitorAvailability.status) || currentOwnerTargetId === "mac");
-  const windowsSharedMonitorMessage = windowsSharedMonitorMissing
-    ? sharedMonitorOwnership.message ||
-      windowsMonitorAvailability.message ||
-      `${state.config.monitorName || "共享屏"} 当前看起来不在 Windows 侧，请到 Mac 端或显示器菜单切回。`
-    : "";
-  const switchMenuItems = createWindowsSwitchMenuModel({
-    windowsSharedMonitorMissing,
-    hasConfigErrors: configErrors.length > 0,
-    lastTarget: state.lastTarget,
-    currentOwnerTargetId,
-    windowsLabel: getTarget("windows").label,
-    macLabel: getTarget("mac").label,
-  }).map((item) => {
-    if (item.kind === "handoffHint") {
-      return {
-        label: item.label,
-        enabled: item.enabled,
-        click: () => showWindowsSharedMonitorTransferHint(windowsSharedMonitorMessage),
-      };
-    }
-
-    return {
-      label: item.label,
-      type: item.type,
-      checked: item.checked,
-      enabled: item.enabled,
-      click: () => handleTraySwitch(item.targetId),
-    };
-  });
   const manualHandoffModel = getManualHandoffModelForCurrentPlatform();
   const manualHandoffSubmenu = manualHandoffModel.actions.length
     ? [
@@ -303,21 +240,7 @@ function refreshMenu() {
 
   const menu = Menu.buildFromTemplate([
     {
-      label: `当前推断归属：${getCurrentOwnershipMenuLabel()}`,
-      enabled: false,
-    },
-    {
       label: `版本：v${app.getVersion()}`,
-      enabled: false,
-    },
-    {
-      label: getLastSwitchOutcomeMenuLabel(),
-      enabled: false,
-    },
-    {
-      label: state.lastTarget
-        ? `最近切换请求：${getTarget(state.lastTarget).label}`
-        : "最近切换请求：尚未通过此应用发送",
       enabled: false,
     },
     {
@@ -332,26 +255,10 @@ function refreshMenu() {
           },
         ]
       : []),
-    ...(windowsSharedMonitorMissing
-      ? [
-          {
-            label: windowsSharedMonitorMessage,
-            enabled: false,
-          },
-        ]
-      : []),
     ...(state.manualSession.active
       ? [
           {
             label: `手动交接：等待 ${getManualSessionRemainingSeconds()} 秒内完成`,
-            enabled: false,
-          },
-        ]
-      : []),
-    ...(state.lastSwitchOutcome.status === "error" && state.lastSwitchOutcome.message
-      ? [
-          {
-            label: `最近错误：${summarizeMenuMessage(state.lastSwitchOutcome.message)}`,
             enabled: false,
           },
         ]
@@ -370,12 +277,7 @@ function refreshMenu() {
           },
         ]
       : []),
-    {
-      label: "说明：这里显示的是软件当前推断归属；最近切换请求只表示历史动作",
-      enabled: false,
-    },
     { type: "separator" },
-    ...switchMenuItems,
     ...manualHandoffSubmenu,
     { type: "separator" },
     {
@@ -415,30 +317,6 @@ function refreshMenu() {
   ]);
 
   tray.setContextMenu(menu);
-}
-
-function showWindowsSharedMonitorTransferHint(message = "") {
-  const hint = createWindowsSharedMonitorTransferHint({
-    monitorName: state.config.monitorName,
-    message,
-  });
-
-  void dialog.showMessageBox({
-    type: "info",
-    title: APP_NAME,
-    message: hint.message,
-    detail: hint.detail,
-    buttons: ["知道了"],
-    defaultId: 0,
-  });
-}
-
-function handleTraySwitch(targetId) {
-  void switchMonitor(targetId, {
-    showErrorDialog: false,
-  }).catch((error) => {
-    appendDiagnosticLog(`Tray switch failed (${targetId})`, error);
-  });
 }
 
 function handleTrayManualHandoffAction(targetId, preferredAction) {
@@ -581,7 +459,6 @@ function resolveManualHandoffPlan(targetId, preferredAction = null) {
   const localTargetId = getLocalPlatformTargetId();
   const parsedTargetId = parseTargetId(targetId);
   const parsedAction = parseManualHandoffAction(preferredAction);
-  const currentOwnerTargetId = getCurrentOwnerTargetId();
   const oppositeTargetId = getOppositeTargetId(localTargetId);
 
   if (!localTargetId) {
@@ -601,15 +478,11 @@ function resolveManualHandoffPlan(targetId, preferredAction = null) {
       throw new Error(`“接收”只能在 ${getTarget(localTargetId).label} 这一侧执行。`);
     }
 
-    if (currentOwnerTargetId === localTargetId) {
-      throw new Error(`共享屏已经在 ${getTarget(localTargetId).label} 侧，不需要点接收。`);
-    }
-
     return {
       kind: "receive",
       localTargetId,
       targetId: localTargetId,
-      sourceTargetId: currentOwnerTargetId || oppositeTargetId,
+      sourceTargetId: oppositeTargetId,
       expectedOwnerTargetId: localTargetId,
     };
   }
@@ -617,10 +490,6 @@ function resolveManualHandoffPlan(targetId, preferredAction = null) {
   if (parsedAction === "transfer") {
     if (parsedTargetId !== oppositeTargetId) {
       throw new Error(`“移交”只能把共享屏交给 ${getTarget(oppositeTargetId).label}。`);
-    }
-
-    if (currentOwnerTargetId && currentOwnerTargetId !== localTargetId) {
-      throw new Error("当前共享屏看起来不在这台主机手里，请在另一侧点移交；如果只是识别不准，请改用这里的“接收”入口。");
     }
 
     return {
@@ -632,26 +501,14 @@ function resolveManualHandoffPlan(targetId, preferredAction = null) {
     };
   }
 
-  if (!currentOwnerTargetId) {
-    throw new Error("当前共享屏归属未知。现在请直接按你眼前看到的实际画面操作：持有画面的一侧点移交，另一侧点接收。");
-  }
-
   if (parsedTargetId === localTargetId) {
-    if (currentOwnerTargetId === localTargetId) {
-      throw new Error(`共享屏已经在 ${getTarget(localTargetId).label} 侧，不需要点接收。`);
-    }
-
     return {
       kind: "receive",
       localTargetId,
       targetId: parsedTargetId,
-      sourceTargetId: currentOwnerTargetId,
+      sourceTargetId: oppositeTargetId,
       expectedOwnerTargetId: localTargetId,
     };
-  }
-
-  if (currentOwnerTargetId !== localTargetId) {
-    throw new Error("当前共享屏不在这台主机手里，这边不能点移交；请在当前持有画面的那一侧点移交。");
   }
 
   return {
@@ -779,11 +636,6 @@ function switchOnMac(targetId, target) {
   const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
   const candidates = getInputCandidates(target);
   return Promise.resolve()
-    .then(async () => {
-      if (targetId === "windows") {
-        await preparePeerForIncomingOwnership(targetId);
-      }
-    })
     .then(() =>
       runCandidateSequence(candidates, (candidate) =>
         runCommand("/bin/sh", [scriptPath, String(candidate)], {
@@ -1077,41 +929,19 @@ async function handleControlRequest(request, response) {
   const statePath = `/api/${state.controlToken}/state`;
   const configPath = `/api/${state.controlToken}/config`;
   const monitorsPath = `/api/${state.controlToken}/monitors`;
-  const windowsPath = `/api/${state.controlToken}/switch/windows`;
-  const macPath = `/api/${state.controlToken}/switch/mac`;
   const manualWindowsPath = `/api/${state.controlToken}/manual/windows`;
   const manualMacPath = `/api/${state.controlToken}/manual/mac`;
   const macProbePath = `/api/${state.controlToken}/probe/mac`;
   const macProbeApplyPath = `/api/${state.controlToken}/probe/mac/apply`;
-  const peerOwnershipPath = getPeerOwnershipPath();
-  const peerPrepareWindowsPath = getPeerPreparePath("windows");
-  const peerPrepareMacPath = getPeerPreparePath("mac");
 
   if (requestUrl.pathname === "/health") {
-    const ownership = await getEffectiveOwnershipSnapshot();
     return writeJson(response, 200, {
       ok: true,
       appName: APP_NAME,
       version: app.getVersion(),
       lastTarget: state.lastTarget,
       monitorName: state.config.monitorName,
-      ownership,
     });
-  }
-
-  if (requestUrl.pathname === peerOwnershipPath && request.method === "GET") {
-    return writeJson(response, 200, {
-      ok: true,
-      ownership: await getEffectiveOwnershipSnapshot({ includePeer: false }),
-    });
-  }
-
-  if (
-    [peerPrepareWindowsPath, peerPrepareMacPath].includes(requestUrl.pathname) &&
-    request.method === "POST"
-  ) {
-    const targetId = requestUrl.pathname.endsWith("/windows") ? "windows" : "mac";
-    return handlePeerPrepareRequest(response, targetId);
   }
 
   if (!isLoopbackRequest(request)) {
@@ -1121,13 +951,9 @@ async function handleControlRequest(request, response) {
   }
 
   if (requestUrl.pathname === statePath) {
-    const ownership = await getEffectiveOwnershipSnapshot();
     return writeJson(response, 200, {
       ok: true,
-      lastTarget: state.lastTarget,
-      currentLabel: getCurrentTargetLabel(),
       version: app.getVersion(),
-      ownership,
       config: state.config,
     });
   }
@@ -1153,22 +979,15 @@ async function handleControlRequest(request, response) {
   }
 
   if (requestUrl.pathname === settingsPath) {
-    const [monitors, diagnostics, macProbeDiagnostics, ownershipSnapshot] = await Promise.all([
+    const [monitors, diagnostics, macProbeDiagnostics] = await Promise.all([
       getAvailableMonitorNames(),
       getMonitorDiagnostics(),
       getMacProbeDiagnostics(),
-      getEffectiveOwnershipSnapshot(),
     ]);
     return writeHtml(
       response,
       200,
-      renderSettingsPage(
-        requestUrl,
-        monitors,
-        diagnostics,
-        macProbeDiagnostics,
-        ownershipSnapshot
-      )
+      renderSettingsPage(requestUrl, monitors, diagnostics, macProbeDiagnostics)
     );
   }
 
@@ -1184,14 +1003,6 @@ async function handleControlRequest(request, response) {
     return handleMacProbeApply(request, response, requestUrl);
   }
 
-  if (requestUrl.pathname === windowsPath) {
-    return handleControlSwitch(request, response, requestUrl, "windows");
-  }
-
-  if (requestUrl.pathname === macPath) {
-    return handleControlSwitch(request, response, requestUrl, "mac");
-  }
-
   if (requestUrl.pathname === manualWindowsPath) {
     return handleManualHandoffRequest(request, response, requestUrl, "windows");
   }
@@ -1202,58 +1013,6 @@ async function handleControlRequest(request, response) {
 
   response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
   response.end("未找到对应页面。");
-}
-
-async function handlePeerPrepareRequest(response, targetId) {
-  if (targetId === "windows" && process.platform === "win32") {
-    const result = await prepareWindowsDesktopForIncomingOwnership();
-    return writeJson(response, 200, {
-      ok: true,
-      prepared: result.prepared,
-      ownership: await getEffectiveOwnershipSnapshot({ includePeer: false }),
-      detail: result.detail,
-    });
-  }
-
-  return writeJson(response, 200, {
-    ok: true,
-    prepared: false,
-    ownership: await getEffectiveOwnershipSnapshot({ includePeer: false }),
-    detail: "当前平台没有需要执行的共享屏接管预热动作。",
-  });
-}
-
-async function handleControlSwitch(request, response, requestUrl, targetId) {
-  if (!["GET", "POST"].includes(request.method || "GET")) {
-    response.writeHead(405, {
-      "Allow": "GET, POST",
-      "Content-Type": "text/plain; charset=utf-8",
-    });
-    response.end("当前接口只支持 GET 或 POST。");
-    return;
-  }
-
-  if (request.method === "POST") {
-    await readRequestBody(request);
-  }
-
-  try {
-    await switchMonitor(targetId, {
-      notifyOnSuccess: false,
-      showErrorDialog: false,
-    });
-
-    redirectToControlPage(response, requestUrl, {
-      status: "success",
-      target: targetId,
-    });
-  } catch (error) {
-    redirectToControlPage(response, requestUrl, {
-      status: "error",
-      target: targetId,
-      message: error.message,
-    });
-  }
 }
 
 async function handleConfigSave(request, response, requestUrl) {
@@ -1301,19 +1060,14 @@ async function handleManualHandoffRequest(request, response, requestUrl, targetI
 
   try {
     await prepareManualHandoff(targetId, {
-      notifyOnSuccess: false,
+      notifyOnSuccess: true,
       showErrorDialog: false,
       preferredAction,
     });
-    redirectToSettingsPage(response, requestUrl, {
-      status: "success",
-      message: state.lastSwitchOutcome.message,
-    });
+    redirectToSettingsPage(response, requestUrl, {});
   } catch (error) {
-    redirectToSettingsPage(response, requestUrl, {
-      status: "error",
-      message: error.message,
-    });
+    notify(error.message || "手动交接准备失败。");
+    redirectToSettingsPage(response, requestUrl, {});
   }
 }
 
@@ -1613,7 +1367,6 @@ function buildConfigFromForm(form) {
     windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
       form.get("windowsDisplayHandoffMode")
     ),
-    peerStatusUrl: normalizePeerStatusUrl(form.get("peerStatusUrl")),
     targets: {
       windows: {
         label: normalizeText(form.get("windowsLabel")),
@@ -1688,24 +1441,6 @@ function getOppositeTargetId(targetId) {
   }
 
   return null;
-}
-
-function normalizePeerStatusUrl(value) {
-  const normalized = normalizeText(value);
-  return normalized.replace(/\/+$/, "");
-}
-
-function isValidPeerStatusUrl(value) {
-  if (!normalizeText(value)) {
-    return true;
-  }
-
-  try {
-    const parsed = new URL(value);
-    return ["http:", "https:"].includes(parsed.protocol);
-  } catch {
-    return false;
-  }
 }
 
 async function getAvailableMonitorNames() {
@@ -1882,23 +1617,14 @@ function redirectToPath(response, requestUrl, pathName, query) {
   response.end();
 }
 
-function renderSettingsPage(
-  requestUrl,
-  monitorNames,
-  diagnostics,
-  macProbeDiagnostics,
-  ownershipSnapshot
-) {
+function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagnostics) {
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
   const statusHtml = renderSettingsBanner(status, message);
-  const switchOutcomeHtml = renderSwitchOutcomeCard();
   const monitorHintHtml = renderMonitorHints(monitorNames);
   const diagnosticsHtml = renderMonitorDiagnostics(diagnostics);
   const manualHandoffHtml = renderManualHandoffCard();
   const macProbeHtml = renderMacProbeAssistant(macProbeDiagnostics);
-  const ownershipHtml = renderOwnershipStatusCard(ownershipSnapshot);
-  const peerStatusHtml = renderPeerStatusCard();
 
   return `<!doctype html>
 <html lang="zh-Hant">
@@ -2025,11 +1751,9 @@ function renderSettingsPage(
   <main>
     <div class="eyebrow">Local Setup · v${escapeHtml(app.getVersion())}</div>
     <h1>${escapeHtml(APP_NAME)} 设置</h1>
-    <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。下面的“共享屏当前推断归属”会尽量显示软件根据本机/对端证据得出的实时判断；“最近切换请求”只保留历史动作，不再代表当前画面归属。</p>
+    <p>这里现在只保留真正还在用的配置和手动交接流程，不再展示“归属判断”“双端协同”“直接切换”这类会误导你的状态。</p>
     <div class="stack">
       ${statusHtml}
-      ${switchOutcomeHtml}
-      ${ownershipHtml}
       ${diagnosticsHtml}
       ${manualHandoffHtml}
       ${macProbeHtml}
@@ -2076,7 +1800,6 @@ function renderSettingsPage(
           <div class="help">
             只影响 Windows 版。切给另一台设备后，应用会尝试把 Windows 桌面退回主显示器；共享屏回到 Windows 后，再恢复扩展显示。要想切走后真正只剩保底屏，请先把保底屏设为 Windows 主显示器。
           </div>
-          ${peerStatusHtml}
           <div class="card soft">
             <div class="section-title">模式 A</div>
             <div class="two-col">
@@ -2227,101 +1950,6 @@ function renderManualHandoffCard() {
     <div class="help">${escapeHtml(model.recommendation || sessionHelp)}</div>
     ${formHtml}
   </div>`;
-}
-
-function renderOwnershipStatusCard(ownershipSnapshot) {
-  const snapshot = ownershipSnapshot || createDefaultOwnershipSnapshot();
-  const ownerTargetId = ["windows", "mac"].includes(snapshot.owner) ? snapshot.owner : null;
-  const ownerLine = ownerTargetId
-    ? `共享屏当前推断归属：${escapeHtml(getTarget(ownerTargetId).label)}`
-    : "共享屏当前推断归属：暂时无法确认";
-  const inputLine = Number.isInteger(snapshot.currentInputValue)
-    ? `当前输入回报：${escapeHtml(describeInputValue(snapshot.currentInputValue))}`
-    : "当前输入回报：暂时不可用";
-  const sourceLine =
-    snapshot.source === "peer"
-      ? "这次推断结果来自对端确认。当前机器上的本地回读结果不够可靠，所以暂时采用了另一台机器的确认。"
-      : "这次推断结果来自当前机器的本地判断。";
-  const detailLine = snapshot.message
-    ? escapeHtml(snapshot.message)
-    : ownerTargetId
-      ? `软件当前根据输入值把 G72 推断为 ${escapeHtml(getTarget(ownerTargetId).label)}。`
-      : "当显示器继续保留逻辑连接、或者 DDC 回读不稳定时，这里的推断归属可能会暂时显示为未知。";
-
-  return `<div class="card soft">
-    <div class="section-title">共享屏当前推断归属</div>
-    <div class="help" style="margin-top: 12px;">${ownerLine}</div>
-    <div class="help">${inputLine}</div>
-    <div class="help">${escapeHtml(sourceLine)}</div>
-    <div class="help">${detailLine}</div>
-  </div>`;
-}
-
-function renderSwitchOutcomeCard() {
-  if (state.lastSwitchOutcome.status === "idle") {
-    return "";
-  }
-
-  const isSuccess = state.lastSwitchOutcome.status === "success";
-  const isManualPrep = state.lastSwitchOutcome.mode === "manual_prep";
-  const targetLabel = state.lastSwitchOutcome.targetId
-    ? getTarget(state.lastSwitchOutcome.targetId).label
-    : "未指定目标";
-  const lines = [
-    `最近结果：${isManualPrep ? "本机准备已完成" : isSuccess ? "流程已执行" : "未完成"}`,
-    `目标：${escapeHtml(targetLabel)}`,
-  ];
-
-  if (state.lastSwitchOutcome.message) {
-    lines.push(escapeHtml(state.lastSwitchOutcome.message));
-  }
-
-  return `<div class="banner ${isSuccess ? "success" : "error"}">${lines.join("<br>")}</div>`;
-}
-
-function renderPeerStatusCard() {
-  const discoveredPeersHtml = renderDiscoveredPeerPills();
-
-  return `<div class="card soft">
-    <div class="section-title">双端协同</div>
-    <div class="help" style="margin-top: 12px;">局域网协同只是增强确认，不是唯一依据。就算局域网不通，应用也会优先按本机输入回读和本机显示拓扑推断 G72 当前推断归属；只有本机判断不够可靠时，才会用局域网里的对端状态来补强。</div>
-    <div class="help">${getPeerDiscoveryStatusText()}</div>
-    <div class="help" style="margin-top: 12px;">当前已发现的对端候选</div>
-    <div class="tip-list">${discoveredPeersHtml}</div>
-  </div>`;
-}
-
-function renderDiscoveredPeerPills() {
-  const candidates = getActivePeerCandidates();
-  if (candidates.length === 0) {
-    return `<span class="help">暂未发现对端。只要另一台电脑打开应用并在同一局域网，通常几秒内就会自动出现。</span>`;
-  }
-
-  return candidates
-    .map((peer) => {
-      const ownershipText =
-        peer.ownership && ["windows", "mac"].includes(peer.ownership.owner)
-          ? `，它当前判断为 ${getTarget(peer.ownership.owner).label}`
-          : "";
-      return `<span class="pill">${escapeHtml(
-        `${peer.hostName || peer.address} · ${peer.platform || "unknown"} · ${peer.monitorName || "未标注显示器"}${ownershipText}`
-      )}</span>`;
-    })
-    .join("");
-}
-
-function getPeerDiscoveryStatusText() {
-  const candidates = getActivePeerCandidates();
-  if (candidates.length === 1) {
-    const peer = candidates[0];
-    return `已自动识别到对端：${peer.hostName || peer.address}（${peer.platform}）。当本机判断不够确定时，会用它的实时推断结果做二次确认。`;
-  }
-
-  if (candidates.length > 1) {
-    return "检测到了多个可能的对端候选。当前不会随便选一台来确认归属，避免把别的机器误认成共享屏伙伴。";
-  }
-
-  return "当前没有可自动配对的对端，所以只按本机读值与本机显示拓扑判断。";
 }
 
 function renderMacProbeAssistant(macProbeDiagnostics) {
@@ -2639,32 +2267,6 @@ function getTarget(targetId) {
   return state.config.targets[targetId];
 }
 
-function getCurrentTargetLabel() {
-  return state.lastTarget ? getTarget(state.lastTarget).label : "尚未通过此应用发送";
-}
-
-function getLastSwitchOutcomeMenuLabel() {
-  if (state.lastSwitchOutcome.status === "success" && state.lastSwitchOutcome.mode === "manual_prep") {
-    return "最近结果：本机准备已完成";
-  }
-
-  if (state.lastSwitchOutcome.status === "success") {
-    return "最近结果：流程已执行";
-  }
-
-  if (state.lastSwitchOutcome.status === "error") {
-    return "最近结果：未完成（详情见下方）";
-  }
-
-  return "最近结果：暂无";
-}
-
-function getCurrentOwnerTargetId() {
-  return ["windows", "mac"].includes(sharedMonitorOwnership.owner)
-    ? sharedMonitorOwnership.owner
-    : null;
-}
-
 function getLocalPlatformTargetId() {
   if (process.platform === "win32") {
     return "windows";
@@ -2689,7 +2291,6 @@ function getManualHandoffModelForCurrentPlatform() {
   }
 
   const oppositeTargetId = getOppositeTargetId(localTargetId);
-  const currentOwnerTargetId = getCurrentOwnerTargetId();
   const activeReason = state.manualSession.active
     ? `当前有一笔手动交接正在等待完成（剩余 ${getManualSessionRemainingSeconds()} 秒）。`
     : "";
@@ -2720,46 +2321,18 @@ function getManualHandoffModelForCurrentPlatform() {
     action: "transfer",
     targetId: oppositeTargetId,
     buttonLabel: `准备移交给 ${getTarget(oppositeTargetId).label}`,
-    disabledReason:
-      currentOwnerTargetId && currentOwnerTargetId !== localTargetId
-        ? "当前共享屏看起来不在这台主机手里；如果只是识别不准，请改用下面的“准备接收”。"
-        : "",
+    disabledReason: "",
   };
   const receiveAction = {
     action: "receive",
     targetId: localTargetId,
     buttonLabel: `准备接收来自 ${getTarget(oppositeTargetId).label}`,
-    disabledReason:
-      currentOwnerTargetId === localTargetId
-        ? `共享屏已经在 ${getTarget(localTargetId).label} 侧，不需要点接收。`
-        : "",
+    disabledReason: "",
   };
 
-  if (currentOwnerTargetId === localTargetId) {
-    return {
-      introText: `当前这台主机持有 G72。先在这里点“移交”，再去 ${getTarget(
-        oppositeTargetId
-      ).label} 那一侧点“接收”，最后用显示器按钮完成切源。`,
-      recommendation: `建议当前先点“${transferAction.buttonLabel}”。`,
-      actions: [transferAction, receiveAction],
-      disabledReason: "",
-    };
-  }
-
-  if (currentOwnerTargetId === oppositeTargetId) {
-    return {
-      introText: `当前这台主机没有持有 G72。先在这里点“接收”，让本机把共享屏接入逻辑准备好；然后回到 ${getTarget(
-        oppositeTargetId
-      ).label} 那一侧点“移交”，最后再用显示器按钮切源。`,
-      recommendation: `建议当前先点“${receiveAction.buttonLabel}”。`,
-      actions: [transferAction, receiveAction],
-      disabledReason: "",
-    };
-  }
-
   return {
-    introText: "当前共享屏归属暂时识别不准。手动模式下不再靠这个判断决定有没有按钮：哪边现在正显示 G72，哪边就点“移交”；另一边点“接收”。",
-    recommendation: "归属未知时，两侧都可以按你眼前看到的实际画面手动操作。",
+    introText: `这套交接现在完全按手动流程走：当前有画面的那一侧点“移交”，另一侧点“接收”，最后再用显示器按钮完成切源。`,
+    recommendation: `Windows 侧负责本机屏幕增减/恢复；Mac 侧只负责把本机该做的切源准备动作先做掉。`,
     actions: [transferAction, receiveAction],
     disabledReason: "",
   };
@@ -2774,20 +2347,6 @@ function getManualSessionRemainingSeconds() {
   return Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
 }
 
-function getCurrentOwnershipMenuLabel() {
-  const ownerTargetId = getCurrentOwnerTargetId();
-  if (ownerTargetId) {
-    const suffix = sharedMonitorOwnership.source === "peer" ? "（来自对端确认）" : "";
-    return `${getTarget(ownerTargetId).label}${suffix}`;
-  }
-
-  if (Number.isInteger(sharedMonitorOwnership.currentInputValue)) {
-    return `${describeInputValue(sharedMonitorOwnership.currentInputValue)}（归属未定）`;
-  }
-
-  return "未知";
-}
-
 function getControlPath() {
   return `/control/${state.controlToken}`;
 }
@@ -2796,34 +2355,8 @@ function getSettingsPath() {
   return `/settings/${state.controlToken}`;
 }
 
-function getPeerOwnershipPath() {
-  return `/api/${state.peerToken}/ownership`;
-}
-
-function getPeerPreparePath(targetId) {
-  return `/api/${state.peerToken}/prepare/${targetId}`;
-}
-
 function getLocalSettingsUrl() {
   return `http://127.0.0.1:${activeControlPort}${getSettingsPath()}`;
-}
-
-function getLocalPeerStatusUrls() {
-  const pathName = getPeerOwnershipPath();
-  const interfaces = os.networkInterfaces();
-  const urls = [];
-
-  for (const addressList of Object.values(interfaces)) {
-    for (const addressInfo of addressList || []) {
-      if (!addressInfo || addressInfo.internal || addressInfo.family !== "IPv4") {
-        continue;
-      }
-
-      urls.push(`http://${addressInfo.address}:${activeControlPort}${pathName}`);
-    }
-  }
-
-  return Array.from(new Set(urls)).sort();
 }
 
 function isLoopbackRequest(request) {
@@ -3425,107 +2958,6 @@ function getAttachedWindowsTopologyDisplayCount(displays) {
   return displays.filter((display) => display.attached).length;
 }
 
-function startPeerDiscovery() {
-  peerDiscoverySocket = dgram.createSocket({ type: "udp4", reuseAddr: true });
-
-  peerDiscoverySocket.on("error", (error) => {
-    appendDiagnosticLog("Peer discovery socket error", error);
-  });
-
-  peerDiscoverySocket.on("message", (message, remoteInfo) => {
-    handlePeerDiscoveryMessage(message, remoteInfo);
-  });
-
-  peerDiscoverySocket.bind(PEER_DISCOVERY_PORT, () => {
-    if (!peerDiscoverySocket) {
-      return;
-    }
-
-    try {
-      peerDiscoverySocket.addMembership(PEER_DISCOVERY_MULTICAST);
-      peerDiscoverySocket.setMulticastTTL(1);
-      peerDiscoverySocket.setMulticastLoopback(true);
-    } catch (error) {
-      appendDiagnosticLog("Failed to join peer discovery multicast group", error);
-    }
-  });
-
-  void broadcastPeerPresence();
-  peerDiscoveryTimer = setInterval(() => {
-    void broadcastPeerPresence();
-    pruneDiscoveredPeers();
-  }, PEER_DISCOVERY_INTERVAL_MS);
-}
-
-async function broadcastPeerPresence() {
-  if (!peerDiscoverySocket) {
-    return;
-  }
-
-  try {
-    const localOwnership = await getLocalOwnershipSnapshot();
-    const payload = Buffer.from(
-      JSON.stringify({
-        appId: APP_ID,
-        peerToken: state.peerToken,
-        platform: process.platform,
-        hostName: os.hostname(),
-        monitorName: state.config.monitorName,
-        controlPort: activeControlPort,
-        ownership: localOwnership,
-      })
-    );
-
-    peerDiscoverySocket.send(payload, PEER_DISCOVERY_PORT, PEER_DISCOVERY_MULTICAST);
-  } catch (error) {
-    appendDiagnosticLog("Failed to broadcast peer presence", error);
-  }
-}
-
-function handlePeerDiscoveryMessage(message, remoteInfo) {
-  let payload = null;
-
-  try {
-    payload = JSON.parse(String(message));
-  } catch {
-    return;
-  }
-
-  if (!payload || payload.appId !== APP_ID || normalizeText(payload.peerToken) === state.peerToken) {
-    return;
-  }
-
-  const peerKey = `${normalizeText(payload.peerToken)}@${remoteInfo.address}`;
-  discoveredPeers.set(peerKey, {
-    peerToken: normalizeText(payload.peerToken),
-    address: remoteInfo.address,
-    controlPort: Number.isInteger(payload.controlPort) ? payload.controlPort : PREFERRED_CONTROL_PORT,
-    platform: normalizeText(payload.platform),
-    hostName: normalizeText(payload.hostName),
-    monitorName: normalizeText(payload.monitorName),
-    lastSeenAt: Date.now(),
-    ownership: payload.ownership || null,
-  });
-
-  void refreshSharedMonitorOwnership();
-}
-
-function pruneDiscoveredPeers() {
-  const now = Date.now();
-  let changed = false;
-
-  for (const [peerKey, peer] of discoveredPeers.entries()) {
-    if (now - peer.lastSeenAt > PEER_DISCOVERY_STALE_MS) {
-      discoveredPeers.delete(peerKey);
-      changed = true;
-    }
-  }
-
-  if (changed) {
-    void refreshSharedMonitorOwnership();
-  }
-}
-
 function startOwnershipWatcher() {
   void refreshSharedMonitorOwnership();
   ownershipRefreshTimer = setInterval(() => {
@@ -3552,9 +2984,7 @@ async function tickManualSession() {
     if (snapshot.owner === state.manualSession.expectedOwnerTargetId) {
       finishManualSession(
         "success",
-        `软件当前判断 ${state.config.monitorName} 已完成手动${state.manualSession.kind === "transfer" ? "移交" : "接收"}，当前推断归属：${getTarget(
-          state.manualSession.expectedOwnerTargetId
-        ).label}。`,
+        `软件当前判断 ${state.config.monitorName} 已完成手动${state.manualSession.kind === "transfer" ? "移交" : "接收"}。`,
         state.manualSession.expectedOwnerTargetId,
         { notifyUser: true }
       );
@@ -3648,26 +3078,7 @@ function updateSharedMonitorOwnership(nextSnapshot) {
 }
 
 async function getEffectiveOwnershipSnapshot({ includePeer = true } = {}) {
-  const localSnapshot = await getLocalOwnershipSnapshot();
-
-  if (!includePeer || getPeerStatusUrls().length === 0) {
-    return localSnapshot;
-  }
-
-  const peerSnapshot = await fetchPeerOwnershipSnapshot();
-  if (!peerSnapshot) {
-    return localSnapshot;
-  }
-
-  if (localSnapshot.owner !== "unknown") {
-    return localSnapshot;
-  }
-
-  if (peerSnapshot.owner !== "unknown") {
-    return peerSnapshot;
-  }
-
-  return localSnapshot;
+  return getLocalOwnershipSnapshot();
 }
 
 async function getLocalOwnershipSnapshot() {
@@ -3748,26 +3159,7 @@ async function getMacOwnershipSnapshot(options = {}) {
   };
 }
 
-async function fetchPeerOwnershipSnapshot() {
-  const peerStatusUrls = getPeerStatusUrls();
-  if (peerStatusUrls.length > 0) {
-    for (const peerStatusUrl of peerStatusUrls) {
-      try {
-        const payload = await requestJson(peerStatusUrl, 1500);
-        const peerSnapshot = normalizePeerOwnershipSnapshot(payload?.ownership);
-        if (peerSnapshot) {
-          return peerSnapshot;
-        }
-      } catch {
-        // Try the next discovered address for the same peer.
-      }
-    }
-  }
-
-  return getAutoDiscoveredPeerBroadcastSnapshot();
-}
-
-async function confirmTargetOwnership(targetId, { includePeer = true, timeoutMs = PEER_CONFIRMATION_TIMEOUT_MS } = {}) {
+async function confirmTargetOwnership(targetId, { timeoutMs = PEER_CONFIRMATION_TIMEOUT_MS } = {}) {
   if (!parseTargetId(targetId)) {
     return {
       confirmed: false,
@@ -3787,19 +3179,6 @@ async function confirmTargetOwnership(targetId, { includePeer = true, timeoutMs 
           confirmed: true,
           snapshot: localSnapshot,
         };
-      }
-    }
-
-    if (includePeer) {
-      const peerSnapshot = await fetchPeerOwnershipSnapshot();
-      if (peerSnapshot) {
-        lastSnapshot = peerSnapshot;
-        if (peerSnapshot.owner === targetId) {
-          return {
-            confirmed: true,
-            snapshot: peerSnapshot,
-          };
-        }
       }
     }
 
@@ -3832,7 +3211,6 @@ async function attemptWindowsDesktopHandoffRecovery(targetId, expectedRestoreDis
   }
 
   const ownershipConfirmation = await confirmTargetOwnership(targetId, {
-    includePeer: true,
     timeoutMs: 4000,
   });
 
@@ -3853,206 +3231,6 @@ async function attemptWindowsDesktopHandoffRecovery(targetId, expectedRestoreDis
   }
 
   return true;
-}
-
-async function preparePeerForIncomingOwnership(targetId) {
-  if (!parseTargetId(targetId)) {
-    return false;
-  }
-
-  for (const peerPrepareUrl of getPeerPrepareUrls(targetId)) {
-    try {
-      const payload = await requestJson(peerPrepareUrl, 3000, {
-        method: "POST",
-      });
-      const peerSnapshot = normalizePeerOwnershipSnapshot(payload?.ownership);
-      if (peerSnapshot) {
-        updateSharedMonitorOwnership(peerSnapshot);
-      }
-
-      return Boolean(payload?.ok);
-    } catch (error) {
-      appendDiagnosticLog(`Failed to prepare peer for ${targetId} ownership`, error);
-    }
-  }
-
-  return false;
-}
-
-function getPeerStatusUrls() {
-  const autoDiscoveredUrls = getAutoDiscoveredPeerStatusUrls();
-  if (autoDiscoveredUrls.length > 0) {
-    return autoDiscoveredUrls;
-  }
-
-  const fallbackUrl = isValidPeerStatusUrl(state.config.peerStatusUrl)
-    ? normalizeText(state.config.peerStatusUrl)
-    : "";
-  return fallbackUrl ? [fallbackUrl] : [];
-}
-
-function getAutoDiscoveredPeerStatusUrls() {
-  const peers = getAutoDiscoveredPeerEntries();
-  return peers.map((peer) => `http://${peer.address}:${peer.controlPort}/api/${peer.peerToken}/ownership`);
-}
-
-function getPeerPrepareUrls(targetId) {
-  const autoDiscoveredUrls = getAutoDiscoveredPeerEntries().map(
-    (peer) => `http://${peer.address}:${peer.controlPort}/api/${peer.peerToken}/prepare/${targetId}`
-  );
-
-  if (autoDiscoveredUrls.length > 0) {
-    return autoDiscoveredUrls;
-  }
-
-  const fallbackUrl = isValidPeerStatusUrl(state.config.peerStatusUrl)
-    ? normalizeText(state.config.peerStatusUrl)
-    : "";
-  const derivedFallbackUrl = derivePeerPrepareUrl(fallbackUrl, targetId);
-  return derivedFallbackUrl ? [derivedFallbackUrl] : [];
-}
-
-function derivePeerPrepareUrl(peerStatusUrl, targetId) {
-  if (!peerStatusUrl) {
-    return "";
-  }
-
-  try {
-    const parsed = new URL(peerStatusUrl);
-    const match = parsed.pathname.match(/^\/api\/([^/]+)\/ownership$/);
-    if (!match) {
-      return "";
-    }
-
-    parsed.pathname = `/api/${match[1]}/prepare/${targetId}`;
-    parsed.search = "";
-    parsed.hash = "";
-    return parsed.toString();
-  } catch {
-    return "";
-  }
-}
-
-function getAutoDiscoveredPeerEntries() {
-  const activePeers = getRawActivePeerCandidates();
-  const peerTokens = Array.from(new Set(activePeers.map((peer) => peer.peerToken))).filter(Boolean);
-  return peerTokens.length === 1 ? activePeers : [];
-}
-
-function getAutoDiscoveredPeerBroadcastSnapshot() {
-  for (const peer of getAutoDiscoveredPeerEntries()) {
-    const peerSnapshot = normalizePeerOwnershipSnapshot(peer.ownership, peer.platform);
-    if (peerSnapshot) {
-      return peerSnapshot;
-    }
-  }
-
-  return null;
-}
-
-function getActivePeerCandidates() {
-  const groupedPeers = new Map();
-
-  for (const peer of getRawActivePeerCandidates()) {
-    const existingPeer = groupedPeers.get(peer.peerToken);
-    if (!existingPeer || peer.lastSeenAt > existingPeer.lastSeenAt) {
-      groupedPeers.set(peer.peerToken, peer);
-    }
-  }
-
-  return Array.from(groupedPeers.values()).sort((left, right) => right.lastSeenAt - left.lastSeenAt);
-}
-
-function getRawActivePeerCandidates() {
-  const now = Date.now();
-  const configuredMonitorToken = normalizeMonitorToken(state.config.monitorName);
-  const oppositePlatformPeers = Array.from(discoveredPeers.values())
-    .filter((peer) => now - peer.lastSeenAt <= PEER_DISCOVERY_STALE_MS)
-    .filter((peer) => peer.platform && peer.platform !== process.platform);
-  const monitorMatchedPeers = oppositePlatformPeers.filter((peer) => {
-    if (!configuredMonitorToken) {
-      return true;
-    }
-
-    const peerMonitorToken = normalizeMonitorToken(peer.monitorName);
-    return (
-      peerMonitorToken &&
-      (peerMonitorToken === configuredMonitorToken ||
-        peerMonitorToken.includes(configuredMonitorToken) ||
-        configuredMonitorToken.includes(peerMonitorToken))
-    );
-  });
-  const sourcePeers =
-    monitorMatchedPeers.length > 0
-      ? monitorMatchedPeers
-      : Array.from(new Map(oppositePlatformPeers.map((peer) => [peer.peerToken, peer])).values()).length === 1
-        ? oppositePlatformPeers
-        : [];
-  const groupedPeers = new Map();
-
-  for (const peer of sourcePeers) {
-    const entryKey = `${peer.peerToken}@${peer.address}:${peer.controlPort}`;
-    groupedPeers.set(entryKey, peer);
-  }
-
-  return Array.from(groupedPeers.values()).sort((left, right) => right.lastSeenAt - left.lastSeenAt);
-}
-
-function requestJson(urlString, timeoutMs, options = {}) {
-  const { method = "GET" } = options;
-  return new Promise((resolve, reject) => {
-    const url = new URL(urlString);
-    const client = url.protocol === "https:" ? https : http;
-    const request = client.request(url, {
-      method,
-      timeout: timeoutMs,
-      headers: {
-        "Accept": "application/json",
-      },
-    }, (response) => {
-      let body = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk) => {
-        body += chunk;
-      });
-      response.on("end", () => {
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          reject(new Error(`Peer returned HTTP ${response.statusCode || 0}`));
-          return;
-        }
-
-        try {
-          resolve(JSON.parse(body));
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-
-    request.on("timeout", () => {
-      request.destroy(new Error("Peer request timed out."));
-    });
-    request.on("error", reject);
-    request.end();
-  });
-}
-
-function normalizePeerOwnershipSnapshot(ownership, fallbackPlatform = "") {
-  if (!ownership || !["windows", "mac", "unknown"].includes(ownership.owner)) {
-    return null;
-  }
-
-  return {
-    owner: ownership.owner,
-    source: "peer",
-    platform: normalizeText(ownership.platform) || normalizeText(fallbackPlatform) || "unknown",
-    status: normalizeText(ownership.status) || "unknown",
-    message: normalizeText(ownership.message),
-    currentInputValue: Number.isInteger(ownership.currentInputValue)
-      ? ownership.currentInputValue
-      : null,
-    updatedAt: normalizeText(ownership.updatedAt) || new Date().toISOString(),
-  };
 }
 
 function runCommand(file, args, options = {}) {
@@ -4477,7 +3655,6 @@ function createDefaultState() {
   return {
     lastTarget: null,
     controlToken: crypto.randomBytes(12).toString("hex"),
-    peerToken: crypto.randomBytes(12).toString("hex"),
     windowsDesktop: createDefaultWindowsDesktopState(),
     manualSession: createDefaultManualSessionState(),
     lastSwitchOutcome: createSwitchOutcome(),
@@ -4538,7 +3715,6 @@ function createDefaultConfig() {
     macDisplayIndex: 1,
     compatibilityMode: "auto",
     windowsDisplayHandoffMode: "auto",
-    peerStatusUrl: "",
     targets: {
       windows: {
         label: "Windows（DP2）",
@@ -4596,7 +3772,6 @@ function normalizeState(nextState) {
   return {
     lastTarget: TARGET_IDS.includes(nextState.lastTarget) ? nextState.lastTarget : null,
     controlToken: normalizeText(nextState.controlToken) || defaults.controlToken,
-    peerToken: normalizeText(nextState.peerToken) || defaults.peerToken,
     windowsDesktop: {
       pendingRestore: Boolean(nextState.windowsDesktop?.pendingRestore),
       expectedAttachedDisplayCount: normalizePositiveInteger(
@@ -4614,7 +3789,6 @@ function normalizeState(nextState) {
       windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
         rawConfig.windowsDisplayHandoffMode || defaults.config.windowsDisplayHandoffMode
       ),
-      peerStatusUrl: normalizePeerStatusUrl(rawConfig.peerStatusUrl),
       targets: {
         windows: {
           label: normalizeText(rawTargets.windows?.label) || defaults.config.targets.windows.label,

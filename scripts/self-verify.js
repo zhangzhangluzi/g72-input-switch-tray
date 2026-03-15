@@ -6,86 +6,12 @@ const path = require("node:path");
 const os = require("node:os");
 const { execFileSync } = require("node:child_process");
 const { doesMonitorListContainConfiguredMonitor } = require("../src/monitor-name-helpers");
-const {
-  createWindowsSharedMonitorTransferHint,
-  createWindowsSwitchMenuModel,
-} = require("../src/tray-menu-helpers");
 
 function run(command, args) {
   return execFileSync(command, args, { encoding: "utf8" }).trim();
 }
 
-function verifyWindowsMenuModel() {
-  const handoffItems = createWindowsSwitchMenuModel({
-    windowsSharedMonitorMissing: true,
-    hasConfigErrors: false,
-    lastTarget: "mac",
-    windowsLabel: "Windows（DP2）",
-    macLabel: "Mac mini（HDMI1）",
-  });
-
-  assert.equal(handoffItems.length, 1);
-  assert.equal(handoffItems[0].kind, "handoffHint");
-  assert.equal(handoffItems[0].enabled, true);
-  assert.match(handoffItems[0].label, /当前判断共享屏不在 Windows 侧/);
-
-  const targetItems = createWindowsSwitchMenuModel({
-    windowsSharedMonitorMissing: false,
-    hasConfigErrors: false,
-    lastTarget: "windows",
-    currentOwnerTargetId: "windows",
-    windowsLabel: "Windows（DP2）",
-    macLabel: "Mac mini（HDMI1）",
-  });
-
-  assert.deepEqual(
-    targetItems.map((item) => ({
-      kind: item.kind,
-      targetId: item.targetId,
-      enabled: item.enabled,
-      checked: item.checked,
-      type: item.type,
-    })),
-    [
-      {
-        kind: "target",
-        targetId: "windows",
-        enabled: true,
-        checked: true,
-        type: "radio",
-      },
-      {
-        kind: "target",
-        targetId: "mac",
-        enabled: true,
-        checked: false,
-        type: "radio",
-      },
-    ]
-  );
-
-  const unknownOwnerItems = createWindowsSwitchMenuModel({
-    windowsSharedMonitorMissing: false,
-    hasConfigErrors: false,
-    lastTarget: "mac",
-    currentOwnerTargetId: null,
-    windowsLabel: "Windows（DP2）",
-    macLabel: "Mac mini（HDMI1）",
-  });
-
-  assert.deepEqual(
-    unknownOwnerItems.map((item) => item.checked),
-    [false, false]
-  );
-
-  const hint = createWindowsSharedMonitorTransferHint({
-    monitorName: "G72",
-    message: "G72 仍然被 Windows 枚举到，但当前输入回报是 HDMI1 (17)，软件当前据此推断这块共享屏的画面已经交给 Mac 了。请在 Mac 端或显示器菜单里切回 Windows。",
-  });
-  assert.equal(hint.message, "G72 当前判断不在 Windows 侧");
-  assert.match(hint.detail, /谁当前拥有这块共享屏/);
-  assert.match(hint.detail, /推断这块共享屏的画面已经交给 Mac/);
-
+function verifyMonitorNameMatching() {
   assert.equal(
     doesMonitorListContainConfiguredMonitor(["G72 Max", "G52 Max"], "G72"),
     true
@@ -257,7 +183,7 @@ function verifyMacDdcctlFallbackScript() {
 }
 
 function main() {
-  verifyWindowsMenuModel();
+  verifyMonitorNameMatching();
 
   if (process.platform === "darwin") {
     verifyMacDdcctlFallbackScript();
