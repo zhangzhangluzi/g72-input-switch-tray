@@ -70,6 +70,7 @@ Result:
 
 - A Windows-side name-mismatch failure means "the Windows helper could not map the configured monitor name to what Windows currently sees".
 - It is unrelated to the macOS-side DDC write path.
+- Some monitors keep a logical display path alive on Windows even after the picture has switched to Mac. In that case, the app must not use "still enumerated" as a proxy for ownership; it should read the current input value and treat a Mac-family input as "ownership moved away".
 
 ## Recommended two-machine contract
 

@@ -40,9 +40,9 @@ function createWindowsSwitchMenuModel({
 function createWindowsSharedMonitorTransferHint({ monitorName, message }) {
   const resolvedMonitorName = monitorName || "共享屏";
   return {
-    message: `${resolvedMonitorName} 当前不在 Windows 侧`,
+    message: `${resolvedMonitorName} 当前已交给另一台电脑`,
     detail: [
-      message || `${resolvedMonitorName} 当前不在 Windows 侧，请到 Mac 端或显示器菜单切回。`,
+      message || `${resolvedMonitorName} 当前不由 Windows 持有，请到 Mac 端或显示器菜单切回。`,
       "",
       "现在的交接规则是：谁当前拥有这块共享屏，谁负责把它交出去。",
       "如果它已经切到 Mac，请在 Mac 端菜单栏或显示器菜单里把它切回 Windows。",

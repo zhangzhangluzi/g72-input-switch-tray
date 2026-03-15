@@ -47,6 +47,8 @@ let windowsMonitorAvailability = {
   status: "unknown",
   names: [],
   message: "",
+  owner: "unknown",
+  currentInputValue: null,
 };
 let windowsMonitorAvailabilityInFlight = false;
 let trayRebuildTimer = null;
@@ -189,7 +191,7 @@ function refreshMenu() {
   const windowsSharedMonitorMissing =
     process.platform === "win32" &&
     configErrors.length === 0 &&
-    windowsMonitorAvailability.status === "missing";
+    ["missing", "away"].includes(windowsMonitorAvailability.status);
   const windowsSharedMonitorMessage = windowsSharedMonitorMissing
     ? windowsMonitorAvailability.message ||
       `${state.config.monitorName || "共享屏"} 当前不在 Windows 侧，请到 Mac 端或显示器菜单切回。`
@@ -1190,10 +1192,14 @@ async function assertWindowsSharedMonitorAvailableForSwitch() {
   }
 
   const names = await getAvailableMonitorNames();
-  updateWindowsMonitorAvailability(names);
+  const availability = await updateWindowsMonitorAvailability(names);
 
-  if (doesMonitorListContainConfiguredMonitor(names, state.config.monitorName)) {
+  if (availability.status === "visible") {
     return;
+  }
+
+  if (availability.status === "away") {
+    throw new Error(availability.message || `${state.config.monitorName} 当前画面已交给另一台电脑。`);
   }
 
   const availableText = names.length > 0 ? names.join("、") : "<none>";
@@ -2479,34 +2485,39 @@ async function refreshWindowsMonitorAvailability() {
 
   try {
     const names = await getAvailableMonitorNames();
-    updateWindowsMonitorAvailability(names);
+    await updateWindowsMonitorAvailability(names);
   } finally {
     windowsMonitorAvailabilityInFlight = false;
   }
 }
 
-function updateWindowsMonitorAvailability(names) {
+async function updateWindowsMonitorAvailability(names) {
   const monitorNames = Array.isArray(names) ? names.filter(Boolean) : [];
-  const nextAvailability = createWindowsMonitorAvailabilitySnapshot(monitorNames);
+  const nextAvailability = await createWindowsMonitorAvailabilitySnapshot(monitorNames);
 
   if (
     windowsMonitorAvailability.status === nextAvailability.status &&
     windowsMonitorAvailability.message === nextAvailability.message &&
+    windowsMonitorAvailability.owner === nextAvailability.owner &&
+    windowsMonitorAvailability.currentInputValue === nextAvailability.currentInputValue &&
     windowsMonitorAvailability.names.join("\n") === nextAvailability.names.join("\n")
   ) {
-    return;
+    return windowsMonitorAvailability;
   }
 
   windowsMonitorAvailability = nextAvailability;
   refreshMenu();
+  return windowsMonitorAvailability;
 }
 
-function createWindowsMonitorAvailabilitySnapshot(monitorNames) {
+async function createWindowsMonitorAvailabilitySnapshot(monitorNames) {
   if (process.platform !== "win32") {
     return {
       status: "unknown",
       names: [],
       message: "",
+      owner: "unknown",
+      currentInputValue: null,
     };
   }
 
@@ -2515,22 +2526,65 @@ function createWindowsMonitorAvailabilitySnapshot(monitorNames) {
       status: "unknown",
       names: monitorNames,
       message: "",
+      owner: "unknown",
+      currentInputValue: null,
     };
   }
 
-  if (doesMonitorListContainConfiguredMonitor(monitorNames, state.config.monitorName)) {
+  if (!doesMonitorListContainConfiguredMonitor(monitorNames, state.config.monitorName)) {
+    const visibleText = monitorNames.length > 0 ? monitorNames.join("、") : "没有检测到任何显示器";
+    return {
+      status: "missing",
+      names: monitorNames,
+      message: `${state.config.monitorName} 当前不在 Windows 侧；现在看到的是 ${visibleText}。请到 Mac 端或显示器菜单切回。`,
+      owner: "unknown",
+      currentInputValue: null,
+    };
+  }
+
+  const currentInputResult = await getWindowsCurrentInputResult();
+  if (!currentInputResult.ok) {
     return {
       status: "visible",
       names: monitorNames,
       message: "",
+      owner: "unknown",
+      currentInputValue: null,
     };
   }
 
-  const visibleText = monitorNames.length > 0 ? monitorNames.join("、") : "没有检测到任何显示器";
+  const currentInputValue = currentInputResult.value;
+  const windowsExpectedValues = getExpectedProbeInputValues(getTarget("windows").inputValue);
+  const macExpectedValues = getExpectedProbeInputValues(getTarget("mac").inputValue);
+
+  if (windowsExpectedValues.includes(currentInputValue)) {
+    return {
+      status: "visible",
+      names: monitorNames,
+      message: "",
+      owner: "windows",
+      currentInputValue,
+    };
+  }
+
+  if (macExpectedValues.includes(currentInputValue)) {
+    return {
+      status: "away",
+      names: monitorNames,
+      message: `${state.config.monitorName} 仍然被 Windows 枚举到，但当前输入回报是 ${describeInputValue(
+        currentInputValue
+      )}，说明这块共享屏的画面已经交给 Mac 了。请在 Mac 端或显示器菜单里切回 Windows。`,
+      owner: "mac",
+      currentInputValue,
+    };
+  }
+
   return {
-    status: "missing",
+    status: "visible",
     names: monitorNames,
-    message: `${state.config.monitorName} 当前不在 Windows 侧；现在看到的是 ${visibleText}。请到 Mac 端或显示器菜单切回。`,
+    message: "",
+    owner: "unknown",
+    currentInputValue,
   };
 }
 
@@ -2596,17 +2650,12 @@ async function attemptPendingWindowsDesktopRestore() {
     return;
   }
 
-  if (getWindowsDisplayCount() >= 2) {
-    clearPendingWindowsDesktopRestore();
-    notify(`已检测到 ${state.config.monitorName} 回到 Windows，桌面已恢复为扩展显示。`);
-    return;
-  }
-
   windowsRestoreInFlight = true;
 
   try {
     const names = await getAvailableMonitorNames();
-    if (!doesMonitorListContainConfiguredMonitor(names, state.config.monitorName)) {
+    const availability = await updateWindowsMonitorAvailability(names);
+    if (availability.status !== "visible" || availability.owner === "mac") {
       return;
     }
 

@@ -65,11 +65,11 @@ function verifyWindowsMenuModel() {
 
   const hint = createWindowsSharedMonitorTransferHint({
     monitorName: "G72",
-    message: "G72 当前不在 Windows 侧；现在看到的是 G52 Max。请到 Mac 端或显示器菜单切回。",
+    message: "G72 仍然被 Windows 枚举到，但当前输入回报是 HDMI1 (17)，说明这块共享屏的画面已经交给 Mac 了。请在 Mac 端或显示器菜单里切回 Windows。",
   });
-  assert.equal(hint.message, "G72 当前不在 Windows 侧");
+  assert.equal(hint.message, "G72 当前已交给另一台电脑");
   assert.match(hint.detail, /谁当前拥有这块共享屏/);
-  assert.match(hint.detail, /G52 Max/);
+  assert.match(hint.detail, /已经交给 Mac/);
 
   assert.equal(
     doesMonitorListContainConfiguredMonitor(["G72 Max", "G52 Max"], "G72"),
