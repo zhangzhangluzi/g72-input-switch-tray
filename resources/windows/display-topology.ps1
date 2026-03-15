@@ -1,6 +1,8 @@
 param(
     [switch]$PrimaryOnly,
 
+    [switch]$ExtendAll,
+
     [switch]$Summary
 )
 
@@ -86,6 +88,7 @@ public static class NativeDisplayTopology
     private const int DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001;
     private const int DISPLAY_DEVICE_PRIMARY_DEVICE = 0x00000004;
     private const int ENUM_CURRENT_SETTINGS = -1;
+    private const int ENUM_REGISTRY_SETTINGS = -2;
     private const int DM_POSITION = 0x00000020;
     private const int DM_PELSWIDTH = 0x00080000;
     private const int DM_PELSHEIGHT = 0x00100000;
@@ -196,6 +199,42 @@ public static class NativeDisplayTopology
         }
     }
 
+    public static void SwitchToExtendedDesktop()
+    {
+        var displays = GetDisplays();
+        var activeDisplays = displays.FindAll(display => display.Attached);
+        if (activeDisplays.Count == 0)
+        {
+            throw new InvalidOperationException("No active desktop displays were found.");
+        }
+
+        var primaryDisplay = activeDisplays.Find(display => display.Primary) ?? activeDisplays[0];
+        int nextX = primaryDisplay.PositionX + Math.Max(primaryDisplay.Width, 1);
+        bool changed = false;
+
+        foreach (var display in displays)
+        {
+            if (display.Attached)
+            {
+                continue;
+            }
+
+            nextX += AttachDisplay(display.DeviceName, nextX, primaryDisplay.PositionY);
+            changed = true;
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        var finalResult = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+        if (finalResult != DISP_CHANGE_SUCCESSFUL)
+        {
+            throw new InvalidOperationException("Final display topology apply failed with code " + finalResult + ".");
+        }
+    }
+
     private static void ApplyPrimaryDisplay(string deviceName)
     {
         var mode = CreateDevMode();
@@ -250,6 +289,47 @@ public static class NativeDisplayTopology
         }
     }
 
+    private static int AttachDisplay(string deviceName, int positionX, int positionY)
+    {
+        var mode = CreateDevMode();
+        if (
+            !EnumDisplaySettingsEx(deviceName, ENUM_REGISTRY_SETTINGS, ref mode, 0) &&
+            !EnumDisplaySettingsEx(deviceName, ENUM_CURRENT_SETTINGS, ref mode, 0)
+        )
+        {
+            throw new InvalidOperationException("Failed to read stored mode for detached display " + deviceName + ".");
+        }
+
+        if (mode.dmPelsWidth <= 0)
+        {
+            mode.dmPelsWidth = 1920;
+        }
+
+        if (mode.dmPelsHeight <= 0)
+        {
+            mode.dmPelsHeight = 1080;
+        }
+
+        mode.dmFields |= DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+        mode.dmPosition.x = positionX;
+        mode.dmPosition.y = positionY;
+
+        var result = ChangeDisplaySettingsEx(
+            deviceName,
+            ref mode,
+            IntPtr.Zero,
+            (uint)(CDS_UPDATEREGISTRY | CDS_NORESET),
+            IntPtr.Zero
+        );
+
+        if (result != DISP_CHANGE_SUCCESSFUL)
+        {
+            throw new InvalidOperationException("Failed to attach display " + deviceName + " with code " + result + ".");
+        }
+
+        return mode.dmPelsWidth;
+    }
+
     private static DISPLAY_DEVICE CreateDisplayDevice()
     {
         var device = new DISPLAY_DEVICE();
@@ -277,6 +357,15 @@ try {
         Write-Output (@{
             ok = $true
             mode = "primary-only"
+        } | ConvertTo-Json -Compress)
+        exit 0
+    }
+
+    if ($ExtendAll) {
+        [NativeDisplayTopology]::SwitchToExtendedDesktop()
+        Write-Output (@{
+            ok = $true
+            mode = "extend-all"
         } | ConvertTo-Json -Compress)
         exit 0
     }

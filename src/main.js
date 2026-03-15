@@ -2766,16 +2766,31 @@ async function prepareWindowsDesktopForIncomingOwnership() {
 
   try {
     await runWindowsDisplaySwitch("/extend");
+    await waitForDisplayCount(2, "Windows 预热共享屏输出后仍没有恢复到扩展显示。");
   } catch (error) {
-    appendDiagnosticLog("Failed to prime Windows shared display path", error);
-    return {
-      prepared: false,
-      detail: error.message,
-    };
+    appendDiagnosticLog("DisplaySwitch /extend did not restore Windows shared display path; trying topology helper", error);
+
+    try {
+      const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
+      await runCommand("powershell.exe", [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        topologyScriptPath,
+        "-ExtendAll",
+      ]);
+      await waitForDisplayCount(2, "Windows 预热共享屏输出后仍没有恢复到扩展显示。");
+    } catch (fallbackError) {
+      appendDiagnosticLog("Failed to prime Windows shared display path", fallbackError);
+      return {
+        prepared: false,
+        detail: fallbackError.message,
+      };
+    }
   }
 
   try {
-    await delay(1000);
     const names = await getAvailableMonitorNames();
     const availability = await updateWindowsMonitorAvailability(names);
     return {
