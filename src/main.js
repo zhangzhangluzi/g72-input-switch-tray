@@ -31,6 +31,7 @@ const PEER_DISCOVERY_STALE_MS = 15000;
 const PEER_CONFIRMATION_TIMEOUT_MS = 4000;
 const PEER_CONFIRMATION_POLL_MS = 250;
 const LOCAL_HANDOFF_INFERENCE_WINDOW_MS = 10 * 60 * 1000;
+const MANUAL_HANDOFF_TIMEOUT_MS = 30 * 1000;
 const TARGET_IDS = ["windows", "mac"];
 const COMMON_INPUT_VALUES = [
   { value: 15, label: "15: DP1" },
@@ -69,6 +70,8 @@ let trayHealthTimer = null;
 let explorerSignature = null;
 let sharedMonitorOwnership = createDefaultOwnershipSnapshot();
 let discoveredPeers = new Map();
+let manualSessionTimer = null;
+let manualSessionInFlight = false;
 let state = createDefaultState();
 
 // Suppress noisy Chromium network-change logs on some Windows systems.
@@ -127,6 +130,11 @@ app.on("before-quit", () => {
     ownershipRefreshTimer = null;
   }
 
+  if (manualSessionTimer) {
+    clearInterval(manualSessionTimer);
+    manualSessionTimer = null;
+  }
+
   if (peerDiscoveryTimer) {
     clearInterval(peerDiscoveryTimer);
     peerDiscoveryTimer = null;
@@ -154,6 +162,7 @@ app.whenReady().then(() => {
   startWindowsTrayWatcher();
   startPeerDiscovery();
   startOwnershipWatcher();
+  startManualSessionWatcher();
   createTray();
   refreshMenu();
 });
@@ -258,9 +267,7 @@ function refreshMenu() {
       click: () => handleTraySwitch(item.targetId),
     };
   });
-  const manualHandoffTargetId = getManualHandoffTargetIdForCurrentPlatform();
-  const manualHandoffDisabledReason = getManualHandoffDisabledReason();
-  const manualHandoffTarget = manualHandoffTargetId ? getTarget(manualHandoffTargetId) : null;
+  const manualHandoffContext = getManualHandoffContextForCurrentPlatform();
 
   const menu = Menu.buildFromTemplate([
     {
@@ -301,6 +308,14 @@ function refreshMenu() {
           },
         ]
       : []),
+    ...(state.manualSession.active
+      ? [
+          {
+            label: `手动交接：等待 ${getManualSessionRemainingSeconds()} 秒内完成`,
+            enabled: false,
+          },
+        ]
+      : []),
     ...(state.lastSwitchOutcome.status === "error" && state.lastSwitchOutcome.message
       ? [
           {
@@ -329,17 +344,17 @@ function refreshMenu() {
     },
     { type: "separator" },
     ...switchMenuItems,
-    ...(manualHandoffTarget
+    ...(manualHandoffContext.targetId
       ? [
           {
-            label: `手动切源辅助：交给 ${manualHandoffTarget.label}`,
-            enabled: !manualHandoffDisabledReason && configErrors.length === 0,
+            label: `手动切源辅助：${manualHandoffContext.buttonLabel}`,
+            enabled: !manualHandoffContext.disabledReason && configErrors.length === 0,
             click: () => handleTrayManualHandoff(),
           },
-          ...(manualHandoffDisabledReason
+          ...(manualHandoffContext.disabledReason
             ? [
                 {
-                  label: manualHandoffDisabledReason,
+                  label: manualHandoffContext.disabledReason,
                   enabled: false,
                 },
               ]
@@ -442,6 +457,8 @@ async function switchMonitor(targetId, options = {}) {
   }
 
   try {
+    resetManualSessionState();
+
     if (process.platform === "win32") {
       await switchOnWindows(targetId, target);
     } else if (process.platform === "darwin") {
@@ -503,17 +520,20 @@ async function prepareManualHandoff(targetId, options = {}) {
   }
 
   try {
-    let message = "";
-
-    if (process.platform === "win32") {
-      message = await prepareManualHandoffOnWindows(targetId, target);
-    } else if (process.platform === "darwin") {
-      message = await prepareManualHandoffOnMac(targetId, target);
-    } else {
-      throw new Error(`当前平台不受支持：${process.platform}`);
-    }
+    const plan = resolveManualHandoffPlan(targetId);
+    const result =
+      plan.kind === "transfer"
+        ? await prepareManualTransfer(plan, target)
+        : await prepareManualReceive(plan, target);
+    const message = result.message;
 
     state.macInputProbe = createMacInputProbeResult();
+    state.manualSession = createManualSessionState({
+      kind: plan.kind,
+      expectedOwnerTargetId: plan.expectedOwnerTargetId,
+      sourceTargetId: plan.sourceTargetId,
+      localAction: result.localAction,
+    });
     state.lastSwitchOutcome = createSwitchOutcome({
       status: "success",
       targetId,
@@ -543,6 +563,78 @@ async function prepareManualHandoff(targetId, options = {}) {
 
     throw userFacingError;
   }
+}
+
+function resolveManualHandoffPlan(targetId) {
+  const localTargetId = getLocalPlatformTargetId();
+  const parsedTargetId = parseTargetId(targetId);
+
+  if (!localTargetId) {
+    throw new Error("当前平台没有实现手动切源辅助。");
+  }
+
+  if (!parsedTargetId) {
+    throw new Error("当前没有可用的手动交接目标。");
+  }
+
+  if (state.manualSession.active) {
+    throw new Error(`当前有一笔手动交接正在等待完成（剩余 ${getManualSessionRemainingSeconds()} 秒）。`);
+  }
+
+  const currentOwnerTargetId = getCurrentOwnerTargetId();
+  if (!currentOwnerTargetId) {
+    throw new Error("当前共享屏归属未知，请先看哪台电脑正在显示 G72，再在对应一侧点移交、另一侧点接收。");
+  }
+
+  if (parsedTargetId === localTargetId) {
+    if (currentOwnerTargetId === localTargetId) {
+      throw new Error(`共享屏已经在 ${getTarget(localTargetId).label} 侧，不需要点接收。`);
+    }
+
+    return {
+      kind: "receive",
+      localTargetId,
+      targetId: parsedTargetId,
+      sourceTargetId: currentOwnerTargetId,
+      expectedOwnerTargetId: localTargetId,
+    };
+  }
+
+  if (currentOwnerTargetId !== localTargetId) {
+    throw new Error("当前共享屏不在这台主机手里，这边不能点移交；请在当前持有画面的那一侧点移交。");
+  }
+
+  return {
+    kind: "transfer",
+    localTargetId,
+    targetId: parsedTargetId,
+    sourceTargetId: localTargetId,
+    expectedOwnerTargetId: parsedTargetId,
+  };
+}
+
+async function prepareManualTransfer(plan, target) {
+  if (process.platform === "win32") {
+    return prepareManualTransferOnWindows(plan, target);
+  }
+
+  if (process.platform === "darwin") {
+    return prepareManualTransferOnMac(plan, target);
+  }
+
+  throw new Error(`当前平台不受支持：${process.platform}`);
+}
+
+async function prepareManualReceive(plan, target) {
+  if (process.platform === "win32") {
+    return prepareManualReceiveOnWindows(plan, target);
+  }
+
+  if (process.platform === "darwin") {
+    return prepareManualReceiveOnMac(plan, target);
+  }
+
+  throw new Error(`当前平台不受支持：${process.platform}`);
 }
 
 async function switchOnWindows(targetId, target) {
@@ -610,21 +702,27 @@ async function switchOnWindows(targetId, target) {
   }
 }
 
-async function prepareManualHandoffOnWindows(targetId, target) {
-  if (targetId !== "mac") {
-    throw new Error(`Windows 当前只支持把共享屏手动交给 ${getTarget("mac").label}。`);
-  }
-
+async function prepareManualTransferOnWindows(plan, target) {
   await assertWindowsSharedMonitorAvailableForSwitch();
   const attachedDisplayCountBeforeHandoff = await getCurrentWindowsAttachedDisplayCount();
 
   if (shouldUseWindowsDisplayHandoff(state.config)) {
     await handOffWindowsDesktop();
     markPendingWindowsDesktopRestore(attachedDisplayCountBeforeHandoff);
-    return `Windows 本机已准备好手动交接，并已把桌面退回主显示器。现在请直接用显示器按键把 ${state.config.monitorName} 切到 ${target.label}。`;
+    return {
+      message: `Windows 已准备好手动移交，并已把桌面退回主显示器。现在请到 ${getTarget(
+        plan.targetId
+      ).label} 那一侧点击“接收”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
+      localAction: "windows_transfer",
+    };
   }
 
-  return `Windows 本机已准备好手动交接。现在请直接用显示器按键把 ${state.config.monitorName} 切到 ${target.label}。`;
+  return {
+    message: `Windows 已准备好手动移交。现在请到 ${getTarget(
+      plan.targetId
+    ).label} 那一侧点击“接收”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
+    localAction: "windows_transfer",
+  };
 }
 
 function switchOnMac(targetId, target) {
@@ -659,15 +757,36 @@ function switchOnMac(targetId, target) {
   });
 }
 
-async function prepareManualHandoffOnMac(targetId, target) {
-  if (targetId !== "windows") {
-    throw new Error(`macOS 当前只支持把共享屏手动交给 ${getTarget("windows").label}。`);
+async function prepareManualTransferOnMac(plan, target) {
+  return {
+    message: `Mac 已准备好手动移交。现在请到 ${getTarget(
+      plan.targetId
+    ).label} 那一侧点击“接收”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
+    localAction: "none",
+  };
+}
+
+async function prepareManualReceiveOnWindows(plan, target) {
+  const result = await prepareWindowsDesktopForIncomingOwnership();
+  if (!result.prepared) {
+    throw new Error(result.detail || `Windows 没有准备好接收 ${target.label}。`);
   }
 
-  const peerPrepared = await preparePeerForIncomingOwnership(targetId);
-  return peerPrepared
-    ? `已通知 Windows 预热共享屏输出。现在请直接用显示器按键把 ${state.config.monitorName} 切到 ${target.label}。`
-    : `当前没有可协同的 Windows 客户端在线，但这不影响手动切源。现在请直接用显示器按键把 ${state.config.monitorName} 切到 ${target.label}。`;
+  return {
+    message: `Windows 已准备好接收。现在请回到 ${getTarget(
+      plan.sourceTargetId
+    ).label} 那一侧点击“移交”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
+    localAction: "windows_receive",
+  };
+}
+
+async function prepareManualReceiveOnMac(plan, target) {
+  return {
+    message: `Mac 已准备好接收。现在请回到 ${getTarget(
+      plan.sourceTargetId
+    ).label} 那一侧点击“移交”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
+    localAction: "none",
+  };
 }
 
 function createUserFacingSwitchError(targetId, error) {
@@ -2011,35 +2130,29 @@ function renderMonitorDiagnostics(diagnostics) {
 }
 
 function renderManualHandoffCard() {
-  const targetId = getManualHandoffTargetIdForCurrentPlatform();
-  if (!targetId) {
-    return "";
-  }
+  const context = getManualHandoffContextForCurrentPlatform();
 
-  const target = getTarget(targetId);
   const canPrepare = canPrepareManualHandoffForCurrentPlatform();
-  const formAction = `/api/${encodeURIComponent(state.controlToken)}/manual/${encodeURIComponent(targetId)}`;
-  const introText =
-    process.platform === "win32"
-      ? `当自动切源不稳定时，先让软件在 Windows 侧完成本机桌面交接，再由你按显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`
-      : `当自动切源不稳定时，先让软件通知 Windows 预热输出，再由你按显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`;
-  const disabledReason = getManualHandoffDisabledReason();
-  const buttonLabel =
-    process.platform === "win32"
-      ? `准备手动交给 ${target.label}`
-      : `准备手动交还给 ${target.label}`;
+  const sessionHelp = state.manualSession.active
+    ? `当前有一笔手动交接在等待完成，剩余 ${getManualSessionRemainingSeconds()} 秒；超过 30 秒会自动回收本机这边已经做过的准备动作。`
+    : "这一步不会假装“已经切源成功”，它只负责把当前这台主机该做的准备动作先做掉。";
+  const formHtml = context.targetId
+    ? `<form method="post" action="/api/${encodeURIComponent(state.controlToken)}/manual/${encodeURIComponent(
+        context.targetId
+      )}" style="margin-top: 14px;">
+        <button type="submit"${canPrepare ? "" : " disabled"}>${escapeHtml(context.buttonLabel)}</button>
+      </form>`
+    : "";
 
   return `<div class="card soft">
     <div class="section-title">手动切源辅助</div>
-    <div class="help" style="margin-top: 12px;">${escapeHtml(introText)}</div>
+    <div class="help" style="margin-top: 12px;">${escapeHtml(context.introText)}</div>
     <div class="help">${
       canPrepare
-        ? "这一步不会假装“已经切源成功”，它只负责把当前这台主机该做的准备动作先做掉。"
-        : escapeHtml(disabledReason)
+        ? escapeHtml(sessionHelp)
+        : escapeHtml(context.disabledReason)
     }</div>
-    <form method="post" action="${formAction}" style="margin-top: 14px;">
-      <button type="submit"${canPrepare ? "" : " disabled"}>${escapeHtml(buttonLabel)}</button>
-    </form>
+    ${formHtml}
   </div>`;
 }
 
@@ -2492,38 +2605,81 @@ function getLocalPlatformTargetId() {
 }
 
 function getManualHandoffTargetIdForCurrentPlatform() {
-  const localTargetId = getLocalPlatformTargetId();
-  if (localTargetId === "windows") {
-    return "mac";
-  }
-
-  if (localTargetId === "mac") {
-    return "windows";
-  }
-
-  return null;
+  return getManualHandoffContextForCurrentPlatform().targetId;
 }
 
-function getManualHandoffDisabledReason() {
+function getManualHandoffContextForCurrentPlatform() {
   const localTargetId = getLocalPlatformTargetId();
   if (!localTargetId) {
-    return "当前平台没有实现手动切源辅助。";
+    return {
+      action: null,
+      targetId: null,
+      introText: "",
+      buttonLabel: "",
+      disabledReason: "当前平台没有实现手动切源辅助。",
+    };
+  }
+
+  if (state.manualSession.active) {
+    return {
+      action: null,
+      targetId: state.manualSession.expectedOwnerTargetId,
+      introText: "当前已有一笔手动交接在等待完成或超时回收。",
+      buttonLabel: "手动交接进行中",
+      disabledReason: `当前有一笔手动交接正在等待完成（剩余 ${getManualSessionRemainingSeconds()} 秒）。`,
+    };
   }
 
   const currentOwnerTargetId = getCurrentOwnerTargetId();
-  if (currentOwnerTargetId && currentOwnerTargetId !== localTargetId) {
-    return "当前共享屏不在这台主机手里，所以这里不能替另一台电脑做交接准备。";
+  if (!currentOwnerTargetId) {
+    return {
+      action: null,
+      targetId: null,
+      introText: "这套手动模式现在改成了“双端分别点击”：当前持有画面的这侧点“移交”，另一侧点“接收”。",
+      buttonLabel: "",
+      disabledReason: "当前共享屏归属未知，请先看哪台电脑正在显示 G72，再在对应一侧点移交、另一侧点接收。",
+    };
   }
 
-  if (process.platform === "win32" && ["missing", "away"].includes(windowsMonitorAvailability.status)) {
-    return `${state.config.monitorName} 当前不在 Windows 侧，不能从这边准备把它交出去。`;
+  if (currentOwnerTargetId === localTargetId) {
+    const targetId = localTargetId === "windows" ? "mac" : "windows";
+    return {
+      action: "transfer",
+      targetId,
+      introText: `当前这台主机持有 G72。先在这里点击“移交”，再去 ${getTarget(
+        targetId
+      ).label} 那一侧点击“接收”，最后用显示器按钮完成切源。`,
+      buttonLabel: `准备移交给 ${getTarget(targetId).label}`,
+      disabledReason: "",
+    };
   }
 
-  return "";
+  return {
+    action: "receive",
+    targetId: localTargetId,
+    introText: `当前这台主机不持有 G72。先在这里点击“接收”，让本机把共享屏接入逻辑准备好；然后回到 ${getTarget(
+      currentOwnerTargetId
+    ).label} 那一侧点击“移交”，最后再用显示器按钮切源。`,
+    buttonLabel: `准备接收来自 ${getTarget(currentOwnerTargetId).label}`,
+    disabledReason: "",
+  };
+}
+
+function getManualHandoffDisabledReason() {
+  return getManualHandoffContextForCurrentPlatform().disabledReason;
 }
 
 function canPrepareManualHandoffForCurrentPlatform() {
-  return !getManualHandoffDisabledReason();
+  return Boolean(getManualHandoffContextForCurrentPlatform().action) && !getManualHandoffDisabledReason();
+}
+
+function getManualSessionRemainingSeconds() {
+  const expiresAt = Date.parse(state.manualSession.expiresAt || "");
+  if (!Number.isFinite(expiresAt)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
 }
 
 function getCurrentOwnershipMenuLabel() {
@@ -3283,6 +3439,100 @@ function startOwnershipWatcher() {
   ownershipRefreshTimer = setInterval(() => {
     void refreshSharedMonitorOwnership();
   }, 5000);
+}
+
+function startManualSessionWatcher() {
+  void tickManualSession();
+  manualSessionTimer = setInterval(() => {
+    void tickManualSession();
+  }, 1000);
+}
+
+async function tickManualSession() {
+  if (!state.manualSession.active || manualSessionInFlight) {
+    return;
+  }
+
+  manualSessionInFlight = true;
+
+  try {
+    const snapshot = await getEffectiveOwnershipSnapshot();
+    if (snapshot.owner === state.manualSession.expectedOwnerTargetId) {
+      finishManualSession(
+        "success",
+        `已检测到 ${state.config.monitorName} 完成手动${state.manualSession.kind === "transfer" ? "移交" : "接收"}，当前归属：${getTarget(
+          state.manualSession.expectedOwnerTargetId
+        ).label}。`,
+        state.manualSession.expectedOwnerTargetId,
+        { notifyUser: true }
+      );
+      return;
+    }
+
+    const expiresAt = Date.parse(state.manualSession.expiresAt || "");
+    if (!Number.isFinite(expiresAt) || Date.now() < expiresAt) {
+      return;
+    }
+
+    await handleManualSessionTimeout(snapshot);
+  } finally {
+    manualSessionInFlight = false;
+  }
+}
+
+async function handleManualSessionTimeout(snapshot) {
+  const session = state.manualSession;
+  const expectedOwnerTargetId = parseTargetId(session.expectedOwnerTargetId);
+  if (!session.active || !expectedOwnerTargetId) {
+    finishManualSession("error", "手动交接已超时，当前会话已取消。", null, {
+      notifyUser: true,
+    });
+    return;
+  }
+
+  let message = `手动${session.kind === "transfer" ? "移交" : "接收"}超时，已取消本次准备。`;
+
+  if (process.platform === "win32" && session.localAction === "windows_transfer") {
+    try {
+      await restoreWindowsDesktopToTargetMonitor();
+      clearPendingWindowsDesktopRestore();
+      message = "手动移交超时，Windows 已恢复扩展显示。";
+    } catch (error) {
+      message = `手动移交超时，但 Windows 自动恢复失败：${normalizeText(error.message) || "未知错误"}`;
+    }
+  } else if (
+    process.platform === "win32" &&
+    session.localAction === "windows_receive" &&
+    snapshot.owner !== expectedOwnerTargetId
+  ) {
+    try {
+      await handOffWindowsDesktop();
+      markPendingWindowsDesktopRestore(state.windowsDesktop.expectedAttachedDisplayCount);
+      message = "手动接收超时，Windows 已回退到仅主屏，继续等待共享屏回来。";
+    } catch (error) {
+      message = `手动接收超时，但 Windows 回退失败：${normalizeText(error.message) || "未知错误"}`;
+    }
+  }
+
+  finishManualSession("error", message, expectedOwnerTargetId, {
+    notifyUser: true,
+  });
+}
+
+function finishManualSession(status, message, targetId, { notifyUser = false } = {}) {
+  state.manualSession = createDefaultManualSessionState();
+  state.lastSwitchOutcome = createSwitchOutcome({
+    status,
+    targetId,
+    mode: "manual_prep",
+    message,
+  });
+  saveState(state);
+  refreshMenu();
+
+  if (notifyUser && message) {
+    notify(message);
+  }
 }
 
 async function refreshSharedMonitorOwnership() {
@@ -4137,6 +4387,7 @@ function createDefaultState() {
     controlToken: crypto.randomBytes(12).toString("hex"),
     peerToken: crypto.randomBytes(12).toString("hex"),
     windowsDesktop: createDefaultWindowsDesktopState(),
+    manualSession: createDefaultManualSessionState(),
     lastSwitchOutcome: createSwitchOutcome(),
     macInputProbe: createMacInputProbeResult(),
     config: createDefaultConfig(),
@@ -4148,6 +4399,45 @@ function createDefaultWindowsDesktopState() {
     pendingRestore: false,
     expectedAttachedDisplayCount: 0,
   };
+}
+
+function createDefaultManualSessionState() {
+  return {
+    active: false,
+    kind: "idle",
+    expectedOwnerTargetId: null,
+    sourceTargetId: null,
+    localAction: "none",
+    expiresAt: "",
+    updatedAt: "",
+  };
+}
+
+function createManualSessionState({
+  kind = "idle",
+  expectedOwnerTargetId = null,
+  sourceTargetId = null,
+  localAction = "none",
+} = {}) {
+  return {
+    active: kind === "transfer" || kind === "receive",
+    kind: ["transfer", "receive"].includes(kind) ? kind : "idle",
+    expectedOwnerTargetId: parseTargetId(expectedOwnerTargetId),
+    sourceTargetId: parseTargetId(sourceTargetId),
+    localAction: ["none", "windows_transfer", "windows_receive"].includes(localAction)
+      ? localAction
+      : "none",
+    expiresAt: new Date(Date.now() + MANUAL_HANDOFF_TIMEOUT_MS).toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function resetManualSessionState() {
+  if (!state.manualSession.active) {
+    return;
+  }
+
+  state.manualSession = createDefaultManualSessionState();
 }
 
 function createDefaultConfig() {
@@ -4222,6 +4512,7 @@ function normalizeState(nextState) {
         0
       ),
     },
+    manualSession: normalizeManualSessionState(nextState.manualSession, defaults.manualSession),
     lastSwitchOutcome: createSwitchOutcome(nextState.lastSwitchOutcome),
     macInputProbe: normalizeMacInputProbeState(nextState.macInputProbe, defaults.macInputProbe),
     config: {
@@ -4243,6 +4534,25 @@ function normalizeState(nextState) {
         },
       },
     },
+  };
+}
+
+function normalizeManualSessionState(nextSession, fallbackSession) {
+  const normalizedKind = normalizeText(nextSession?.kind);
+  const normalizedLocalAction = normalizeText(nextSession?.localAction);
+
+  return {
+    active: Boolean(nextSession?.active),
+    kind: ["idle", "transfer", "receive"].includes(normalizedKind)
+      ? normalizedKind
+      : fallbackSession.kind,
+    expectedOwnerTargetId: parseTargetId(nextSession?.expectedOwnerTargetId),
+    sourceTargetId: parseTargetId(nextSession?.sourceTargetId),
+    localAction: ["none", "windows_transfer", "windows_receive"].includes(normalizedLocalAction)
+      ? normalizedLocalAction
+      : fallbackSession.localAction,
+    expiresAt: normalizeText(nextSession?.expiresAt),
+    updatedAt: normalizeText(nextSession?.updatedAt),
   };
 }
 
