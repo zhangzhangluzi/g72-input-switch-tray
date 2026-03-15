@@ -352,6 +352,7 @@ async function switchMonitor(targetId, options = {}) {
     }
 
     state.lastTarget = targetId;
+    state.macInputProbe = createMacInputProbeResult();
     saveState(state);
     refreshMenu();
 
@@ -383,9 +384,10 @@ async function switchOnWindows(targetId, target) {
 
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
   const candidates = getInputCandidates(target);
+  const expectedValues = getExpectedProbeInputValues(target.inputValue);
 
-  await runCandidateSequence(candidates, (candidate) =>
-    runCommand("powershell.exe", [
+  await runCandidateSequence(candidates, async (candidate) => {
+    await runCommand("powershell.exe", [
       "-NoProfile",
       "-ExecutionPolicy",
       "Bypass",
@@ -395,8 +397,9 @@ async function switchOnWindows(targetId, target) {
       state.config.monitorName,
       "-InputValue",
       String(candidate),
-    ])
-  );
+    ]);
+    await verifyWindowsSwitchOutcome(targetId, target, expectedValues);
+  });
 
   if (useDisplayHandoff && targetId !== "windows") {
     await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
@@ -441,7 +444,7 @@ function formatSwitchErrorMessage(targetId, rawMessage) {
   }
 
   if (process.platform === "win32") {
-    return formatWindowsSwitchErrorMessage(rawMessage);
+    return formatWindowsSwitchErrorMessage(targetId, rawMessage);
   }
 
   return rawMessage;
@@ -471,7 +474,7 @@ function formatMacSwitchErrorMessage(targetId, rawMessage) {
   return rawMessage;
 }
 
-function formatWindowsSwitchErrorMessage(rawMessage) {
+function formatWindowsSwitchErrorMessage(targetId, rawMessage) {
   const missingMonitorMatch = /^No monitor matched '([^']+)'\. Available monitors: (.+)$/i.exec(rawMessage);
   if (missingMonitorMatch) {
     const requestedName = missingMonitorMatch[1];
@@ -492,6 +495,25 @@ function formatWindowsSwitchErrorMessage(rawMessage) {
   const setInputFailedMatch = /^Setting VCP 0x60 to value ([0-9]+) failed for '([^']+)'\.$/i.exec(rawMessage);
   if (setInputFailedMatch) {
     return `Windows 已找到“${setInputFailedMatch[2]}”，但显示器拒绝了输入值 ${setInputFailedMatch[1]}。请确认 DDC/CI 已开启，并检查模式 A / 模式 B 的输入值是否填对。`;
+  }
+
+  const windowsMismatchMatch = /^Windows 已发送输入切换命令，但当前输入仍是 ([0-9]+)，未匹配目标值集合：([0-9 ]+)$/u.exec(
+    rawMessage
+  );
+  if (windowsMismatchMatch) {
+    const currentValue = Number.parseInt(windowsMismatchMatch[1], 10);
+    const expectedValues = windowsMismatchMatch[2].trim().split(/\s+/).join(" / ");
+    const target = getTarget(targetId);
+    return `Windows 已把切换命令发给 ${state.config.monitorName}，但这块共享屏仍停留在 ${describeInputValue(
+      currentValue
+    )}。这通常说明 ${target.label} 的输入值还没配对，或者目标设备当前没有稳定可切入的信号。请先确认目标设备正在输出画面，再检查设置页里的输入值配置。当前候选集合：${expectedValues}。`;
+  }
+
+  const windowsVerificationMatch = /^Windows 已发送输入切换命令，但还没有确认 (.+) 是否真正接管了共享屏。$/u.exec(
+    rawMessage
+  );
+  if (windowsVerificationMatch) {
+    return `Windows 已发出切换命令，但暂时还没确认 ${windowsVerificationMatch[1]} 是否真正接管了共享屏。请确认目标设备正在输出画面，并检查显示器名称、DDC/CI 与输入值配置。`;
   }
 
   if (/^Failed\.?$/i.test(rawMessage)) {
@@ -764,6 +786,7 @@ async function handleConfigSave(request, response, requestUrl) {
   }
 
   state.config = config;
+  state.macInputProbe = createMacInputProbeResult();
   saveState(state);
   refreshMenu();
   if (process.platform === "win32") {
@@ -1210,16 +1233,7 @@ async function getMonitorDiagnostics() {
       monitorName,
       "-ReadCapabilities",
     ]),
-    runCommand("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      scriptPath,
-      "-MonitorName",
-      monitorName,
-      "-ReadInputValue",
-    ]),
+    getWindowsCurrentInputResult(monitorName),
   ]);
 
   if (capabilitiesResult.status === "fulfilled") {
@@ -1234,14 +1248,8 @@ async function getMonitorDiagnostics() {
   }
 
   if (currentInputResult.status === "fulfilled") {
-    try {
-      const parsed = JSON.parse(currentInputResult.value);
-      diagnostics.currentInputValue = Number.isInteger(parsed.currentInputValue)
-        ? parsed.currentInputValue
-        : null;
-    } catch (error) {
-      diagnostics.currentInputError = error.message;
-    }
+    diagnostics.currentInputValue = currentInputResult.value.ok ? currentInputResult.value.value : null;
+    diagnostics.currentInputError = currentInputResult.value.ok ? null : currentInputResult.value.error;
   } else {
     diagnostics.currentInputError = currentInputResult.reason?.message || "读取失败";
   }
@@ -1636,7 +1644,7 @@ function renderMacProbeAssistant(macProbeDiagnostics) {
   const canApplyProbe = Boolean(
     lastProbe &&
       Number.isInteger(lastProbe.candidate) &&
-      ["matched", "different", "inconclusive"].includes(lastProbe.status) &&
+      ["matched", "inconclusive"].includes(lastProbe.status) &&
       parseTargetId(lastProbe.targetId)
   );
 
@@ -2015,6 +2023,109 @@ async function runCandidateSequence(candidates, runCandidate) {
   if (lastError) {
     throw lastError;
   }
+}
+
+async function getWindowsCurrentInputResult(monitorName = state.config.monitorName) {
+  if (process.platform !== "win32") {
+    return {
+      ok: false,
+      value: null,
+      error: "当前平台不支持 Windows 输入值读取。",
+    };
+  }
+
+  const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
+
+  try {
+    const output = await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-MonitorName",
+      monitorName,
+      "-ReadInputValue",
+    ]);
+    const parsed = JSON.parse(output);
+    const parsedValue = Number.isInteger(parsed?.currentInputValue) ? parsed.currentInputValue : NaN;
+
+    if (!Number.isInteger(parsedValue)) {
+      throw new Error(`无法从 Windows 输入探测输出里解析输入值：${output}`);
+    }
+
+    return {
+      ok: true,
+      value: parsedValue,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      value: null,
+      error: error.message,
+    };
+  }
+}
+
+async function verifyWindowsSwitchOutcome(targetId, target, expectedValues) {
+  const startedAt = Date.now();
+  let lastObservedValue = null;
+  let lastErrorMessage = "";
+  let missingSince = 0;
+
+  while (Date.now() - startedAt < 3000) {
+    const names = await getAvailableMonitorNames();
+    updateWindowsMonitorAvailability(names);
+
+    if (!doesMonitorListContainConfiguredMonitor(names, state.config.monitorName)) {
+      if (targetId !== "windows") {
+        if (!missingSince) {
+          missingSince = Date.now();
+        }
+
+        if (Date.now() - missingSince >= 1000) {
+          return;
+        }
+
+        await delay(250);
+        continue;
+      }
+
+      lastErrorMessage = `No monitor matched '${state.config.monitorName}'. Available monitors: ${
+        names.length > 0 ? names.join(", ") : "<none>"
+      }`;
+      await delay(250);
+      continue;
+    }
+
+    missingSince = 0;
+    const currentInputResult = await getWindowsCurrentInputResult();
+    if (currentInputResult.ok) {
+      if (expectedValues.includes(currentInputResult.value)) {
+        return;
+      }
+
+      lastObservedValue = currentInputResult.value;
+      lastErrorMessage = "";
+    } else {
+      lastErrorMessage = currentInputResult.error;
+    }
+
+    await delay(250);
+  }
+
+  if (Number.isInteger(lastObservedValue)) {
+    throw new Error(
+      `Windows 已发送输入切换命令，但当前输入仍是 ${lastObservedValue}，未匹配目标值集合：${expectedValues.join(
+        " "
+      )}`
+    );
+  }
+
+  throw new Error(
+    lastErrorMessage || `Windows 已发送输入切换命令，但还没有确认 ${target.label} 是否真正接管了共享屏。`
+  );
 }
 
 function shouldAbortCandidateRetries(error) {
