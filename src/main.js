@@ -30,6 +30,7 @@ const PEER_DISCOVERY_INTERVAL_MS = 2000;
 const PEER_DISCOVERY_STALE_MS = 15000;
 const PEER_CONFIRMATION_TIMEOUT_MS = 4000;
 const PEER_CONFIRMATION_POLL_MS = 250;
+const LOCAL_HANDOFF_INFERENCE_WINDOW_MS = 10 * 60 * 1000;
 const TARGET_IDS = ["windows", "mac"];
 const COMMON_INPUT_VALUES = [
   { value: 15, label: "15: DP1" },
@@ -261,6 +262,10 @@ function refreshMenu() {
   const menu = Menu.buildFromTemplate([
     {
       label: `当前所有权：${getCurrentOwnershipMenuLabel()}`,
+      enabled: false,
+    },
+    {
+      label: `版本：v${app.getVersion()}`,
       enabled: false,
     },
     {
@@ -759,6 +764,7 @@ async function handleControlRequest(request, response) {
     return writeJson(response, 200, {
       ok: true,
       appName: APP_NAME,
+      version: app.getVersion(),
       lastTarget: state.lastTarget,
       monitorName: state.config.monitorName,
       ownership,
@@ -784,6 +790,7 @@ async function handleControlRequest(request, response) {
       ok: true,
       lastTarget: state.lastTarget,
       currentLabel: getCurrentTargetLabel(),
+      version: app.getVersion(),
       ownership,
       config: state.config,
     });
@@ -1589,7 +1596,7 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
 </head>
 <body>
   <main>
-    <div class="eyebrow">Local Setup</div>
+    <div class="eyebrow">Local Setup · v${escapeHtml(app.getVersion())}</div>
     <h1>${escapeHtml(APP_NAME)} 设置</h1>
     <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。下面的“共享屏当前归属”会尽量显示实时所有权；“最近切换请求”只保留历史动作，不再代表当前画面归属。</p>
     <div class="stack">
@@ -1818,7 +1825,7 @@ function renderPeerStatusCard() {
 
   return `<div class="card soft">
     <div class="section-title">双端协同</div>
-    <div class="help" style="margin-top: 12px;">应用会自动在局域网里发现另一台运行中的客户端，并在本地读值不稳定时自动向对端确认 G72 当前归属，不需要手填地址。</div>
+    <div class="help" style="margin-top: 12px;">局域网协同只是增强确认，不是唯一依据。就算局域网不通，应用也会优先按本机输入回读和本机显示拓扑判断 G72 当前归属；只有本机判断不够可靠时，才会用局域网里的对端状态来补强。</div>
     <div class="help">${getPeerDiscoveryStatusText()}</div>
     <div class="help" style="margin-top: 12px;">当前已发现的对端</div>
     <div class="tip-list">${discoveredPeersHtml}</div>
@@ -1848,14 +1855,14 @@ function getPeerDiscoveryStatusText() {
   const candidates = getActivePeerCandidates();
   if (candidates.length === 1) {
     const peer = candidates[0];
-    return `已自动识别到对端：${peer.hostName || peer.address}（${peer.platform}）。切换失败时，本机会优先拿它的实时归属结果来做二次确认。`;
+    return `已自动识别到对端：${peer.hostName || peer.address}（${peer.platform}）。当本机判断不够确定时，会用它的实时归属结果做二次确认。`;
   }
 
   if (candidates.length > 1) {
     return "检测到了多个可能的对端候选。当前不会随便选一台来确认归属，避免把别的机器误认成共享屏伙伴。";
   }
 
-  return "还没发现可自动配对的对端，所以当前仍以本机读值为主。";
+  return "当前没有可自动配对的对端，所以只按本机读值与本机显示拓扑判断。";
 }
 
 function renderMacProbeAssistant(macProbeDiagnostics) {
@@ -2898,6 +2905,21 @@ async function getWindowsOwnershipSnapshot() {
 async function getMacOwnershipSnapshot() {
   const currentInputResult = await getMacCurrentInputResult();
   if (!currentInputResult.ok) {
+    const inferredOwnerTargetId = inferMacOwnerFromLocalDisplayState();
+    if (inferredOwnerTargetId) {
+      return {
+        owner: inferredOwnerTargetId,
+        source: "local",
+        platform: process.platform,
+        status: "missing",
+        message: `Mac 当前已经看不到共享屏，且最近一次成功切换目标是 ${getTarget(
+          inferredOwnerTargetId
+        ).label}；本机判断共享屏已经交给对端。`,
+        currentInputValue: null,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+
     return {
       owner: "unknown",
       source: "local",
@@ -3229,13 +3251,27 @@ async function createWindowsMonitorAvailabilitySnapshot(monitorNames) {
     };
   }
 
+  if (shouldInferWindowsAwayFromTopology()) {
+    return {
+      status: "away",
+      names: monitorNames,
+      message: `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据最近一次成功切换和当前只剩主屏的状态，判断共享屏已经交给 Mac。`,
+      owner: "mac",
+      currentInputValue: null,
+    };
+  }
+
   if (!doesMonitorListContainConfiguredMonitor(monitorNames, state.config.monitorName)) {
     const visibleText = monitorNames.length > 0 ? monitorNames.join("、") : "没有检测到任何显示器";
+    const inferredOwnerTargetId = inferWindowsOwnerFromLocalDisplayState(monitorNames);
     return {
       status: "missing",
       names: monitorNames,
-      message: `${state.config.monitorName} 当前不在 Windows 侧；现在看到的是 ${visibleText}。请到 Mac 端或显示器菜单切回。`,
-      owner: "unknown",
+      message:
+        inferredOwnerTargetId === "mac"
+          ? `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据最近一次成功切换和当前只剩主屏的状态，判断共享屏已经交给 Mac。现在看到的是 ${visibleText}。`
+          : `${state.config.monitorName} 当前不在 Windows 侧；现在看到的是 ${visibleText}。请到 Mac 端或显示器菜单切回。`,
+      owner: inferredOwnerTargetId || "unknown",
       currentInputValue: null,
     };
   }
@@ -3392,6 +3428,57 @@ function getWindowsDisplayCount() {
   } catch {
     return 0;
   }
+}
+
+function inferWindowsOwnerFromLocalDisplayState(monitorNames = []) {
+  const recentTargetId = getRecentSuccessfulTargetId();
+  if (recentTargetId !== "mac") {
+    return null;
+  }
+
+  const displayCount = getWindowsDisplayCount();
+  const otherNamesVisible = Array.isArray(monitorNames) && monitorNames.length > 0;
+  if (displayCount <= 1 || state.windowsDesktop.pendingRestore || !otherNamesVisible) {
+    return "mac";
+  }
+
+  return null;
+}
+
+function shouldInferWindowsAwayFromTopology() {
+  return getWindowsDisplayCount() <= 1 && inferWindowsOwnerFromLocalDisplayState();
+}
+
+function inferMacOwnerFromLocalDisplayState() {
+  const recentTargetId = getRecentSuccessfulTargetId();
+  if (recentTargetId !== "windows") {
+    return null;
+  }
+
+  try {
+    if (screen.getAllDisplays().length === 0) {
+      return "windows";
+    }
+  } catch {
+    return "windows";
+  }
+
+  return null;
+}
+
+function getRecentSuccessfulTargetId() {
+  if (state.lastSwitchOutcome.status !== "success" || !state.lastSwitchOutcome.targetId) {
+    return null;
+  }
+
+  const updatedAt = Date.parse(state.lastSwitchOutcome.updatedAt || "");
+  if (!Number.isFinite(updatedAt)) {
+    return state.lastSwitchOutcome.targetId;
+  }
+
+  return Date.now() - updatedAt <= LOCAL_HANDOFF_INFERENCE_WINDOW_MS
+    ? state.lastSwitchOutcome.targetId
+    : null;
 }
 
 function recordSwitchOutcome(status, targetId, message = "") {

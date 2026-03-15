@@ -120,6 +120,12 @@ The app now includes a first peer-confirmation layer:
 - when exactly one matching peer is discovered, the app uses it automatically
 - if local DDC readback is inconclusive, the app can ask the peer which side currently owns G72
 
+That LAN layer is only a secondary signal:
+
+- Windows should first use local input readback and local desktop-topology changes
+- macOS should first use local input readback and, in single-screen setups, whether its shared display disappeared after a successful handoff
+- peer confirmation is for the cases where local evidence is still ambiguous
+
 Normal operation should stay zero-config:
 
 - the user should not need to paste a peer URL by hand
