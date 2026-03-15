@@ -264,6 +264,10 @@ function refreshMenu() {
       enabled: false,
     },
     {
+      label: getLastSwitchOutcomeMenuLabel(),
+      enabled: false,
+    },
+    {
       label: state.lastTarget
         ? `最近切换请求：${getTarget(state.lastTarget).label}`
         : "最近切换请求：尚未通过此应用发送",
@@ -285,6 +289,14 @@ function refreshMenu() {
       ? [
           {
             label: windowsSharedMonitorMessage,
+            enabled: false,
+          },
+        ]
+      : []),
+    ...(state.lastSwitchOutcome.status === "error" && state.lastSwitchOutcome.message
+      ? [
+          {
+            label: `最近错误：${summarizeMenuMessage(state.lastSwitchOutcome.message)}`,
             enabled: false,
           },
         ]
@@ -366,18 +378,23 @@ function showWindowsSharedMonitorTransferHint(message = "") {
 }
 
 function handleTraySwitch(targetId) {
-  void switchMonitor(targetId).catch((error) => {
+  void switchMonitor(targetId, {
+    showErrorDialog: false,
+  }).catch((error) => {
     appendDiagnosticLog(`Tray switch failed (${targetId})`, error);
   });
 }
 
 async function switchMonitor(targetId, options = {}) {
-  const { notifyOnSuccess = true, showErrorDialog = true } = options;
+  const { notifyOnSuccess = true, showErrorDialog = false } = options;
   const target = getTarget(targetId);
   const configErrors = getConfigValidationErrors(state.config);
 
   if (configErrors.length > 0) {
     const error = new Error(configErrors.join(" "));
+    recordSwitchOutcome("error", targetId, error.message);
+    saveState(state);
+    refreshMenu();
 
     if (showErrorDialog) {
       dialog.showErrorBox(APP_NAME, `当前配置无效。\n\n${error.message}`);
@@ -397,6 +414,7 @@ async function switchMonitor(targetId, options = {}) {
 
     state.lastTarget = targetId;
     state.macInputProbe = createMacInputProbeResult();
+    recordSwitchOutcome("success", targetId, `已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
     saveState(state);
     await refreshSharedMonitorOwnership().catch((error) => {
       appendDiagnosticLog("Failed to refresh shared ownership after switch", error);
@@ -408,6 +426,9 @@ async function switchMonitor(targetId, options = {}) {
     }
   } catch (error) {
     const userFacingError = createUserFacingSwitchError(targetId, error);
+    recordSwitchOutcome("error", targetId, userFacingError.message);
+    saveState(state);
+    refreshMenu();
 
     if (showErrorDialog) {
       dialog.showErrorBox(
@@ -1438,6 +1459,7 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
   const statusHtml = renderSettingsBanner(status, message);
+  const switchOutcomeHtml = renderSwitchOutcomeCard();
   const monitorHintHtml = renderMonitorHints(monitorNames);
   const diagnosticsHtml = renderMonitorDiagnostics(diagnostics);
   const macProbeHtml = renderMacProbeAssistant(macProbeDiagnostics);
@@ -1572,6 +1594,7 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
     <p>这里定义“控制哪一台显示器”以及“两种切换模式分别发什么输入值”。下面的“共享屏当前归属”会尽量显示实时所有权；“最近切换请求”只保留历史动作，不再代表当前画面归属。</p>
     <div class="stack">
       ${statusHtml}
+      ${switchOutcomeHtml}
       ${ownershipHtml}
       ${diagnosticsHtml}
       ${macProbeHtml}
@@ -1767,6 +1790,27 @@ function renderOwnershipStatusCard(ownershipSnapshot) {
     <div class="help">${escapeHtml(sourceLine)}</div>
     <div class="help">${detailLine}</div>
   </div>`;
+}
+
+function renderSwitchOutcomeCard() {
+  if (state.lastSwitchOutcome.status === "idle") {
+    return "";
+  }
+
+  const isSuccess = state.lastSwitchOutcome.status === "success";
+  const targetLabel = state.lastSwitchOutcome.targetId
+    ? getTarget(state.lastSwitchOutcome.targetId).label
+    : "未指定目标";
+  const lines = [
+    `最近切换结果：${isSuccess ? "成功" : "失败"}`,
+    `目标：${escapeHtml(targetLabel)}`,
+  ];
+
+  if (state.lastSwitchOutcome.message) {
+    lines.push(escapeHtml(state.lastSwitchOutcome.message));
+  }
+
+  return `<div class="banner ${isSuccess ? "success" : "error"}">${lines.join("<br>")}</div>`;
 }
 
 function renderPeerStatusCard() {
@@ -2101,6 +2145,15 @@ function summarizeControlAddress(url) {
   }
 }
 
+function summarizeMenuMessage(message, maxLength = 72) {
+  const normalized = normalizeText(message).replace(/\s+/g, " ");
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength - 1)}…`;
+}
+
 function isRecoverablePortError(error) {
   return error && ["EACCES", "EADDRINUSE"].includes(error.code);
 }
@@ -2122,6 +2175,18 @@ function getTarget(targetId) {
 
 function getCurrentTargetLabel() {
   return state.lastTarget ? getTarget(state.lastTarget).label : "尚未通过此应用发送";
+}
+
+function getLastSwitchOutcomeMenuLabel() {
+  if (state.lastSwitchOutcome.status === "success") {
+    return "最近结果：成功";
+  }
+
+  if (state.lastSwitchOutcome.status === "error") {
+    return "最近结果：失败（详情见下方）";
+  }
+
+  return "最近结果：暂无";
 }
 
 function getCurrentOwnerTargetId() {
@@ -2603,7 +2668,23 @@ function notify(body) {
 }
 
 async function handOffWindowsDesktop() {
-  await runWindowsDisplaySwitch("/internal");
+  try {
+    await runWindowsDisplaySwitch("/internal");
+    await waitForDisplayCount(1, "Windows 没有切成仅保留主屏。");
+    return;
+  } catch (error) {
+    appendDiagnosticLog("DisplaySwitch /internal did not collapse topology; trying topology helper", error);
+  }
+
+  const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
+  await runCommand("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    topologyScriptPath,
+    "-PrimaryOnly",
+  ]);
   await waitForDisplayCount(1, "Windows 没有切成仅保留主屏。");
 }
 
@@ -2940,24 +3021,31 @@ function getActivePeerCandidates() {
 function getRawActivePeerCandidates() {
   const now = Date.now();
   const configuredMonitorToken = normalizeMonitorToken(state.config.monitorName);
+  const oppositePlatformPeers = Array.from(discoveredPeers.values())
+    .filter((peer) => now - peer.lastSeenAt <= PEER_DISCOVERY_STALE_MS)
+    .filter((peer) => peer.platform && peer.platform !== process.platform);
+  const monitorMatchedPeers = oppositePlatformPeers.filter((peer) => {
+    if (!configuredMonitorToken) {
+      return true;
+    }
+
+    const peerMonitorToken = normalizeMonitorToken(peer.monitorName);
+    return (
+      peerMonitorToken &&
+      (peerMonitorToken === configuredMonitorToken ||
+        peerMonitorToken.includes(configuredMonitorToken) ||
+        configuredMonitorToken.includes(peerMonitorToken))
+    );
+  });
+  const sourcePeers =
+    monitorMatchedPeers.length > 0
+      ? monitorMatchedPeers
+      : Array.from(new Map(oppositePlatformPeers.map((peer) => [peer.peerToken, peer])).values()).length === 1
+        ? oppositePlatformPeers
+        : [];
   const groupedPeers = new Map();
 
-  for (const peer of Array.from(discoveredPeers.values())
-    .filter((peer) => now - peer.lastSeenAt <= PEER_DISCOVERY_STALE_MS)
-    .filter((peer) => peer.platform && peer.platform !== process.platform)
-    .filter((peer) => {
-      if (!configuredMonitorToken) {
-        return true;
-      }
-
-      const peerMonitorToken = normalizeMonitorToken(peer.monitorName);
-      return (
-        peerMonitorToken &&
-        (peerMonitorToken === configuredMonitorToken ||
-          peerMonitorToken.includes(configuredMonitorToken) ||
-          configuredMonitorToken.includes(peerMonitorToken))
-      );
-    })) {
+  for (const peer of sourcePeers) {
     const entryKey = `${peer.peerToken}@${peer.address}:${peer.controlPort}`;
     groupedPeers.set(entryKey, peer);
   }
@@ -3306,12 +3394,21 @@ function getWindowsDisplayCount() {
   }
 }
 
+function recordSwitchOutcome(status, targetId, message = "") {
+  state.lastSwitchOutcome = createSwitchOutcome({
+    status,
+    targetId,
+    message,
+  });
+}
+
 function createDefaultState() {
   return {
     lastTarget: null,
     controlToken: crypto.randomBytes(12).toString("hex"),
     peerToken: crypto.randomBytes(12).toString("hex"),
     windowsDesktop: createDefaultWindowsDesktopState(),
+    lastSwitchOutcome: createSwitchOutcome(),
     macInputProbe: createMacInputProbeResult(),
     config: createDefaultConfig(),
   };
@@ -3355,6 +3452,20 @@ function createDefaultOwnershipSnapshot() {
   };
 }
 
+function createSwitchOutcome({
+  status = "idle",
+  targetId = null,
+  message = "",
+  updatedAt = null,
+} = {}) {
+  return {
+    status: ["idle", "success", "error"].includes(status) ? status : "idle",
+    targetId: parseTargetId(targetId),
+    message: normalizeText(message),
+    updatedAt: normalizeText(updatedAt) || new Date().toISOString(),
+  };
+}
+
 function loadState() {
   try {
     return normalizeState(JSON.parse(fs.readFileSync(getStatePath(), "utf8")));
@@ -3375,6 +3486,7 @@ function normalizeState(nextState) {
     windowsDesktop: {
       pendingRestore: Boolean(nextState.windowsDesktop?.pendingRestore),
     },
+    lastSwitchOutcome: createSwitchOutcome(nextState.lastSwitchOutcome),
     macInputProbe: normalizeMacInputProbeState(nextState.macInputProbe, defaults.macInputProbe),
     config: {
       monitorName: normalizeText(rawConfig.monitorName) || defaults.config.monitorName,

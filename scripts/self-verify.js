@@ -149,6 +149,20 @@ function verifyMacHelperApps(appBundlePath) {
     true,
     `${bundledDdcctlPath} should exist`
   );
+
+  const bundledWindowsTopologyHelperPath = path.join(
+    appBundlePath,
+    "Contents",
+    "Resources",
+    "resources",
+    "windows",
+    "display-topology.ps1"
+  );
+  assert.equal(
+    fs.existsSync(bundledWindowsTopologyHelperPath),
+    true,
+    `${bundledWindowsTopologyHelperPath} should exist`
+  );
 }
 
 function writeFakeDdcctlBinary(fakeBinaryPath, mode) {

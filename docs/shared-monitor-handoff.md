@@ -21,6 +21,7 @@ This is a Windows-only concern. It is not the same thing as monitor input switch
 
 - When Windows switches the shared monitor away to the other device, the Windows app can call `DisplaySwitch.exe /internal` so the desktop falls back to Windows' primary display.
 - When the shared monitor later comes back to Windows, the Windows app can call `DisplaySwitch.exe /extend` to restore extended desktop mode.
+- If Windows still keeps the shared screen attached after `/internal`, the app should fall back to an explicit topology helper that detaches every non-primary display.
 
 Operational constraint:
 
@@ -87,6 +88,7 @@ Treat the handoff as three ordered phases, not one blended action:
 - The machine that currently owns the visible picture should initiate the input switch.
 - Both tray apps should run at login.
 - Windows should keep its tray app running so desktop handoff and recovery stay automatic.
+- Tray/menu initiated switch failures should be recorded in the tray/menu state instead of interrupting the user with a blocking modal dialog.
 - macOS should use the built-in input probe assistant to verify the real input value for the Windows path.
 - Windows should use the exact monitor name that Windows currently detects.
 - If Windows no longer sees the shared screen, Windows should stop offering local switch actions and defer ownership return to the Mac side or the monitor's own buttons.
