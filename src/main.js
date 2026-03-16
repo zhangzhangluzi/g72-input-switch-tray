@@ -621,7 +621,7 @@ function switchOnMac(targetId, target) {
 
 async function prepareManualTransferOnMac(plan, target) {
   return {
-    message: `Mac 已准备好手动移交。现在请到 ${getTarget(
+    message: `Mac 已进入手动移交流程；这一步不会立即切屏。现在请到 ${getTarget(
       plan.targetId
     ).label} 那一侧点击“接收”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
     localAction: "none",
@@ -644,7 +644,7 @@ async function prepareManualReceiveOnWindows(plan, target) {
 
 async function prepareManualReceiveOnMac(plan, target) {
   return {
-    message: `Mac 已准备好接收。现在请回到 ${getTarget(
+    message: `Mac 已进入手动接收流程；这一步不会立即切屏。现在请回到 ${getTarget(
       plan.sourceTargetId
     ).label} 那一侧点击“移交”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
     localAction: "none",
@@ -2245,6 +2245,8 @@ function getManualHandoffModelForCurrentPlatform() {
   const activeReason = state.manualSession.active
     ? `当前有一笔手动交接正在等待完成（剩余 ${getManualSessionRemainingSeconds()} 秒）。`
     : "";
+  const transferButtonLabel = getManualHandoffButtonLabel("transfer", oppositeTargetId);
+  const receiveButtonLabel = getManualHandoffButtonLabel("receive", oppositeTargetId);
 
   if (state.manualSession.active) {
     return {
@@ -2254,13 +2256,13 @@ function getManualHandoffModelForCurrentPlatform() {
         {
           action: "transfer",
           targetId: oppositeTargetId,
-          buttonLabel: `准备移交给 ${getTarget(oppositeTargetId).label}`,
+          buttonLabel: transferButtonLabel,
           disabledReason: activeReason,
         },
         {
           action: "receive",
           targetId: localTargetId,
-          buttonLabel: `准备接收来自 ${getTarget(oppositeTargetId).label}`,
+          buttonLabel: receiveButtonLabel,
           disabledReason: activeReason,
         },
       ],
@@ -2271,13 +2273,13 @@ function getManualHandoffModelForCurrentPlatform() {
   const transferAction = {
     action: "transfer",
     targetId: oppositeTargetId,
-    buttonLabel: `准备移交给 ${getTarget(oppositeTargetId).label}`,
+    buttonLabel: transferButtonLabel,
     disabledReason: "",
   };
   const receiveAction = {
     action: "receive",
     targetId: localTargetId,
-    buttonLabel: `准备接收来自 ${getTarget(oppositeTargetId).label}`,
+    buttonLabel: receiveButtonLabel,
     disabledReason: "",
   };
 
@@ -2287,6 +2289,26 @@ function getManualHandoffModelForCurrentPlatform() {
     actions: [transferAction, receiveAction],
     disabledReason: "",
   };
+}
+
+function getManualHandoffButtonLabel(action, oppositeTargetId) {
+  const oppositeLabel = getTarget(oppositeTargetId).label;
+
+  if (process.platform === "win32") {
+    return action === "transfer"
+      ? `准备移交给 ${oppositeLabel}（退回主屏）`
+      : `准备接收来自 ${oppositeLabel}（恢复共享屏）`;
+  }
+
+  if (process.platform === "darwin") {
+    return action === "transfer"
+      ? `开始手动移交流程（给 ${oppositeLabel}）`
+      : `开始手动接收流程（来自 ${oppositeLabel}）`;
+  }
+
+  return action === "transfer"
+    ? `准备移交给 ${oppositeLabel}`
+    : `准备接收来自 ${oppositeLabel}`;
 }
 
 function getManualSessionRemainingSeconds() {
