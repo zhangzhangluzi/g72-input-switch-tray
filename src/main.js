@@ -205,6 +205,19 @@ function refreshMenu() {
         click: () => handleTrayManualHandoffAction(item.targetId, item.action),
       }))
     : [];
+  const refreshWindowsMenuItems =
+    process.platform === "win32"
+      ? [
+          {
+            label: "主动刷新 Windows 屏幕状态",
+            click: () => {
+              void refreshWindowsDisplayState({
+                notifyOnSuccess: true,
+              });
+            },
+          },
+        ]
+      : [];
 
   const menu = Menu.buildFromTemplate([
     {
@@ -241,6 +254,11 @@ function refreshMenu() {
       : []),
     { type: "separator" },
     ...manualHandoffMenuItems,
+    ...(
+      refreshWindowsMenuItems.length > 0
+        ? [{ type: "separator" }, ...refreshWindowsMenuItems]
+        : []
+    ),
     { type: "separator" },
     {
       label: "开机时启动",
@@ -525,15 +543,23 @@ async function prepareManualReceive(plan, target) {
 
 async function switchOnWindows(targetId, target, options = {}) {
   const { forceDisplayHandoff = false } = options;
-  const useDisplayHandoff = forceDisplayHandoff
-    ? targetId !== "windows" && canWindowsManualTransferDetachSharedMonitor()
-    : shouldUseWindowsDisplayHandoff(state.config);
-  await assertWindowsSharedMonitorAvailableForSwitch();
-  let desktopHandedOff = false;
   const attachedDisplayCountBeforeSwitch =
-    useDisplayHandoff && targetId !== "windows"
+    targetId !== "windows"
       ? await getCurrentWindowsAttachedDisplayCount()
       : null;
+  const handoffEnabledByConfig = state.config.windowsDisplayHandoffMode !== "off";
+  const canDetachSharedMonitor =
+    (Number.isInteger(attachedDisplayCountBeforeSwitch) &&
+      attachedDisplayCountBeforeSwitch > 1) ||
+    canWindowsManualTransferDetachSharedMonitor();
+  const useDisplayHandoff = forceDisplayHandoff
+    ? targetId !== "windows" && canDetachSharedMonitor
+    : targetId === "windows"
+      ? state.windowsDesktop.pendingRestore || shouldUseWindowsDisplayHandoff(state.config)
+      : handoffEnabledByConfig &&
+        (shouldUseWindowsDisplayHandoff(state.config) || canDetachSharedMonitor);
+  await assertWindowsSharedMonitorAvailableForSwitch();
+  let desktopHandedOff = false;
 
   if (useDisplayHandoff && targetId === "windows") {
     await restoreWindowsDesktopToTargetMonitor();
@@ -580,7 +606,7 @@ async function switchOnWindows(targetId, target, options = {}) {
     }
   }
 
-  if (useDisplayHandoff && targetId !== "windows" && !desktopHandedOff && !state.windowsDesktop.pendingRestore) {
+  if (useDisplayHandoff && targetId !== "windows" && !desktopHandedOff) {
     await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
     await handOffWindowsDesktop();
     markPendingWindowsDesktopRestore(attachedDisplayCountBeforeSwitch);
@@ -903,6 +929,7 @@ async function handleControlRequest(request, response) {
   const monitorsPath = `/api/${state.controlToken}/monitors`;
   const manualWindowsPath = `/api/${state.controlToken}/manual/windows`;
   const manualMacPath = `/api/${state.controlToken}/manual/mac`;
+  const windowsRefreshPath = `/api/${state.controlToken}/windows/refresh`;
   const macProbePath = `/api/${state.controlToken}/probe/mac`;
   const macProbeApplyPath = `/api/${state.controlToken}/probe/mac/apply`;
 
@@ -983,6 +1010,10 @@ async function handleControlRequest(request, response) {
     return handleManualHandoffRequest(request, response, requestUrl, "mac");
   }
 
+  if (requestUrl.pathname === windowsRefreshPath && request.method === "POST") {
+    return handleWindowsRefreshRequest(response, requestUrl);
+  }
+
   response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
   response.end("未找到对应页面。");
 }
@@ -1041,6 +1072,18 @@ async function handleManualHandoffRequest(request, response, requestUrl, targetI
     notify(error.message || "手动交接准备失败。");
     redirectToSettingsPage(response, requestUrl, {});
   }
+}
+
+async function handleWindowsRefreshRequest(response, requestUrl) {
+  try {
+    await refreshWindowsDisplayState({
+      notifyOnSuccess: true,
+    });
+  } catch (error) {
+    notify(normalizeText(error.message) || "Windows 主动刷新失败。");
+  }
+
+  redirectToSettingsPage(response, requestUrl, {});
 }
 
 async function handleMacProbe(request, response, requestUrl) {
@@ -1915,12 +1958,21 @@ function renderManualHandoffCard() {
       </form>`;
     })
     .join("");
+  const refreshHtml =
+    process.platform === "win32"
+      ? `<form method="post" action="/api/${encodeURIComponent(
+          state.controlToken
+        )}/windows/refresh" style="margin-top: 14px;">
+        <button type="submit" class="secondary">主动刷新 Windows 屏幕状态</button>
+      </form>`
+      : "";
 
   return `<div class="card soft">
     <div class="section-title">手动切源辅助</div>
     <div class="help" style="margin-top: 12px;">${escapeHtml(model.introText || model.disabledReason)}</div>
     <div class="help">${escapeHtml(model.recommendation || sessionHelp)}</div>
     ${formHtml}
+    ${refreshHtml}
   </div>`;
 }
 
@@ -3443,8 +3495,12 @@ function isTrayDestroyed() {
 }
 
 async function attemptPendingWindowsDesktopRestore() {
+  return attemptPendingWindowsDesktopRestoreInternal();
+}
+
+async function attemptPendingWindowsDesktopRestoreInternal({ notifyOnSuccess = true } = {}) {
   if (process.platform !== "win32" || windowsRestoreInFlight || !state.windowsDesktop.pendingRestore) {
-    return;
+    return false;
   }
 
   windowsRestoreInFlight = true;
@@ -3453,14 +3509,18 @@ async function attemptPendingWindowsDesktopRestore() {
     const names = await getAvailableMonitorNames();
     const availability = await updateWindowsMonitorAvailability(names);
     if (availability.status !== "visible" || availability.owner !== "windows") {
-      return;
+      return false;
     }
 
     await restoreWindowsDesktopToTargetMonitor();
     clearPendingWindowsDesktopRestore();
-    notify(`软件当前判断 ${state.config.monitorName} 已回到 Windows，并已把桌面恢复为扩展显示。`);
+    if (notifyOnSuccess) {
+      notify(`软件当前判断 ${state.config.monitorName} 已回到 Windows，并已把桌面恢复为扩展显示。`);
+    }
+    return true;
   } catch {
     // Keep waiting. The monitor may have reappeared but not finished handshaking yet.
+    return false;
   } finally {
     windowsRestoreInFlight = false;
   }
@@ -3510,6 +3570,77 @@ async function getCurrentWindowsAttachedDisplayCount() {
 
   const electronDisplayCount = getWindowsDisplayCount();
   return electronDisplayCount > 0 ? electronDisplayCount : null;
+}
+
+async function refreshWindowsDisplayState({ notifyOnSuccess = false } = {}) {
+  if (process.platform !== "win32") {
+    return {
+      changed: false,
+      message: "当前平台不是 Windows，无需刷新 Windows 屏幕状态。",
+    };
+  }
+
+  const names = await getAvailableMonitorNames();
+  let availability = await updateWindowsMonitorAvailability(names);
+  const attachedDisplayCount = await getCurrentWindowsAttachedDisplayCount();
+  const recentTargetId = getRecentSuccessfulTargetId();
+
+  if (state.windowsDesktop.pendingRestore && availability.status === "visible" && availability.owner === "windows") {
+    const restored = await attemptPendingWindowsDesktopRestoreInternal({
+      notifyOnSuccess: false,
+    });
+    const message = restored
+      ? "Windows 已主动刷新，并已把桌面恢复为扩展显示。"
+      : "Windows 已主动刷新当前屏幕状态。";
+    refreshMenu();
+    if (notifyOnSuccess) {
+      notify(message);
+    }
+    return {
+      changed: restored,
+      message,
+      availability: windowsMonitorAvailability,
+      attachedDisplayCount,
+    };
+  }
+
+  const shouldCollapseSharedMonitor =
+    state.config.windowsDisplayHandoffMode !== "off" &&
+    Number.isInteger(attachedDisplayCount) &&
+    attachedDisplayCount > 1 &&
+    availability.owner !== "windows" &&
+    (availability.owner === "mac" || recentTargetId === "mac");
+
+  if (shouldCollapseSharedMonitor) {
+    await handOffWindowsDesktop();
+    markPendingWindowsDesktopRestore(attachedDisplayCount);
+    availability = await updateWindowsMonitorAvailability(await getAvailableMonitorNames());
+    const message = "Windows 已主动刷新，并已再次尝试把桌面缩为仅主屏。";
+    if (notifyOnSuccess) {
+      notify(message);
+    }
+    return {
+      changed: true,
+      message,
+      availability,
+      attachedDisplayCount: await getCurrentWindowsAttachedDisplayCount(),
+    };
+  }
+
+  const message =
+    Number.isInteger(attachedDisplayCount) && attachedDisplayCount <= 1
+      ? "Windows 当前已经是仅主屏状态。"
+      : "Windows 已主动刷新当前屏幕状态。";
+  refreshMenu();
+  if (notifyOnSuccess) {
+    notify(message);
+  }
+  return {
+    changed: false,
+    message,
+    availability,
+    attachedDisplayCount,
+  };
 }
 
 function getExpectedWindowsRestoreDisplayCount() {
@@ -3581,7 +3712,7 @@ function inferMacOwnerFromLocalDisplayState(attemptedTargetId = null) {
   return null;
 }
 
-function getRecentSuccessfulTargetId() {
+function getRecentSuccessfulTargetId(maxAgeMs = LOCAL_HANDOFF_INFERENCE_WINDOW_MS) {
   if (
     state.lastSwitchOutcome.status !== "success" ||
     state.lastSwitchOutcome.mode !== "switch" ||
@@ -3595,7 +3726,7 @@ function getRecentSuccessfulTargetId() {
     return state.lastSwitchOutcome.targetId;
   }
 
-  return Date.now() - updatedAt <= LOCAL_HANDOFF_INFERENCE_WINDOW_MS
+  return Date.now() - updatedAt <= maxAgeMs
     ? state.lastSwitchOutcome.targetId
     : null;
 }
