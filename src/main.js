@@ -204,37 +204,14 @@ function refreshMenu() {
   const openAtLogin = app.getLoginItemSettings().openAtLogin;
   const configErrors = getConfigValidationErrors(state.config);
   const manualHandoffModel = getManualHandoffModelForCurrentPlatform();
-  const manualHandoffSubmenu = manualHandoffModel.actions.length
-    ? [
-        {
-          label: "手动交接辅助",
-          submenu: [
-            {
-              label: summarizeMenuMessage(manualHandoffModel.introText || "手动交接会先做本机准备动作，再由你用显示器按钮完成切源。"),
-              enabled: false,
-            },
-            ...(manualHandoffModel.recommendation
-              ? [
-                  {
-                    label: summarizeMenuMessage(manualHandoffModel.recommendation),
-                    enabled: false,
-                  },
-                ]
-              : []),
-            ...manualHandoffModel.actions.map((item) => ({
-              label: item.buttonLabel,
-              enabled: configErrors.length === 0 && !item.disabledReason,
-              click: () => handleTrayManualHandoffAction(item.targetId, item.action),
-            })),
-            ...manualHandoffModel.actions
-              .filter((item) => item.disabledReason)
-              .map((item) => ({
-                label: `${item.buttonLabel}：${summarizeMenuMessage(item.disabledReason)}`,
-                enabled: false,
-              })),
-          ],
-        },
-      ]
+  const manualHandoffMenuItems = manualHandoffModel.actions.length
+    ? manualHandoffModel.actions.map((item) => ({
+        label: item.disabledReason
+          ? `${item.buttonLabel}：${summarizeMenuMessage(item.disabledReason)}`
+          : item.buttonLabel,
+        enabled: configErrors.length === 0 && !item.disabledReason,
+        click: () => handleTrayManualHandoffAction(item.targetId, item.action),
+      }))
     : [];
 
   const menu = Menu.buildFromTemplate([
@@ -271,7 +248,7 @@ function refreshMenu() {
         ]
       : []),
     { type: "separator" },
-    ...manualHandoffSubmenu,
+    ...manualHandoffMenuItems,
     { type: "separator" },
     {
       label: "开机时启动",
