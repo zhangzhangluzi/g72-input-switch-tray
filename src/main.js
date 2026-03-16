@@ -43,7 +43,6 @@ let controlServerError = null;
 let activeControlPort = PREFERRED_CONTROL_PORT;
 let windowsRestoreTimer = null;
 let windowsRestoreInFlight = false;
-let ownershipRefreshTimer = null;
 let windowsMonitorAvailability = {
   status: "unknown",
   names: [],
@@ -55,7 +54,6 @@ let windowsMonitorAvailabilityInFlight = false;
 let trayRebuildTimer = null;
 let trayHealthTimer = null;
 let explorerSignature = null;
-let sharedMonitorOwnership = createDefaultOwnershipSnapshot();
 let manualSessionTimer = null;
 let manualSessionInFlight = false;
 let state = createDefaultState();
@@ -111,11 +109,6 @@ app.on("before-quit", () => {
     trayHealthTimer = null;
   }
 
-  if (ownershipRefreshTimer) {
-    clearInterval(ownershipRefreshTimer);
-    ownershipRefreshTimer = null;
-  }
-
   if (manualSessionTimer) {
     clearInterval(manualSessionTimer);
     manualSessionTimer = null;
@@ -132,7 +125,6 @@ app.whenReady().then(() => {
   startControlServer();
   startWindowsRestoreWatcher();
   startWindowsTrayWatcher();
-  startOwnershipWatcher();
   startManualSessionWatcher();
   createTray();
   refreshMenu();
@@ -321,9 +313,6 @@ async function switchMonitor(targetId, options = {}) {
     state.macInputProbe = createMacInputProbeResult();
     recordSwitchOutcome("success", targetId, `本机切换流程已执行，并已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
     saveState(state);
-    await refreshSharedMonitorOwnership().catch((error) => {
-      appendDiagnosticLog("Failed to refresh shared ownership after switch", error);
-    });
     refreshMenu();
 
     if (notifyOnSuccess) {
@@ -371,6 +360,7 @@ async function prepareManualHandoff(targetId, options = {}) {
 
   try {
     const plan = resolveManualHandoffPlan(targetId, preferredAction);
+    await assertManualHandoffStartState(plan);
     const result =
       plan.kind === "transfer"
         ? await prepareManualTransfer(plan, target)
@@ -480,6 +470,25 @@ function resolveManualHandoffPlan(targetId, preferredAction = null) {
   };
 }
 
+async function assertManualHandoffStartState(plan) {
+  const snapshot = await getTargetedLocalOwnershipSnapshot(plan.expectedOwnerTargetId);
+  if (snapshot.owner === "unknown") {
+    return;
+  }
+
+  if (plan.kind === "transfer" && snapshot.owner === plan.expectedOwnerTargetId) {
+    throw new Error(
+      `软件当前判断 ${state.config.monitorName} 已经在 ${getTarget(plan.expectedOwnerTargetId).label} 这一侧，不需要再从本侧点“移交”。`
+    );
+  }
+
+  if (plan.kind === "receive" && snapshot.owner === plan.expectedOwnerTargetId) {
+    throw new Error(
+      `软件当前判断 ${state.config.monitorName} 已经回到 ${getTarget(plan.expectedOwnerTargetId).label} 这一侧，不需要再重复点“接收”。`
+    );
+  }
+}
+
 async function prepareManualTransfer(plan, target) {
   if (process.platform === "win32") {
     return prepareManualTransferOnWindows(plan, target);
@@ -556,10 +565,6 @@ async function switchOnWindows(targetId, target) {
     if (!ownershipConfirmation.confirmed) {
       throw error;
     }
-
-    if (ownershipConfirmation.snapshot) {
-      updateSharedMonitorOwnership(ownershipConfirmation.snapshot);
-    }
   }
 
   if (useDisplayHandoff && targetId !== "windows" && !desktopHandedOff && !state.windowsDesktop.pendingRestore) {
@@ -570,10 +575,10 @@ async function switchOnWindows(targetId, target) {
 }
 
 async function prepareManualTransferOnWindows(plan, target) {
-  await assertWindowsSharedMonitorAvailableForSwitch();
-  const attachedDisplayCountBeforeHandoff = await getCurrentWindowsAttachedDisplayCount();
-
-  if (shouldUseWindowsDisplayHandoff(state.config)) {
+  const canDetachSharedScreen = canWindowsManualTransferDetachSharedMonitor();
+  if (canDetachSharedScreen) {
+    await assertWindowsSharedMonitorAvailableForSwitch();
+    const attachedDisplayCountBeforeHandoff = await getCurrentWindowsAttachedDisplayCount();
     await handOffWindowsDesktop();
     markPendingWindowsDesktopRestore(attachedDisplayCountBeforeHandoff);
     return {
@@ -585,10 +590,10 @@ async function prepareManualTransferOnWindows(plan, target) {
   }
 
   return {
-    message: `Windows 已准备好手动移交。现在请到 ${getTarget(
+    message: `Windows 已进入手动移交流程；这一步不会再改本机屏幕拓扑。现在请到 ${getTarget(
       plan.targetId
     ).label} 那一侧点击“接收”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
-    localAction: "windows_transfer",
+    localAction: "none",
   };
 }
 
@@ -607,16 +612,13 @@ function switchOnMac(targetId, target) {
       )
     )
     .catch(async (error) => {
-    const ownershipConfirmation = await confirmTargetOwnership(targetId);
-    if (ownershipConfirmation.confirmed) {
-      if (ownershipConfirmation.snapshot) {
-        updateSharedMonitorOwnership(ownershipConfirmation.snapshot);
+      const ownershipConfirmation = await confirmTargetOwnership(targetId);
+      if (ownershipConfirmation.confirmed) {
+        return;
       }
-      return;
-    }
 
-    throw error;
-  });
+      throw error;
+    });
 }
 
 async function prepareManualTransferOnMac(plan, target) {
@@ -2296,7 +2298,9 @@ function getManualHandoffButtonLabel(action, oppositeTargetId) {
 
   if (process.platform === "win32") {
     return action === "transfer"
-      ? `准备移交给 ${oppositeLabel}（退回主屏）`
+      ? canWindowsManualTransferDetachSharedMonitor()
+        ? `准备移交给 ${oppositeLabel}（退回主屏）`
+        : `开始手动移交流程（给 ${oppositeLabel}）`
       : `准备接收来自 ${oppositeLabel}（恢复共享屏）`;
   }
 
@@ -2662,6 +2666,14 @@ function shouldUseWindowsDisplayHandoff(config) {
   return getWindowsDisplayLayoutInfo().displayCount >= 2;
 }
 
+function canWindowsManualTransferDetachSharedMonitor() {
+  if (process.platform !== "win32") {
+    return false;
+  }
+
+  return getWindowsDisplayLayoutInfo().displayCount >= 2;
+}
+
 function getWindowsDisplayLayoutInfo() {
   if (process.platform !== "win32") {
     return {
@@ -2786,7 +2798,6 @@ async function prepareWindowsDesktopForIncomingOwnership() {
     };
   }
 
-  markPendingWindowsDesktopRestore(getExpectedWindowsRestoreDisplayCount());
   const expectedCount = getExpectedWindowsRestoreDisplayCount();
 
   try {
@@ -2801,6 +2812,8 @@ async function prepareWindowsDesktopForIncomingOwnership() {
       detail: error.message,
     };
   }
+
+  markPendingWindowsDesktopRestore(expectedCount);
 
   try {
     const names = await getAvailableMonitorNames();
@@ -2927,13 +2940,6 @@ function getAttachedWindowsTopologyDisplayCount(displays) {
   return displays.filter((display) => display.attached).length;
 }
 
-function startOwnershipWatcher() {
-  void refreshSharedMonitorOwnership();
-  ownershipRefreshTimer = setInterval(() => {
-    void refreshSharedMonitorOwnership();
-  }, 5000);
-}
-
 function startManualSessionWatcher() {
   void tickManualSession();
   manualSessionTimer = setInterval(() => {
@@ -2949,7 +2955,7 @@ async function tickManualSession() {
   manualSessionInFlight = true;
 
   try {
-    const snapshot = await getEffectiveOwnershipSnapshot();
+    const snapshot = await getTargetedLocalOwnershipSnapshot(state.manualSession.expectedOwnerTargetId);
     if (snapshot.owner === state.manualSession.expectedOwnerTargetId) {
       finishManualSession(
         "success",
@@ -3024,30 +3030,6 @@ function finishManualSession(status, message, targetId, { notifyUser = false } =
   if (notifyUser && message) {
     notify(message);
   }
-}
-
-async function refreshSharedMonitorOwnership() {
-  const snapshot = await getEffectiveOwnershipSnapshot();
-  updateSharedMonitorOwnership(snapshot);
-}
-
-function updateSharedMonitorOwnership(nextSnapshot) {
-  if (
-    sharedMonitorOwnership.owner === nextSnapshot.owner &&
-    sharedMonitorOwnership.source === nextSnapshot.source &&
-    sharedMonitorOwnership.status === nextSnapshot.status &&
-    sharedMonitorOwnership.message === nextSnapshot.message &&
-    sharedMonitorOwnership.currentInputValue === nextSnapshot.currentInputValue
-  ) {
-    return;
-  }
-
-  sharedMonitorOwnership = nextSnapshot;
-  refreshMenu();
-}
-
-async function getEffectiveOwnershipSnapshot({ includePeer = true } = {}) {
-  return getLocalOwnershipSnapshot();
 }
 
 async function getLocalOwnershipSnapshot() {
@@ -3185,10 +3167,6 @@ async function attemptWindowsDesktopHandoffRecovery(targetId, expectedRestoreDis
 
   if (!ownershipConfirmation.confirmed) {
     return false;
-  }
-
-  if (ownershipConfirmation.snapshot) {
-    updateSharedMonitorOwnership(ownershipConfirmation.snapshot);
   }
 
   try {
@@ -3464,7 +3442,7 @@ async function attemptPendingWindowsDesktopRestore() {
   try {
     const names = await getAvailableMonitorNames();
     const availability = await updateWindowsMonitorAvailability(names);
-    if (availability.status !== "visible" || availability.owner === "mac") {
+    if (availability.status !== "visible" || availability.owner !== "windows") {
       return;
     }
 
