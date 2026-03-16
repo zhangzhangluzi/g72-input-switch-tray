@@ -309,11 +309,7 @@ async function switchMonitor(targetId, options = {}) {
       throw new Error(`当前平台不受支持：${process.platform}`);
     }
 
-    state.lastTarget = targetId;
-    state.macInputProbe = createMacInputProbeResult();
-    recordSwitchOutcome("success", targetId, `本机切换流程已执行，并已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
-    saveState(state);
-    refreshMenu();
+    persistSuccessfulLocalSwitch(targetId, target);
 
     if (notifyOnSuccess) {
       notify(`本机切换流程已执行，并已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
@@ -366,20 +362,26 @@ async function prepareManualHandoff(targetId, options = {}) {
         ? await prepareManualTransfer(plan, target)
         : await prepareManualReceive(plan, target);
     const message = result.message;
+    const shouldStartSession = result.startSession !== false;
+    const preserveSwitchOutcome = result.preserveSwitchOutcome === true;
 
     state.macInputProbe = createMacInputProbeResult();
-    state.manualSession = createManualSessionState({
-      kind: plan.kind,
-      expectedOwnerTargetId: plan.expectedOwnerTargetId,
-      sourceTargetId: plan.sourceTargetId,
-      localAction: result.localAction,
-    });
-    state.lastSwitchOutcome = createSwitchOutcome({
-      status: "success",
-      targetId,
-      mode: "manual_prep",
-      message,
-    });
+    state.manualSession = shouldStartSession
+      ? createManualSessionState({
+          kind: plan.kind,
+          expectedOwnerTargetId: plan.expectedOwnerTargetId,
+          sourceTargetId: plan.sourceTargetId,
+          localAction: result.localAction,
+        })
+      : createDefaultManualSessionState();
+    if (!preserveSwitchOutcome) {
+      state.lastSwitchOutcome = createSwitchOutcome({
+        status: "success",
+        targetId,
+        mode: "manual_prep",
+        message,
+      });
+    }
     saveState(state);
     refreshMenu();
 
@@ -403,6 +405,14 @@ async function prepareManualHandoff(targetId, options = {}) {
 
     throw userFacingError;
   }
+}
+
+function persistSuccessfulLocalSwitch(targetId, target) {
+  state.lastTarget = targetId;
+  state.macInputProbe = createMacInputProbeResult();
+  recordSwitchOutcome("success", targetId, `本机切换流程已执行，并已向 ${state.config.monitorName} 发送切换命令：${target.label}。`);
+  saveState(state);
+  refreshMenu();
 }
 
 function resolveManualHandoffPlan(targetId, preferredAction = null) {
@@ -513,8 +523,11 @@ async function prepareManualReceive(plan, target) {
   throw new Error(`当前平台不受支持：${process.platform}`);
 }
 
-async function switchOnWindows(targetId, target) {
-  const useDisplayHandoff = shouldUseWindowsDisplayHandoff(state.config);
+async function switchOnWindows(targetId, target, options = {}) {
+  const { forceDisplayHandoff = false } = options;
+  const useDisplayHandoff = forceDisplayHandoff
+    ? targetId !== "windows" && canWindowsManualTransferDetachSharedMonitor()
+    : shouldUseWindowsDisplayHandoff(state.config);
   await assertWindowsSharedMonitorAvailableForSwitch();
   let desktopHandedOff = false;
   const attachedDisplayCountBeforeSwitch =
@@ -575,25 +588,18 @@ async function switchOnWindows(targetId, target) {
 }
 
 async function prepareManualTransferOnWindows(plan, target) {
-  const canDetachSharedScreen = canWindowsManualTransferDetachSharedMonitor();
-  if (canDetachSharedScreen) {
-    await assertWindowsSharedMonitorAvailableForSwitch();
-    const attachedDisplayCountBeforeHandoff = await getCurrentWindowsAttachedDisplayCount();
-    await handOffWindowsDesktop();
-    markPendingWindowsDesktopRestore(attachedDisplayCountBeforeHandoff);
-    return {
-      message: `Windows 已准备好手动移交，并已把桌面退回主显示器。现在请到 ${getTarget(
-        plan.targetId
-      ).label} 那一侧点击“接收”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
-      localAction: "windows_transfer",
-    };
-  }
-
+  const willDetachSharedScreen = canWindowsManualTransferDetachSharedMonitor();
+  await switchOnWindows(plan.targetId, target, {
+    forceDisplayHandoff: true,
+  });
+  persistSuccessfulLocalSwitch(plan.targetId, target);
   return {
-    message: `Windows 已进入手动移交流程；这一步不会再改本机屏幕拓扑。现在请到 ${getTarget(
-      plan.targetId
-    ).label} 那一侧点击“接收”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
+    message: willDetachSharedScreen
+      ? `Windows 已执行移交，并已尝试把 ${state.config.monitorName} 切到 ${target.label}；桌面也已退回主显示器。若另一侧已先点“接收”，软件会继续判断接收是否完成。`
+      : `Windows 已执行移交，并已尝试把 ${state.config.monitorName} 切到 ${target.label}。若另一侧已先点“接收”，软件会继续判断接收是否完成。`,
     localAction: "none",
+    startSession: false,
+    preserveSwitchOutcome: true,
   };
 }
 
@@ -622,11 +628,15 @@ function switchOnMac(targetId, target) {
 }
 
 async function prepareManualTransferOnMac(plan, target) {
+  await switchOnMac(plan.targetId, target);
+  persistSuccessfulLocalSwitch(plan.targetId, target);
   return {
-    message: `Mac 已进入手动移交流程；这一步不会立即切屏。现在请到 ${getTarget(
+    message: `Mac 已执行移交，并已尝试把 ${state.config.monitorName} 切到 ${target.label}。若 ${getTarget(
       plan.targetId
-    ).label} 那一侧点击“接收”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
+    ).label} 那一侧已先点“接收”，软件会继续判断接收是否完成。`,
     localAction: "none",
+    startSession: false,
+    preserveSwitchOutcome: true,
   };
 }
 
@@ -639,16 +649,16 @@ async function prepareManualReceiveOnWindows(plan, target) {
   return {
     message: `Windows 已准备好接收。现在请回到 ${getTarget(
       plan.sourceTargetId
-    ).label} 那一侧点击“移交”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
+    ).label} 那一侧点击“移交”；真正的切屏动作会在那一侧执行。`,
     localAction: "windows_receive",
   };
 }
 
 async function prepareManualReceiveOnMac(plan, target) {
   return {
-    message: `Mac 已进入手动接收流程；这一步不会立即切屏。现在请回到 ${getTarget(
+    message: `Mac 已进入手动接收流程；这一步只负责等待共享屏回来，不会立即切屏。现在请回到 ${getTarget(
       plan.sourceTargetId
-    ).label} 那一侧点击“移交”，再在 30 秒内用显示器按钮把 ${state.config.monitorName} 切到 ${target.label}。`,
+    ).label} 那一侧点击“移交”；真正的切屏动作会在那一侧执行。`,
     localAction: "none",
   };
 }
@@ -1888,7 +1898,7 @@ function renderManualHandoffCard() {
   const model = getManualHandoffModelForCurrentPlatform();
   const sessionHelp = state.manualSession.active
     ? `当前有一笔手动交接在等待完成，剩余 ${getManualSessionRemainingSeconds()} 秒；超过 30 秒会自动回收本机这边已经做过的准备动作。`
-    : "这一步不会假装“已经切源成功”，它只负责把当前这台主机该做的准备动作先做掉。";
+    : "“接收”只负责把本机该做的准备动作先做掉；“移交”会在当前这台主机直接执行切屏。";
   const formHtml = model.actions
     .map((action) => {
       const disabled = action.disabledReason ? " disabled" : "";
@@ -2286,8 +2296,8 @@ function getManualHandoffModelForCurrentPlatform() {
   };
 
   return {
-    introText: `这套交接现在完全按手动流程走：当前有画面的那一侧点“移交”，另一侧点“接收”，最后再用显示器按钮完成切源。`,
-    recommendation: `Windows 侧负责本机屏幕增减/恢复；Mac 侧只负责把本机该做的切源准备动作先做掉。`,
+    introText: `这套交接现在按“两边分别点击”的流程走：接收侧先点“接收”做本机准备，持有画面的那一侧再点“移交”直接执行切屏。`,
+    recommendation: `Windows 侧负责本机屏幕增减/恢复；Mac 侧在点“移交”时会直接执行把共享屏交回 Windows 的切源动作。`,
     actions: [transferAction, receiveAction],
     disabledReason: "",
   };
@@ -2299,15 +2309,15 @@ function getManualHandoffButtonLabel(action, oppositeTargetId) {
   if (process.platform === "win32") {
     return action === "transfer"
       ? canWindowsManualTransferDetachSharedMonitor()
-        ? `准备移交给 ${oppositeLabel}（退回主屏）`
-        : `开始手动移交流程（给 ${oppositeLabel}）`
+        ? `立即移交给 ${oppositeLabel}（切源并退回主屏）`
+        : `立即移交给 ${oppositeLabel}（执行切源）`
       : `准备接收来自 ${oppositeLabel}（恢复共享屏）`;
   }
 
   if (process.platform === "darwin") {
     return action === "transfer"
-      ? `开始手动移交流程（给 ${oppositeLabel}）`
-      : `开始手动接收流程（来自 ${oppositeLabel}）`;
+      ? `立即移交给 ${oppositeLabel}（执行切源）`
+      : `准备接收来自 ${oppositeLabel}`;
   }
 
   return action === "transfer"
