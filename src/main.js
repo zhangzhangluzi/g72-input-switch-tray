@@ -203,7 +203,6 @@ function refreshMenu() {
 
   const openAtLogin = app.getLoginItemSettings().openAtLogin;
   const configErrors = getConfigValidationErrors(state.config);
-  const localSettingsUrl = getLocalSettingsUrl();
   const manualHandoffModel = getManualHandoffModelForCurrentPlatform();
   const manualHandoffSubmenu = manualHandoffModel.actions.length
     ? [
@@ -263,12 +262,6 @@ function refreshMenu() {
           },
         ]
       : []),
-    {
-      label: controlServerError
-        ? `设置页：启动失败（${controlServerError.code || "未知错误"}）`
-        : `设置页：${summarizeControlAddress(localSettingsUrl)}`,
-      enabled: false,
-    },
     ...(configErrors.length > 0
       ? [
           {
@@ -280,16 +273,6 @@ function refreshMenu() {
     { type: "separator" },
     ...manualHandoffSubmenu,
     { type: "separator" },
-    {
-      label: "打开本机设置页",
-      enabled: !controlServerError,
-      click: () => {
-        void shell.openExternal(localSettingsUrl).catch((error) => {
-          appendDiagnosticLog("Failed to open settings page", error);
-          dialog.showErrorBox(APP_NAME, `无法打开本机设置页。\n\n${error.message}`);
-        });
-      },
-    },
     {
       label: "开机时启动",
       type: "checkbox",
@@ -2230,15 +2213,6 @@ function renderSharedStyles() {
   `;
 }
 
-function summarizeControlAddress(url) {
-  try {
-    const parsedUrl = new URL(url);
-    return `${parsedUrl.hostname}:${parsedUrl.port}`;
-  } catch {
-    return "不可用";
-  }
-}
-
 function summarizeMenuMessage(message, maxLength = 72) {
   const normalized = normalizeText(message).replace(/\s+/g, " ");
   if (normalized.length <= maxLength) {
@@ -2353,10 +2327,6 @@ function getControlPath() {
 
 function getSettingsPath() {
   return `/settings/${state.controlToken}`;
-}
-
-function getLocalSettingsUrl() {
-  return `http://127.0.0.1:${activeControlPort}${getSettingsPath()}`;
 }
 
 function isLoopbackRequest(request) {
