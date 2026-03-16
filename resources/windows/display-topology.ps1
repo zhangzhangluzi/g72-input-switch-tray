@@ -1,7 +1,13 @@
 param(
+    [string]$MonitorName,
+
     [switch]$PrimaryOnly,
 
     [switch]$ExtendAll,
+
+    [switch]$DetachMonitor,
+
+    [switch]$AttachMonitor,
 
     [switch]$Summary
 )
@@ -77,6 +83,8 @@ public static class NativeDisplayTopology
     {
         public string DeviceName;
         public string DeviceString;
+        public string DeviceId;
+        public string ProductCode;
         public bool Attached;
         public bool Primary;
         public int Width;
@@ -149,6 +157,8 @@ public static class NativeDisplayTopology
                 var info = new DisplayInfo();
                 info.DeviceName = device.DeviceName;
                 info.DeviceString = device.DeviceString ?? string.Empty;
+                info.DeviceId = device.DeviceID ?? string.Empty;
+                info.ProductCode = ExtractProductCode(device.DeviceID);
                 info.Attached = (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
                 info.Primary = (device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
 
@@ -199,6 +209,42 @@ public static class NativeDisplayTopology
         }
     }
 
+    public static void DetachDisplayByDeviceName(string deviceName)
+    {
+        if (string.IsNullOrWhiteSpace(deviceName))
+        {
+            throw new InvalidOperationException("Target display device name was empty.");
+        }
+
+        var displays = GetDisplays();
+        var activeDisplays = displays.FindAll(display => display.Attached);
+        if (activeDisplays.Count == 0)
+        {
+            throw new InvalidOperationException("No active desktop displays were found.");
+        }
+
+        var targetDisplay = activeDisplays.Find(
+            display => string.Equals(display.DeviceName, deviceName, StringComparison.OrdinalIgnoreCase)
+        );
+        if (targetDisplay == null)
+        {
+            throw new InvalidOperationException("Target display " + deviceName + " is not currently attached.");
+        }
+
+        if (targetDisplay.Primary)
+        {
+            throw new InvalidOperationException("Target display " + deviceName + " is currently the primary desktop and cannot be detached directly.");
+        }
+
+        DetachDisplay(targetDisplay.DeviceName);
+
+        var finalResult = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+        if (finalResult != DISP_CHANGE_SUCCESSFUL)
+        {
+            throw new InvalidOperationException("Final display topology apply failed with code " + finalResult + ".");
+        }
+    }
+
     public static void SwitchToExtendedDesktop()
     {
         var displays = GetDisplays();
@@ -227,6 +273,53 @@ public static class NativeDisplayTopology
         {
             return;
         }
+
+        var finalResult = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+        if (finalResult != DISP_CHANGE_SUCCESSFUL)
+        {
+            throw new InvalidOperationException("Final display topology apply failed with code " + finalResult + ".");
+        }
+    }
+
+    public static void AttachDisplayByDeviceName(string deviceName)
+    {
+        if (string.IsNullOrWhiteSpace(deviceName))
+        {
+            throw new InvalidOperationException("Target display device name was empty.");
+        }
+
+        var displays = GetDisplays();
+        var activeDisplays = displays.FindAll(display => display.Attached);
+        if (activeDisplays.Count == 0)
+        {
+            throw new InvalidOperationException("No active desktop displays were found.");
+        }
+
+        var targetDisplay = displays.Find(
+            display => string.Equals(display.DeviceName, deviceName, StringComparison.OrdinalIgnoreCase)
+        );
+        if (targetDisplay == null)
+        {
+            throw new InvalidOperationException("Target display " + deviceName + " was not found.");
+        }
+
+        if (targetDisplay.Attached)
+        {
+            return;
+        }
+
+        int nextX = 0;
+        foreach (var display in activeDisplays)
+        {
+            int rightEdge = display.PositionX + Math.Max(display.Width, 1);
+            if (rightEdge > nextX)
+            {
+                nextX = rightEdge;
+            }
+        }
+
+        var primaryDisplay = activeDisplays.Find(display => display.Primary) ?? activeDisplays[0];
+        AttachDisplay(targetDisplay.DeviceName, nextX, primaryDisplay.PositionY);
 
         var finalResult = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
         if (finalResult != DISP_CHANGE_SUCCESSFUL)
@@ -343,13 +436,218 @@ public static class NativeDisplayTopology
         mode.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
         return mode;
     }
+
+    private static string ExtractProductCode(string deviceId)
+    {
+        if (string.IsNullOrEmpty(deviceId))
+        {
+            return string.Empty;
+        }
+
+        var parts = deviceId.Split('\\');
+        if (parts.Length < 2)
+        {
+            return deviceId;
+        }
+
+        return parts[1];
+    }
 }
 "@
 
+function Get-FriendlyNameMap {
+    $friendlyNameMap = @{}
+
+    foreach ($monitor in Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID) {
+        $friendlyName = ([System.Text.Encoding]::ASCII.GetString($monitor.UserFriendlyName) -replace "`0", "").Trim()
+        if ([string]::IsNullOrWhiteSpace($friendlyName)) {
+            continue
+        }
+
+        $segments = $monitor.InstanceName -split '\\'
+        if ($segments.Length -lt 2) {
+            continue
+        }
+
+        $friendlyNameMap[$segments[1].ToUpperInvariant()] = $friendlyName
+    }
+
+    return $friendlyNameMap
+}
+
+function Normalize-MonitorToken {
+    param(
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    return (($Value -replace '[^0-9A-Za-z]+', '')).ToUpperInvariant()
+}
+
+function Get-DisplayEntries {
+    param(
+        [array]$Displays,
+        [hashtable]$FriendlyNameMap
+    )
+
+    $entries = @()
+
+    foreach ($display in $Displays) {
+        $friendlyName = $null
+        $productCodeKey = [string]$display.ProductCode
+        if (-not [string]::IsNullOrWhiteSpace($productCodeKey)) {
+            $productCodeKey = $productCodeKey.ToUpperInvariant()
+        }
+
+        if ($FriendlyNameMap.ContainsKey($productCodeKey)) {
+            $friendlyName = $FriendlyNameMap[$productCodeKey]
+        }
+
+        $displayName = if ([string]::IsNullOrWhiteSpace($friendlyName)) {
+            if ([string]::IsNullOrWhiteSpace($display.ProductCode)) {
+                $display.DeviceString
+            } else {
+                $display.ProductCode
+            }
+        } else {
+            $friendlyName
+        }
+
+        $entries += [pscustomobject]@{
+            Display               = $display
+            FriendlyName          = $friendlyName
+            DisplayName           = $displayName
+            ProductCode           = $display.ProductCode
+            DeviceName            = $display.DeviceName
+            Attached              = [bool]$display.Attached
+            Primary               = [bool]$display.Primary
+            NormalizedDisplayName = Normalize-MonitorToken $displayName
+            NormalizedProductCode = Normalize-MonitorToken $display.ProductCode
+        }
+    }
+
+    return @($entries)
+}
+
+function Get-AvailableMonitorNames {
+    param(
+        [array]$DisplayEntries
+    )
+
+    $names = @()
+
+    foreach ($entry in $DisplayEntries) {
+        if (-not [string]::IsNullOrWhiteSpace($entry.DisplayName)) {
+            $names += $entry.DisplayName
+        }
+    }
+
+    return @($names | Sort-Object -Unique)
+}
+
+function Select-TargetDisplayEntry {
+    param(
+        [array]$DisplayEntries,
+        [string]$MonitorName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($MonitorName)) {
+        return $null
+    }
+
+    $requestedName = $MonitorName.Trim()
+    $requestedToken = Normalize-MonitorToken $requestedName
+    $exactMatches = @(
+        $DisplayEntries | Where-Object {
+            $_.DisplayName -ieq $requestedName -or
+            $_.ProductCode -ieq $requestedName -or
+            $_.DeviceName -ieq $requestedName
+        }
+    )
+
+    if ($exactMatches.Count -eq 1) {
+        return $exactMatches[0]
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($requestedToken)) {
+        $normalizedMatches = @(
+            $DisplayEntries | Where-Object {
+                $_.NormalizedDisplayName -eq $requestedToken -or $_.NormalizedProductCode -eq $requestedToken
+            }
+        )
+
+        if ($normalizedMatches.Count -eq 1) {
+            return $normalizedMatches[0]
+        }
+
+        $partialMatches = @(
+            $DisplayEntries | Where-Object {
+                ($_.NormalizedDisplayName.Length -gt 0 -and (
+                    $_.NormalizedDisplayName.Contains($requestedToken) -or
+                    $requestedToken.Contains($_.NormalizedDisplayName)
+                )) -or
+                ($_.NormalizedProductCode.Length -gt 0 -and (
+                    $_.NormalizedProductCode.Contains($requestedToken) -or
+                    $requestedToken.Contains($_.NormalizedProductCode)
+                ))
+            }
+        )
+
+        if ($partialMatches.Count -eq 1) {
+            return $partialMatches[0]
+        }
+    }
+
+    return $null
+}
+
 try {
+    $friendlyNameMap = Get-FriendlyNameMap
+    $displays = [NativeDisplayTopology]::GetDisplays()
+    $displayEntries = Get-DisplayEntries -Displays $displays -FriendlyNameMap $friendlyNameMap
+    $availableMonitors = Get-AvailableMonitorNames -DisplayEntries $displayEntries
+
     if ($Summary) {
-        Write-Output ([NativeDisplayTopology]::GetDisplays() | ConvertTo-Json -Compress)
+        Write-Output ($displays | ConvertTo-Json -Compress)
         exit 0
+    }
+
+    if ($DetachMonitor -or $AttachMonitor) {
+        $targetDisplayEntry = Select-TargetDisplayEntry -DisplayEntries $displayEntries -MonitorName $MonitorName
+        if ($null -eq $targetDisplayEntry) {
+            $availableText = if ($availableMonitors.Count -gt 0) {
+                $availableMonitors -join ", "
+            } else {
+                "<none>"
+            }
+
+            throw "No monitor matched '$MonitorName'. Available monitors: $availableText"
+        }
+
+        if ($DetachMonitor) {
+            [NativeDisplayTopology]::DetachDisplayByDeviceName($targetDisplayEntry.DeviceName)
+            Write-Output (@{
+                ok = $true
+                mode = "detach-monitor"
+                monitor = $targetDisplayEntry.DisplayName
+                deviceName = $targetDisplayEntry.DeviceName
+            } | ConvertTo-Json -Compress)
+            exit 0
+        }
+
+        if ($AttachMonitor) {
+            [NativeDisplayTopology]::AttachDisplayByDeviceName($targetDisplayEntry.DeviceName)
+            Write-Output (@{
+                ok = $true
+                mode = "attach-monitor"
+                monitor = $targetDisplayEntry.DisplayName
+                deviceName = $targetDisplayEntry.DeviceName
+            } | ConvertTo-Json -Compress)
+            exit 0
+        }
     }
 
     if ($PrimaryOnly) {

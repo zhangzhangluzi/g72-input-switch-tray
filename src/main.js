@@ -2828,6 +2828,13 @@ function notify(body) {
 
 async function handOffWindowsDesktop() {
   try {
+    await detachConfiguredWindowsSharedMonitor();
+    return;
+  } catch (error) {
+    appendDiagnosticLog("Targeted Windows shared-monitor detach failed; falling back to generic collapse", error);
+  }
+
+  try {
     await runWindowsDisplaySwitch("/internal");
     await waitForDisplayCount(1, "Windows 没有切成仅保留主屏。");
     return;
@@ -2835,20 +2842,19 @@ async function handOffWindowsDesktop() {
     appendDiagnosticLog("DisplaySwitch /internal did not collapse topology; trying topology helper", error);
   }
 
-  const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
-  await runCommand("powershell.exe", [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    topologyScriptPath,
-    "-PrimaryOnly",
-  ]);
+  await runWindowsTopologyCommand(["-PrimaryOnly"]);
   await waitForDisplayCount(1, "Windows 没有切成仅保留主屏。");
 }
 
 async function restoreWindowsDesktopToTargetMonitor() {
   const expectedCount = getExpectedWindowsRestoreDisplayCount();
+  try {
+    await attachConfiguredWindowsSharedMonitor(expectedCount);
+    return;
+  } catch (error) {
+    appendDiagnosticLog("Targeted Windows shared-monitor attach failed; falling back to generic extend", error);
+  }
+
   await extendWindowsDesktopToExpectedCount(expectedCount, "Windows 没有恢复到扩展显示。");
 }
 
@@ -2905,6 +2911,18 @@ function runWindowsDisplaySwitch(mode) {
   return runCommand(displaySwitchPath, [mode]);
 }
 
+async function runWindowsTopologyCommand(args) {
+  const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
+  return runCommand("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    topologyScriptPath,
+    ...args,
+  ]);
+}
+
 async function waitForDisplayCount(expectedCount, errorMessage) {
   const startedAt = Date.now();
 
@@ -2929,6 +2947,98 @@ async function waitForDisplayCount(expectedCount, errorMessage) {
   throw new Error(errorMessage);
 }
 
+async function waitForConfiguredWindowsSharedMonitorDetached(previousAttachedDisplayCount = null, errorMessage) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < 8000) {
+    try {
+      const [names, attachedDisplayCount] = await Promise.all([
+        getAvailableMonitorNames(),
+        getCurrentWindowsAttachedDisplayCount(),
+      ]);
+      const configuredMonitorVisible = doesMonitorListContainConfiguredMonitor(
+        Array.isArray(names) ? names : [],
+        state.config.monitorName
+      );
+
+      if (!configuredMonitorVisible) {
+        return;
+      }
+
+      if (
+        Number.isInteger(previousAttachedDisplayCount) &&
+        Number.isInteger(attachedDisplayCount) &&
+        attachedDisplayCount < previousAttachedDisplayCount
+      ) {
+        return;
+      }
+    } catch {
+      // Ignore transient topology/readback failures while Windows is reconfiguring.
+    }
+
+    await delay(250);
+  }
+
+  throw new Error(errorMessage);
+}
+
+async function waitForConfiguredWindowsSharedMonitorAttached(expectedCount, errorMessage) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < 8000) {
+    try {
+      const [names, attachedDisplayCount] = await Promise.all([
+        getAvailableMonitorNames(),
+        getCurrentWindowsAttachedDisplayCount(),
+      ]);
+      const configuredMonitorVisible = doesMonitorListContainConfiguredMonitor(
+        Array.isArray(names) ? names : [],
+        state.config.monitorName
+      );
+
+      if (
+        configuredMonitorVisible &&
+        (!Number.isInteger(expectedCount) ||
+          !Number.isInteger(attachedDisplayCount) ||
+          attachedDisplayCount >= expectedCount)
+      ) {
+        return;
+      }
+    } catch {
+      // Ignore transient topology/readback failures while Windows is reconfiguring.
+    }
+
+    await delay(250);
+  }
+
+  throw new Error(errorMessage);
+}
+
+async function detachConfiguredWindowsSharedMonitor() {
+  const previousAttachedDisplayCount = await getCurrentWindowsAttachedDisplayCount();
+  await runWindowsTopologyCommand([
+    "-MonitorName",
+    state.config.monitorName,
+    "-DetachMonitor",
+  ]);
+  await waitForConfiguredWindowsSharedMonitorDetached(
+    previousAttachedDisplayCount,
+    "Windows 没有把共享屏从桌面拓扑里移除。"
+  );
+}
+
+async function attachConfiguredWindowsSharedMonitor(expectedCount) {
+  await runWindowsTopologyCommand([
+    "-MonitorName",
+    state.config.monitorName,
+    "-AttachMonitor",
+  ]);
+  await waitForConfiguredWindowsSharedMonitorAttached(
+    expectedCount,
+    "Windows 没有把共享屏重新加回桌面拓扑。"
+  );
+}
+
 async function extendWindowsDesktopToExpectedCount(expectedCount, errorMessage) {
   try {
     await runWindowsDisplaySwitch("/extend");
@@ -2938,15 +3048,7 @@ async function extendWindowsDesktopToExpectedCount(expectedCount, errorMessage) 
     appendDiagnosticLog("DisplaySwitch /extend did not restore Windows shared display path; trying topology helper", error);
   }
 
-  const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
-  await runCommand("powershell.exe", [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    topologyScriptPath,
-    "-ExtendAll",
-  ]);
+  await runWindowsTopologyCommand(["-ExtendAll"]);
   await waitForDisplayCount(expectedCount, errorMessage);
 }
 
@@ -2955,17 +3057,8 @@ async function getWindowsTopologyDisplays() {
     return [];
   }
 
-  const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
-
   try {
-    const output = await runCommand("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      topologyScriptPath,
-      "-Summary",
-    ]);
+    const output = await runWindowsTopologyCommand(["-Summary"]);
     const parsed = JSON.parse(output);
     const displays = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
     return displays
