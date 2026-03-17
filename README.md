@@ -44,6 +44,8 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - Windows desktop handoff verification now reads the bundled topology helper summary back, so the app verifies the real Windows desktop topology instead of relying only on Electron's cached display list.
 - If `DisplaySwitch.exe /extend` still leaves Windows stuck on “only show on 1”, the bundled Windows topology helper now tries to re-attach the detached displays with their stored modes so the shared input can present a stable signal before the monitor switches back.
 - If you want Windows to truly drop the shared screen from desktop topology during `Windows -> Mac`, set the Windows fallback screen as the primary display; the handoff path now returns Windows to that primary display.
+- On Windows, the app also bundles a display-topology helper that can directly detach the configured shared monitor from the desktop and remember its last known mode for later re-attach attempts.
+- The Windows "refresh display state" action now forces another shared-monitor detach attempt whenever the last requested target is `Mac`, even if the previous switch result was recorded as a failure.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching now prefers BetterDisplay command-line control when it is available, because name-based matching is more reliable than a fixed display index on some Macs.
 - If `betterdisplaycli` is not installed but `BetterDisplay.app` is present in `/Applications` or `~/Applications`, the app uses the BetterDisplay bundle binary directly.

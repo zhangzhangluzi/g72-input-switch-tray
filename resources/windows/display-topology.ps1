@@ -21,6 +21,17 @@ using System.Runtime.InteropServices;
 
 public static class NativeDisplayTopology
 {
+    public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     public struct POINTL
     {
@@ -91,6 +102,27 @@ public static class NativeDisplayTopology
         public int Height;
         public int PositionX;
         public int PositionY;
+        public int BitsPerPel;
+        public int DisplayFrequency;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    public struct MONITORINFOEX
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string szDevice;
+    }
+
+    public class LogicalMonitorInfo
+    {
+        public string GdiDeviceName;
+        public string DisplayDeviceId;
+        public string DisplayProductCode;
     }
 
     private const int DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001;
@@ -98,8 +130,10 @@ public static class NativeDisplayTopology
     private const int ENUM_CURRENT_SETTINGS = -1;
     private const int ENUM_REGISTRY_SETTINGS = -2;
     private const int DM_POSITION = 0x00000020;
+    private const int DM_BITSPERPEL = 0x00040000;
     private const int DM_PELSWIDTH = 0x00080000;
     private const int DM_PELSHEIGHT = 0x00100000;
+    private const int DM_DISPLAYFREQUENCY = 0x00400000;
     private const int CDS_UPDATEREGISTRY = 0x00000001;
     private const int CDS_SET_PRIMARY = 0x00000010;
     private const int CDS_NORESET = 0x10000000;
@@ -111,6 +145,22 @@ public static class NativeDisplayTopology
         uint iDevNum,
         ref DISPLAY_DEVICE lpDisplayDevice,
         uint dwFlags
+    );
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumDisplayMonitors(
+        IntPtr hdc,
+        IntPtr clip,
+        MonitorEnumProc callback,
+        IntPtr data
+    );
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfo(
+        IntPtr hMonitor,
+        ref MONITORINFOEX info
     );
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -169,6 +219,8 @@ public static class NativeDisplayTopology
                     info.Height = mode.dmPelsHeight;
                     info.PositionX = mode.dmPosition.x;
                     info.PositionY = mode.dmPosition.y;
+                    info.BitsPerPel = mode.dmBitsPerPel;
+                    info.DisplayFrequency = mode.dmDisplayFrequency;
                 }
 
                 displays.Add(info);
@@ -178,6 +230,42 @@ public static class NativeDisplayTopology
         }
 
         return displays;
+    }
+
+    public static List<LogicalMonitorInfo> GetLogicalMonitors()
+    {
+        var results = new List<LogicalMonitorInfo>();
+
+        MonitorEnumProc callback = delegate(IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data)
+        {
+            var info = new MONITORINFOEX();
+            info.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+
+            if (!GetMonitorInfo(hMonitor, ref info))
+            {
+                return true;
+            }
+
+            var display = CreateDisplayDevice();
+            if (!EnumDisplayDevices(info.szDevice, 0, ref display, 0))
+            {
+                return true;
+            }
+
+            var logicalMonitor = new LogicalMonitorInfo();
+            logicalMonitor.GdiDeviceName = info.szDevice;
+            logicalMonitor.DisplayDeviceId = display.DeviceID ?? string.Empty;
+            logicalMonitor.DisplayProductCode = ExtractProductCode(display.DeviceID);
+            results.Add(logicalMonitor);
+            return true;
+        };
+
+        if (!EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero))
+        {
+            throw new InvalidOperationException("EnumDisplayMonitors failed.");
+        }
+
+        return results;
     }
 
     public static void SwitchToPrimaryOnly()
@@ -283,6 +371,17 @@ public static class NativeDisplayTopology
 
     public static void AttachDisplayByDeviceName(string deviceName)
     {
+        AttachDisplayByDeviceName(deviceName, 0, 0, 0, 0);
+    }
+
+    public static void AttachDisplayByDeviceName(
+        string deviceName,
+        int preferredWidth,
+        int preferredHeight,
+        int preferredBitsPerPel,
+        int preferredDisplayFrequency
+    )
+    {
         if (string.IsNullOrWhiteSpace(deviceName))
         {
             throw new InvalidOperationException("Target display device name was empty.");
@@ -319,7 +418,15 @@ public static class NativeDisplayTopology
         }
 
         var primaryDisplay = activeDisplays.Find(display => display.Primary) ?? activeDisplays[0];
-        AttachDisplay(targetDisplay.DeviceName, nextX, primaryDisplay.PositionY);
+        AttachDisplay(
+            targetDisplay.DeviceName,
+            nextX,
+            primaryDisplay.PositionY,
+            preferredWidth,
+            preferredHeight,
+            preferredBitsPerPel,
+            preferredDisplayFrequency
+        );
 
         var finalResult = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
         if (finalResult != DISP_CHANGE_SUCCESSFUL)
@@ -384,6 +491,19 @@ public static class NativeDisplayTopology
 
     private static int AttachDisplay(string deviceName, int positionX, int positionY)
     {
+        return AttachDisplay(deviceName, positionX, positionY, 0, 0, 0, 0);
+    }
+
+    private static int AttachDisplay(
+        string deviceName,
+        int positionX,
+        int positionY,
+        int preferredWidth,
+        int preferredHeight,
+        int preferredBitsPerPel,
+        int preferredDisplayFrequency
+    )
+    {
         var mode = CreateDevMode();
         if (
             !EnumDisplaySettingsEx(deviceName, ENUM_REGISTRY_SETTINGS, ref mode, 0) &&
@@ -393,17 +513,44 @@ public static class NativeDisplayTopology
             throw new InvalidOperationException("Failed to read stored mode for detached display " + deviceName + ".");
         }
 
-        if (mode.dmPelsWidth <= 0)
+        if (preferredWidth > 0)
+        {
+            mode.dmPelsWidth = preferredWidth;
+        }
+        else if (mode.dmPelsWidth <= 0)
         {
             mode.dmPelsWidth = 1920;
         }
 
-        if (mode.dmPelsHeight <= 0)
+        if (preferredHeight > 0)
+        {
+            mode.dmPelsHeight = preferredHeight;
+        }
+        else if (mode.dmPelsHeight <= 0)
         {
             mode.dmPelsHeight = 1080;
         }
 
+        if (preferredBitsPerPel > 0)
+        {
+            mode.dmBitsPerPel = preferredBitsPerPel;
+        }
+
+        if (preferredDisplayFrequency > 0)
+        {
+            mode.dmDisplayFrequency = preferredDisplayFrequency;
+        }
+
         mode.dmFields |= DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+        if (mode.dmBitsPerPel > 0)
+        {
+            mode.dmFields |= DM_BITSPERPEL;
+        }
+
+        if (mode.dmDisplayFrequency > 0)
+        {
+            mode.dmFields |= DM_DISPLAYFREQUENCY;
+        }
         mode.dmPosition.x = positionX;
         mode.dmPosition.y = positionY;
 
@@ -475,6 +622,154 @@ function Get-FriendlyNameMap {
     return $friendlyNameMap
 }
 
+function Get-DisplayCachePath {
+    $basePath = if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        Join-Path $env:TEMP "g72-input-switch-tray"
+    } else {
+        Join-Path $env:APPDATA "g72-input-switch-tray"
+    }
+
+    return Join-Path $basePath "display-topology-cache.json"
+}
+
+function Read-DisplayCache {
+    $cachePath = Get-DisplayCachePath
+    if (-not (Test-Path -LiteralPath $cachePath)) {
+        return @{}
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $cachePath -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return @{}
+        }
+
+        $parsed = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
+        $cache = @{}
+
+        if ($parsed -is [System.Collections.IEnumerable] -and -not ($parsed -is [string])) {
+            foreach ($entry in @($parsed)) {
+                if ($null -ne $entry -and -not [string]::IsNullOrWhiteSpace($entry.DeviceName)) {
+                    $cache[$entry.DeviceName.ToUpperInvariant()] = @{
+                        DeviceName   = [string]$entry.DeviceName
+                        DisplayName  = [string]$entry.DisplayName
+                        FriendlyName = [string]$entry.FriendlyName
+                        ProductCode  = [string]$entry.ProductCode
+                        Width        = [int]$entry.Width
+                        Height       = [int]$entry.Height
+                        BitsPerPel   = [int]$entry.BitsPerPel
+                        DisplayFrequency = [int]$entry.DisplayFrequency
+                        UpdatedAt    = [string]$entry.UpdatedAt
+                    }
+                }
+            }
+
+            return $cache
+        }
+
+        if ($parsed -is [hashtable]) {
+            foreach ($key in $parsed.Keys) {
+                $entry = $parsed[$key]
+                if ($entry -is [hashtable] -and -not [string]::IsNullOrWhiteSpace($entry.DeviceName)) {
+                    $cache[$entry.DeviceName.ToUpperInvariant()] = $entry
+                    continue
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($key)) {
+                    $cache[$key.ToUpperInvariant()] = @{
+                        DeviceName   = $key
+                        DisplayName  = [string]$entry.DisplayName
+                        FriendlyName = [string]$entry.FriendlyName
+                        ProductCode  = [string]$entry.ProductCode
+                        Width        = [int]$entry.Width
+                        Height       = [int]$entry.Height
+                        BitsPerPel   = [int]$entry.BitsPerPel
+                        DisplayFrequency = [int]$entry.DisplayFrequency
+                        UpdatedAt    = [string]$entry.UpdatedAt
+                    }
+                }
+            }
+
+            return $cache
+        }
+
+        if ($null -ne $parsed -and -not [string]::IsNullOrWhiteSpace($parsed.DeviceName)) {
+            $cache[$parsed.DeviceName.ToUpperInvariant()] = @{
+                DeviceName   = [string]$parsed.DeviceName
+                DisplayName  = [string]$parsed.DisplayName
+                FriendlyName = [string]$parsed.FriendlyName
+                ProductCode  = [string]$parsed.ProductCode
+                Width        = [int]$parsed.Width
+                Height       = [int]$parsed.Height
+                BitsPerPel   = [int]$parsed.BitsPerPel
+                DisplayFrequency = [int]$parsed.DisplayFrequency
+                UpdatedAt    = [string]$parsed.UpdatedAt
+            }
+
+            return $cache
+        }
+    } catch {
+        return @{}
+    }
+
+    return @{}
+}
+
+function Save-DisplayCache {
+    param(
+        [hashtable]$DisplayCache
+    )
+
+    if ($null -eq $DisplayCache) {
+        return
+    }
+
+    $cachePath = Get-DisplayCachePath
+    $cacheDirectory = Split-Path -Path $cachePath -Parent
+    if (-not (Test-Path -LiteralPath $cacheDirectory)) {
+        New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
+    }
+
+    $cacheEntries = @(
+        $DisplayCache.Values |
+            Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace($_.DeviceName) } |
+            Sort-Object DeviceName
+    )
+    $json = ConvertTo-Json -InputObject $cacheEntries -Depth 4
+    Set-Content -LiteralPath $cachePath -Value $json -Encoding UTF8
+}
+
+function Set-DisplayCacheEntry {
+    param(
+        [hashtable]$DisplayCache,
+        [string]$DeviceName,
+        [string]$DisplayName,
+        [string]$FriendlyName,
+        [string]$ProductCode,
+        [int]$Width,
+        [int]$Height,
+        [int]$BitsPerPel,
+        [int]$DisplayFrequency
+    )
+
+    if ($null -eq $DisplayCache -or [string]::IsNullOrWhiteSpace($DeviceName)) {
+        return
+    }
+
+    $cacheKey = $DeviceName.ToUpperInvariant()
+    $DisplayCache[$cacheKey] = @{
+        DeviceName   = $DeviceName
+        DisplayName  = $DisplayName
+        FriendlyName = $FriendlyName
+        ProductCode  = $ProductCode
+        Width        = $Width
+        Height       = $Height
+        BitsPerPel   = $BitsPerPel
+        DisplayFrequency = $DisplayFrequency
+        UpdatedAt    = (Get-Date).ToString("o")
+    }
+}
+
 function Normalize-MonitorToken {
     param(
         [string]$Value
@@ -487,45 +782,148 @@ function Normalize-MonitorToken {
     return (($Value -replace '[^0-9A-Za-z]+', '')).ToUpperInvariant()
 }
 
+function Test-IsGenericDisplayLabel {
+    param(
+        [string]$Value
+    )
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $true
+    }
+
+    return $text -like "VEN_*" -or
+        $text -like "AMD Radeon *" -or
+        $text -like "GameViewer Virtual Display Adapter"
+}
+
 function Get-DisplayEntries {
     param(
         [array]$Displays,
-        [hashtable]$FriendlyNameMap
+        [array]$LogicalMonitors,
+        [hashtable]$FriendlyNameMap,
+        [hashtable]$DisplayCache
     )
 
     $entries = @()
 
     foreach ($display in $Displays) {
+        $cacheKey = if ([string]::IsNullOrWhiteSpace($display.DeviceName)) {
+            ""
+        } else {
+            $display.DeviceName.ToUpperInvariant()
+        }
+        $cachedEntry = if (-not [string]::IsNullOrWhiteSpace($cacheKey) -and $DisplayCache.ContainsKey($cacheKey)) {
+            $DisplayCache[$cacheKey]
+        } else {
+            $null
+        }
+        $matchingLogicalMonitor = $null
+        if ($null -ne $LogicalMonitors) {
+            $matchingLogicalMonitor = $LogicalMonitors | Where-Object {
+                $_.GdiDeviceName -ieq $display.DeviceName
+            } | Select-Object -First 1
+        }
+
         $friendlyName = $null
-        $productCodeKey = [string]$display.ProductCode
+        $resolvedProductCode = if ($null -ne $matchingLogicalMonitor -and -not [string]::IsNullOrWhiteSpace($matchingLogicalMonitor.DisplayProductCode)) {
+            [string]$matchingLogicalMonitor.DisplayProductCode
+        } elseif ($null -ne $cachedEntry -and -not [string]::IsNullOrWhiteSpace($cachedEntry.ProductCode)) {
+            [string]$cachedEntry.ProductCode
+        } else {
+            [string]$display.ProductCode
+        }
+        $productCodeKey = $resolvedProductCode
         if (-not [string]::IsNullOrWhiteSpace($productCodeKey)) {
             $productCodeKey = $productCodeKey.ToUpperInvariant()
         }
 
         if ($FriendlyNameMap.ContainsKey($productCodeKey)) {
             $friendlyName = $FriendlyNameMap[$productCodeKey]
+        } elseif ($null -ne $cachedEntry -and -not [string]::IsNullOrWhiteSpace($cachedEntry.FriendlyName)) {
+            $friendlyName = [string]$cachedEntry.FriendlyName
         }
 
         $displayName = if ([string]::IsNullOrWhiteSpace($friendlyName)) {
-            if ([string]::IsNullOrWhiteSpace($display.ProductCode)) {
+            if ($null -ne $cachedEntry -and -not (Test-IsGenericDisplayLabel $cachedEntry.DisplayName)) {
+                [string]$cachedEntry.DisplayName
+            } elseif ($null -ne $cachedEntry -and -not (Test-IsGenericDisplayLabel $cachedEntry.ProductCode)) {
+                [string]$cachedEntry.ProductCode
+            } elseif (
+                -not [string]::IsNullOrWhiteSpace($display.DeviceString) -and
+                $display.DeviceString -ne "AMD Radeon RX 6750 GRE 12GB"
+            ) {
+                $display.DeviceString
+            } elseif ([string]::IsNullOrWhiteSpace($resolvedProductCode)) {
+                $display.DeviceString
+            } elseif ($resolvedProductCode -like "VEN_*") {
                 $display.DeviceString
             } else {
-                $display.ProductCode
+                $resolvedProductCode
             }
         } else {
             $friendlyName
+        }
+
+        $resolvedWidth = if ($display.Width -gt 0) {
+            [int]$display.Width
+        } elseif ($null -ne $cachedEntry -and [int]$cachedEntry.Width -gt 0) {
+            [int]$cachedEntry.Width
+        } else {
+            0
+        }
+        $resolvedHeight = if ($display.Height -gt 0) {
+            [int]$display.Height
+        } elseif ($null -ne $cachedEntry -and [int]$cachedEntry.Height -gt 0) {
+            [int]$cachedEntry.Height
+        } else {
+            0
+        }
+        $resolvedBitsPerPel = if ($display.BitsPerPel -gt 0) {
+            [int]$display.BitsPerPel
+        } elseif ($null -ne $cachedEntry -and [int]$cachedEntry.BitsPerPel -gt 0) {
+            [int]$cachedEntry.BitsPerPel
+        } else {
+            0
+        }
+        $resolvedDisplayFrequency = if ($display.DisplayFrequency -gt 0) {
+            [int]$display.DisplayFrequency
+        } elseif ($null -ne $cachedEntry -and [int]$cachedEntry.DisplayFrequency -gt 0) {
+            [int]$cachedEntry.DisplayFrequency
+        } else {
+            0
+        }
+
+        if (
+            -not [string]::IsNullOrWhiteSpace($display.DeviceName) -and
+            -not (Test-IsGenericDisplayLabel $displayName)
+        ) {
+            Set-DisplayCacheEntry `
+                -DisplayCache $DisplayCache `
+                -DeviceName $display.DeviceName `
+                -DisplayName $displayName `
+                -FriendlyName $friendlyName `
+                -ProductCode $resolvedProductCode `
+                -Width $resolvedWidth `
+                -Height $resolvedHeight `
+                -BitsPerPel $resolvedBitsPerPel `
+                -DisplayFrequency $resolvedDisplayFrequency
         }
 
         $entries += [pscustomobject]@{
             Display               = $display
             FriendlyName          = $friendlyName
             DisplayName           = $displayName
-            ProductCode           = $display.ProductCode
+            ProductCode           = $resolvedProductCode
             DeviceName            = $display.DeviceName
             Attached              = [bool]$display.Attached
             Primary               = [bool]$display.Primary
+            Width                 = $resolvedWidth
+            Height                = $resolvedHeight
+            BitsPerPel            = $resolvedBitsPerPel
+            DisplayFrequency      = $resolvedDisplayFrequency
             NormalizedDisplayName = Normalize-MonitorToken $displayName
-            NormalizedProductCode = Normalize-MonitorToken $display.ProductCode
+            NormalizedProductCode = Normalize-MonitorToken $resolvedProductCode
         }
     }
 
@@ -606,12 +1004,34 @@ function Select-TargetDisplayEntry {
 
 try {
     $friendlyNameMap = Get-FriendlyNameMap
+    $displayCache = Read-DisplayCache
     $displays = [NativeDisplayTopology]::GetDisplays()
-    $displayEntries = Get-DisplayEntries -Displays $displays -FriendlyNameMap $friendlyNameMap
+    $logicalMonitors = [NativeDisplayTopology]::GetLogicalMonitors()
+    $displayEntries = Get-DisplayEntries -Displays $displays -LogicalMonitors $logicalMonitors -FriendlyNameMap $friendlyNameMap -DisplayCache $displayCache
+    Save-DisplayCache -DisplayCache $displayCache
     $availableMonitors = Get-AvailableMonitorNames -DisplayEntries $displayEntries
 
     if ($Summary) {
-        Write-Output ($displays | ConvertTo-Json -Compress)
+        $summaryEntries = @(
+            foreach ($entry in $displayEntries) {
+                [pscustomobject]@{
+                    DeviceName   = $entry.DeviceName
+                    DeviceString = $entry.Display.DeviceString
+                    DisplayName  = $entry.DisplayName
+                    FriendlyName = $entry.FriendlyName
+                    ProductCode  = $entry.ProductCode
+                    Attached     = [bool]$entry.Attached
+                    Primary      = [bool]$entry.Primary
+                    Width        = [int]$entry.Width
+                    Height       = [int]$entry.Height
+                    BitsPerPel   = [int]$entry.BitsPerPel
+                    DisplayFrequency = [int]$entry.DisplayFrequency
+                    PositionX    = [int]$entry.Display.PositionX
+                    PositionY    = [int]$entry.Display.PositionY
+                }
+            }
+        )
+        Write-Output ($summaryEntries | ConvertTo-Json -Compress)
         exit 0
     }
 
@@ -639,7 +1059,13 @@ try {
         }
 
         if ($AttachMonitor) {
-            [NativeDisplayTopology]::AttachDisplayByDeviceName($targetDisplayEntry.DeviceName)
+            [NativeDisplayTopology]::AttachDisplayByDeviceName(
+                $targetDisplayEntry.DeviceName,
+                [int]$targetDisplayEntry.Width,
+                [int]$targetDisplayEntry.Height,
+                [int]$targetDisplayEntry.BitsPerPel,
+                [int]$targetDisplayEntry.DisplayFrequency
+            )
             Write-Output (@{
                 ok = $true
                 mode = "attach-monitor"

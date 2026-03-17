@@ -2952,23 +2952,26 @@ async function waitForConfiguredWindowsSharedMonitorDetached(previousAttachedDis
 
   while (Date.now() - startedAt < 8000) {
     try {
-      const [names, attachedDisplayCount] = await Promise.all([
+      const [names, attachedDisplayCount, topologyDisplays] = await Promise.all([
         getAvailableMonitorNames(),
         getCurrentWindowsAttachedDisplayCount(),
+        getWindowsTopologyDisplays(),
       ]);
       const configuredMonitorVisible = doesMonitorListContainConfiguredMonitor(
         Array.isArray(names) ? names : [],
         state.config.monitorName
       );
+      const configuredMonitorAttached = isConfiguredWindowsSharedMonitorAttached(topologyDisplays);
 
-      if (!configuredMonitorVisible) {
+      if (!configuredMonitorVisible && !configuredMonitorAttached) {
         return;
       }
 
       if (
         Number.isInteger(previousAttachedDisplayCount) &&
         Number.isInteger(attachedDisplayCount) &&
-        attachedDisplayCount < previousAttachedDisplayCount
+        attachedDisplayCount < previousAttachedDisplayCount &&
+        !configuredMonitorAttached
       ) {
         return;
       }
@@ -3078,6 +3081,9 @@ function normalizeWindowsTopologyDisplay(display) {
   return {
     deviceName: normalizeText(display.DeviceName),
     deviceString: normalizeText(display.DeviceString),
+    displayName: normalizeText(display.DisplayName),
+    friendlyName: normalizeText(display.FriendlyName),
+    productCode: normalizeText(display.ProductCode),
     attached: Boolean(display.Attached),
     primary: Boolean(display.Primary),
     width: Number.isFinite(display.Width) ? display.Width : 0,
@@ -3093,6 +3099,27 @@ function getAttachedWindowsTopologyDisplayCount(displays) {
   }
 
   return displays.filter((display) => display.attached).length;
+}
+
+function isConfiguredWindowsSharedMonitorAttached(displays) {
+  if (!Array.isArray(displays) || displays.length === 0) {
+    return false;
+  }
+
+  return displays.some(
+    (display) =>
+      display.attached &&
+      doesMonitorListContainConfiguredMonitor(
+        [
+          display.displayName,
+          display.friendlyName,
+          display.productCode,
+          display.deviceString,
+          display.deviceName,
+        ].filter(Boolean),
+        state.config.monitorName
+      )
+  );
 }
 
 function startManualSessionWatcher() {
@@ -3677,6 +3704,7 @@ async function refreshWindowsDisplayState({ notifyOnSuccess = false } = {}) {
   let availability = await updateWindowsMonitorAvailability(names);
   const attachedDisplayCount = await getCurrentWindowsAttachedDisplayCount();
   const recentTargetId = getRecentSuccessfulTargetId();
+  const lastRequestedTargetId = parseTargetId(state.lastTarget);
 
   if (state.windowsDesktop.pendingRestore && availability.status === "visible" && availability.owner === "windows") {
     const restored = await attemptPendingWindowsDesktopRestoreInternal({
@@ -3704,7 +3732,19 @@ async function refreshWindowsDisplayState({ notifyOnSuccess = false } = {}) {
     availability.owner !== "windows" &&
     (availability.owner === "mac" || recentTargetId === "mac");
 
-  if (shouldCollapseSharedMonitor) {
+  const shouldForceCollapseSharedMonitor =
+    state.config.windowsDisplayHandoffMode !== "off" &&
+    Number.isInteger(attachedDisplayCount) &&
+    attachedDisplayCount > 1 &&
+    lastRequestedTargetId === "mac";
+
+  if (shouldCollapseSharedMonitor || shouldForceCollapseSharedMonitor) {
+    if (shouldForceCollapseSharedMonitor && !shouldCollapseSharedMonitor) {
+      appendDiagnosticLog(
+        "Manual Windows refresh is forcing shared-monitor collapse based on last requested target",
+        new Error(`lastTarget=${lastRequestedTargetId || "unknown"} attachedDisplayCount=${attachedDisplayCount}`)
+      );
+    }
     await handOffWindowsDesktop();
     markPendingWindowsDesktopRestore(attachedDisplayCount);
     availability = await updateWindowsMonitorAvailability(await getAvailableMonitorNames());
