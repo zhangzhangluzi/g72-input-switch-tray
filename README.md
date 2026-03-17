@@ -27,8 +27,10 @@ Cross-platform tray app for switching any DDC/CI-capable monitor between two con
 - Windows switching is done with a bundled PowerShell DDC/CI helper that maps the target monitor through Win32 and WMI. The installer does **not** bundle `.NET`.
 - Some monitors do not report a trustworthy “current input” value over DDC/CI. The app now treats the tray state as the last command sent, and the settings page shows monitor diagnostics when Windows can read them.
 - Some monitors, especially Samsung / MStar models, continue reporting an active connection to the current computer even after the picture switches away. The app no longer treats “still attached” as a failure for those screens.
-- For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
-- On Windows, desktop handoff uses the system display switcher to move the desktop off the departing monitor, and retries extend mode until that monitor is available again.
+- For Samsung / MStar compatibility mode, the app uses a short list of known alternate values for the same port family. On Windows switch-away paths it prioritizes those alternates first, because some Samsung / MStar displays ignore the standard MCCS value but still accept the compatibility value.
+- On Windows, desktop handoff uses the system display switcher to move the desktop off the departing monitor. The app only restores extend mode after the shared monitor becomes DDC-readable again, which avoids treating a phantom re-enumerated display as a real return.
+- On Windows, the app also bundles a display-topology helper that can directly detach the configured shared monitor from the desktop and remember its last known mode for later re-attach attempts.
+- The Windows "refresh display state" action now forces another shared-monitor detach attempt whenever the last requested target is `Mac`, even if the previous switch result was recorded as a failure.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching now prefers `betterdisplaycli` when it is available, because name-based matching is more reliable than a fixed display index on some Macs.
 - If BetterDisplay CLI is unavailable, the app falls back to the bundled `ddcctl` binary built during the macOS GitHub Actions release job, and then to `ddcctl` from `PATH`.
