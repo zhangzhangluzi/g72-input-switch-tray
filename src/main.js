@@ -121,11 +121,11 @@ app.whenReady().then(() => {
   }
 
   state = loadState();
+  state.manualSession = createDefaultManualSessionState();
   saveState(state);
   startControlServer();
   startWindowsRestoreWatcher();
   startWindowsTrayWatcher();
-  startManualSessionWatcher();
   createTray();
   refreshMenu();
 });
@@ -195,16 +195,11 @@ function refreshMenu() {
 
   const openAtLogin = app.getLoginItemSettings().openAtLogin;
   const configErrors = getConfigValidationErrors(state.config);
-  const manualHandoffModel = getManualHandoffModelForCurrentPlatform();
-  const manualHandoffMenuItems = manualHandoffModel.actions.length
-    ? manualHandoffModel.actions.map((item) => ({
-        label: item.disabledReason
-          ? `${item.buttonLabel}：${summarizeMenuMessage(item.disabledReason)}`
-          : item.buttonLabel,
-        enabled: configErrors.length === 0 && !item.disabledReason,
-        click: () => handleTrayManualHandoffAction(item.targetId, item.action),
-      }))
-    : [];
+  const directSwitchMenuItems = TARGET_IDS.map((targetId) => ({
+    label: `直接切到 ${getTarget(targetId).label}`,
+    enabled: configErrors.length === 0,
+    click: () => handleTrayDirectSwitch(targetId),
+  }));
   const refreshWindowsMenuItems =
     process.platform === "win32"
       ? [
@@ -236,14 +231,6 @@ function refreshMenu() {
           },
         ]
       : []),
-    ...(state.manualSession.active
-      ? [
-          {
-            label: `手动交接：等待 ${getManualSessionRemainingSeconds()} 秒内完成`,
-            enabled: false,
-          },
-        ]
-      : []),
     ...(configErrors.length > 0
       ? [
           {
@@ -253,7 +240,7 @@ function refreshMenu() {
         ]
       : []),
     { type: "separator" },
-    ...manualHandoffMenuItems,
+    ...directSwitchMenuItems,
     ...(
       refreshWindowsMenuItems.length > 0
         ? [{ type: "separator" }, ...refreshWindowsMenuItems]
@@ -287,6 +274,15 @@ function refreshMenu() {
   ]);
 
   tray.setContextMenu(menu);
+}
+
+function handleTrayDirectSwitch(targetId) {
+  void switchMonitor(targetId, {
+    notifyOnSuccess: true,
+    showErrorDialog: false,
+  }).catch((error) => {
+    appendDiagnosticLog(`Direct local switch failed (${targetId})`, error);
+  });
 }
 
 function handleTrayManualHandoffAction(targetId, preferredAction) {
@@ -927,6 +923,8 @@ async function handleControlRequest(request, response) {
   const statePath = `/api/${state.controlToken}/state`;
   const configPath = `/api/${state.controlToken}/config`;
   const monitorsPath = `/api/${state.controlToken}/monitors`;
+  const switchWindowsPath = `/api/${state.controlToken}/switch/windows`;
+  const switchMacPath = `/api/${state.controlToken}/switch/mac`;
   const manualWindowsPath = `/api/${state.controlToken}/manual/windows`;
   const manualMacPath = `/api/${state.controlToken}/manual/mac`;
   const windowsRefreshPath = `/api/${state.controlToken}/windows/refresh`;
@@ -994,6 +992,14 @@ async function handleControlRequest(request, response) {
     return handleConfigSave(request, response, requestUrl);
   }
 
+  if (requestUrl.pathname === switchWindowsPath && request.method === "POST") {
+    return handleSwitchRequest(response, requestUrl, "windows");
+  }
+
+  if (requestUrl.pathname === switchMacPath && request.method === "POST") {
+    return handleSwitchRequest(response, requestUrl, "mac");
+  }
+
   if (requestUrl.pathname === macProbePath && request.method === "POST") {
     return handleMacProbe(request, response, requestUrl);
   }
@@ -1042,6 +1048,19 @@ async function handleConfigSave(request, response, requestUrl) {
   redirectToSettingsPage(response, requestUrl, {
     status: "success",
   });
+}
+
+async function handleSwitchRequest(response, requestUrl, targetId) {
+  try {
+    await switchMonitor(targetId, {
+      notifyOnSuccess: true,
+      showErrorDialog: false,
+    });
+  } catch (error) {
+    notify(normalizeText(error.message) || "直接切换失败。");
+  }
+
+  redirectToSettingsPage(response, requestUrl, {});
 }
 
 async function handleManualHandoffRequest(request, response, requestUrl, targetId) {
@@ -1638,7 +1657,7 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
   const statusHtml = renderSettingsBanner(status, message);
   const monitorHintHtml = renderMonitorHints(monitorNames);
   const diagnosticsHtml = renderMonitorDiagnostics(diagnostics);
-  const manualHandoffHtml = renderManualHandoffCard();
+  const directSwitchHtml = renderDirectSwitchCard();
   const macProbeHtml = renderMacProbeAssistant(macProbeDiagnostics);
 
   return `<!doctype html>
@@ -1766,11 +1785,11 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
   <main>
     <div class="eyebrow">Local Setup · v${escapeHtml(app.getVersion())}</div>
     <h1>${escapeHtml(APP_NAME)} 设置</h1>
-    <p>这里现在只保留真正还在用的配置和手动交接流程，不再展示“归属判断”“双端协同”“直接切换”这类会误导你的状态。</p>
+    <p>这里现在按“当前这台主机直接发切源命令”的逻辑工作；不再把手动交接、归属判断或双端协同放在主流程里。</p>
     <div class="stack">
       ${statusHtml}
       ${diagnosticsHtml}
-      ${manualHandoffHtml}
+      ${directSwitchHtml}
       ${macProbeHtml}
       <div class="card">
         <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/config">
@@ -1972,6 +1991,34 @@ function renderManualHandoffCard() {
     <div class="help" style="margin-top: 12px;">${escapeHtml(model.introText || model.disabledReason)}</div>
     <div class="help">${escapeHtml(model.recommendation || sessionHelp)}</div>
     ${formHtml}
+    ${refreshHtml}
+  </div>`;
+}
+
+function renderDirectSwitchCard() {
+  const switchFormsHtml = TARGET_IDS.map(
+    (targetId) => `<form method="post" action="/api/${encodeURIComponent(
+      state.controlToken
+    )}/switch/${encodeURIComponent(targetId)}" style="margin-top: 14px;">
+      <button type="submit">直接切到 ${escapeHtml(getTarget(targetId).label)}</button>
+    </form>`
+  ).join("");
+  const refreshHtml =
+    process.platform === "win32"
+      ? `<form method="post" action="/api/${encodeURIComponent(
+          state.controlToken
+        )}/windows/refresh" style="margin-top: 14px;">
+        <button type="submit" class="secondary">主动刷新 Windows 屏幕状态</button>
+      </form>`
+      : "";
+
+  return `<div class="card soft">
+    <div class="section-title">直接切换</div>
+    <div class="help" style="margin-top: 12px;">当前这台主机会直接对 ${escapeHtml(
+      state.config.monitorName || "目标显示器"
+    )} 发送切源命令。</div>
+    <div class="help">Windows 版会在切走后尝试把共享屏从本机桌面里移除；切回时再尝试加回扩展显示。</div>
+    ${switchFormsHtml}
     ${refreshHtml}
   </div>`;
 }

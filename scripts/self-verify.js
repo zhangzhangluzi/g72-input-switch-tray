@@ -196,16 +196,12 @@ function main() {
       "显示器输入切换.app"
     );
     const installedAppPath = "/Applications/显示器输入切换.app";
-    const appPaths = fs.existsSync(builtAppPath)
-      ? [builtAppPath]
-      : [installedAppPath].filter((appPath) => fs.existsSync(appPath));
-
-    if (appPaths.length === 0) {
+    if (fs.existsSync(builtAppPath)) {
+      verifyMacHelperApps(builtAppPath);
+    } else if (fs.existsSync(installedAppPath)) {
+      verifyMacHelperApps(installedAppPath);
+    } else {
       throw new Error("No macOS app bundle was found for self verification.");
-    }
-
-    for (const appPath of appPaths) {
-      verifyMacHelperApps(appPath);
     }
   }
 
