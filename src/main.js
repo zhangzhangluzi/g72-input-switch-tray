@@ -1612,9 +1612,14 @@ async function getLocalDisplaySummaries() {
   const orderedDisplays = getOrderedLocalDisplays();
   const topologyDisplays = process.platform === "win32" ? await getWindowsTopologyDisplays() : [];
   let secondaryIndex = 2;
+  const singleDisplayOnly = orderedDisplays.length <= 1;
 
   return orderedDisplays.map((display, index) => {
-    const roleLabel = display.primary ? "主屏幕" : `附屏幕 ${secondaryIndex++}`;
+    const roleLabel = singleDisplayOnly
+      ? "当前机器屏幕"
+      : display.primary
+        ? "主屏幕"
+        : `附屏幕 ${secondaryIndex++}`;
     const topologyMatch =
       process.platform === "win32"
         ? matchWindowsTopologyDisplayToElectronDisplay(display, topologyDisplays)
@@ -1940,7 +1945,7 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
           <label>
             当前这台机器里的共享屏序号
             ${
-              localDisplays.length > 0
+              localDisplays.length > 1
                 ? `<select name="localDisplayIndex">
                     ${localDisplays
                       .map((display) =>
@@ -1952,13 +1957,25 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
                       )
                       .join("")}
                   </select>`
+                : localDisplays.length === 1
+                  ? `<input type="hidden" name="localDisplayIndex" value="${escapeHtml(
+                      String(localDisplays[0].index)
+                    )}">
+                    <div class="display-item active">
+                      <div><strong>${escapeHtml(localDisplays[0].roleLabel)}</strong></div>
+                      <div class="display-meta">
+                        ${localDisplays[0].detectedName ? `系统名称：${escapeHtml(localDisplays[0].detectedName)}<br>` : ""}
+                        分辨率：${escapeHtml(localDisplays[0].resolution)}<br>
+                        位置：${escapeHtml(localDisplays[0].position)}
+                      </div>
+                    </div>`
                 : `<input name="localDisplayIndex" type="number" min="1" step="1" value="${escapeHtml(
                     String(state.config.localDisplayIndex)
                   )}">`
             }
           </label>
           <div class="help">
-            识别到几块本机屏幕，这里就会显示几项。macOS 会把这个序号传给切屏脚本；Windows 也会把它当成当前机器的共享屏参考序号。
+            识别到几块本机屏幕，这里就显示几项；如果当前机器只连了一块屏，这里就只展示这一块。macOS 会把这个序号传给切屏脚本；Windows 也会把它当成当前机器的共享屏参考序号。
           </div>
           <label>
             当前这台机器的共享屏接口
@@ -3728,6 +3745,7 @@ function startWindowsRestoreWatcher() {
 
   const scheduleAttempt = () => {
     void attemptPendingWindowsDesktopRestore();
+    void attemptWindowsDesktopAutoRestoreToLocalInterface();
     void refreshWindowsMonitorAvailability();
   };
 
@@ -3945,6 +3963,46 @@ async function attemptPendingWindowsDesktopRestoreInternal({ notifyOnSuccess = t
   }
 }
 
+async function attemptWindowsDesktopAutoRestoreToLocalInterface({ notifyOnSuccess = false } = {}) {
+  if (process.platform !== "win32" || windowsRestoreInFlight || state.config.windowsDisplayHandoffMode === "off") {
+    return false;
+  }
+
+  windowsRestoreInFlight = true;
+
+  try {
+    const names = await getAvailableMonitorNames();
+    const availability = await updateWindowsMonitorAvailability(names);
+    const localInterfaceId = getLocalInterfaceId();
+
+    if (availability.status !== "visible" || availability.owner !== localInterfaceId) {
+      return false;
+    }
+
+    const attachedDisplayCount = await getCurrentWindowsAttachedDisplayCount();
+    const expectedCount = getExpectedWindowsRestoreDisplayCount();
+    if (
+      !Number.isInteger(attachedDisplayCount) ||
+      attachedDisplayCount >= expectedCount ||
+      expectedCount <= 1
+    ) {
+      return false;
+    }
+
+    await restoreWindowsDesktopToTargetMonitor();
+    clearPendingWindowsDesktopRestore();
+    if (notifyOnSuccess) {
+      notify(`Windows 已检测到共享屏切回当前机器接口，并已主动恢复扩展显示。`);
+    }
+    return true;
+  } catch (error) {
+    appendDiagnosticLog("Windows auto-restore to local interface failed", error);
+    return false;
+  } finally {
+    windowsRestoreInFlight = false;
+  }
+}
+
 function markPendingWindowsDesktopRestore(expectedAttachedDisplayCount = null) {
   const normalizedExpectedCount =
     Number.isInteger(expectedAttachedDisplayCount) && expectedAttachedDisplayCount > 1
@@ -4027,6 +4085,29 @@ async function refreshWindowsDisplayState({ notifyOnSuccess = false } = {}) {
       availability: windowsMonitorAvailability,
       attachedDisplayCount,
     };
+  }
+
+  if (
+    !state.windowsDesktop.pendingRestore &&
+    state.config.windowsDisplayHandoffMode !== "off" &&
+    availability.status === "visible" &&
+    availability.owner === localInterfaceId
+  ) {
+    const autoRestored = await attemptWindowsDesktopAutoRestoreToLocalInterface({
+      notifyOnSuccess: false,
+    });
+    if (autoRestored) {
+      const message = "Windows 已主动刷新，并已重新把共享屏接回扩展桌面。";
+      if (notifyOnSuccess) {
+        notify(message);
+      }
+      return {
+        changed: true,
+        message,
+        availability: windowsMonitorAvailability,
+        attachedDisplayCount: await getCurrentWindowsAttachedDisplayCount(),
+      };
+    }
   }
 
   const shouldCollapseSharedMonitor =
