@@ -21,7 +21,14 @@ const PEER_CONFIRMATION_TIMEOUT_MS = 4000;
 const PEER_CONFIRMATION_POLL_MS = 250;
 const LOCAL_HANDOFF_INFERENCE_WINDOW_MS = 10 * 60 * 1000;
 const MANUAL_HANDOFF_TIMEOUT_MS = 30 * 1000;
-const TARGET_IDS = ["windows", "mac"];
+const TARGET_SLOTS = [
+  { id: "dp1", title: "DP1", defaultInputValue: 15 },
+  { id: "dp2", title: "DP2", defaultInputValue: 16 },
+  { id: "hdmi1", title: "HDMI1", defaultInputValue: 17 },
+  { id: "hdmi2", title: "HDMI2", defaultInputValue: 18 },
+];
+const TARGET_SLOT_MAP = new Map(TARGET_SLOTS.map((slot) => [slot.id, slot]));
+const TARGET_IDS = TARGET_SLOTS.map((slot) => slot.id);
 const COMMON_INPUT_VALUES = [
   { value: 15, label: "15: DP1" },
   { value: 16, label: "16: DP2" },
@@ -196,7 +203,7 @@ function refreshMenu() {
   const openAtLogin = app.getLoginItemSettings().openAtLogin;
   const configErrors = getConfigValidationErrors(state.config);
   const directSwitchMenuItems = TARGET_IDS.map((targetId) => ({
-    label: `直接切到 ${getTarget(targetId).label}`,
+    label: `直接切到 ${getSwitchActionLabel(targetId)}`,
     enabled: configErrors.length === 0,
     click: () => handleTrayDirectSwitch(targetId),
   }));
@@ -220,7 +227,11 @@ function refreshMenu() {
       enabled: false,
     },
     {
-      label: `当前显示器：${state.config.monitorName || "未设置"}`,
+      label: `当前共享屏：${state.config.monitorName || "未设置"}`,
+      enabled: false,
+    },
+    {
+      label: `本机共享屏接口：${getTarget(getLocalInterfaceId()).label}`,
       enabled: false,
     },
     ...(process.platform === "win32" && state.windowsDesktop.pendingRestore
@@ -539,8 +550,9 @@ async function prepareManualReceive(plan, target) {
 
 async function switchOnWindows(targetId, target, options = {}) {
   const { forceDisplayHandoff = false } = options;
+  const switchingToLocalInterface = isLocalInterfaceTarget(targetId);
   const attachedDisplayCountBeforeSwitch =
-    targetId !== "windows"
+    !switchingToLocalInterface
       ? await getCurrentWindowsAttachedDisplayCount()
       : null;
   const handoffEnabledByConfig = state.config.windowsDisplayHandoffMode !== "off";
@@ -549,15 +561,15 @@ async function switchOnWindows(targetId, target, options = {}) {
       attachedDisplayCountBeforeSwitch > 1) ||
     canWindowsManualTransferDetachSharedMonitor();
   const useDisplayHandoff = forceDisplayHandoff
-    ? targetId !== "windows" && canDetachSharedMonitor
-    : targetId === "windows"
+    ? !switchingToLocalInterface && canDetachSharedMonitor
+    : switchingToLocalInterface
       ? state.windowsDesktop.pendingRestore || shouldUseWindowsDisplayHandoff(state.config)
       : handoffEnabledByConfig &&
         (shouldUseWindowsDisplayHandoff(state.config) || canDetachSharedMonitor);
   await assertWindowsSharedMonitorAvailableForSwitch();
   let desktopHandedOff = false;
 
-  if (useDisplayHandoff && targetId === "windows") {
+  if (useDisplayHandoff && switchingToLocalInterface) {
     await restoreWindowsDesktopToTargetMonitor();
     clearPendingWindowsDesktopRestore();
   }
@@ -584,7 +596,7 @@ async function switchOnWindows(targetId, target, options = {}) {
   } catch (error) {
     if (
       useDisplayHandoff &&
-      targetId !== "windows" &&
+      !switchingToLocalInterface &&
       shouldAttemptWindowsDesktopHandoffRecovery(error)
     ) {
       desktopHandedOff = await attemptWindowsDesktopHandoffRecovery(
@@ -602,7 +614,7 @@ async function switchOnWindows(targetId, target, options = {}) {
     }
   }
 
-  if (useDisplayHandoff && targetId !== "windows" && !desktopHandedOff) {
+  if (useDisplayHandoff && !switchingToLocalInterface && !desktopHandedOff) {
     await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
     await handOffWindowsDesktop();
     markPendingWindowsDesktopRestore(attachedDisplayCountBeforeSwitch);
@@ -634,7 +646,7 @@ function switchOnMac(targetId, target) {
         runCommand("/bin/sh", [scriptPath, String(candidate)], {
           env: {
             DISPLAY_NAME: state.config.monitorName,
-            DISPLAY_INDEX: String(state.config.macDisplayIndex),
+            DISPLAY_INDEX: String(state.config.localDisplayIndex),
           },
         })
       )
@@ -726,7 +738,7 @@ function formatMacSwitchErrorMessage(targetId, rawMessage) {
       currentValue
     )}。这只说明显示器没有切到 ${target.label}；常见原因是 ${getTargetSlotName(
       targetId
-    )} 的输入值还没配对，或者目标设备当前没有稳定可切入的信号。请先确认目标设备正在输出画面，再到设置页里的“输入值探测助手”为 ${target.label} 测试并保存正确值。当前候选集合：${expectedValues}。`;
+    )} 的输入值还没配对，或者该接口当前没有稳定可切入的信号。请先确认目标接口背后的设备正在输出画面，再到设置页里的“输入值探测助手”为 ${target.label} 测试并保存正确值。当前候选集合：${expectedValues}。`;
   }
 
   if (/^Failed\.?$/i.test(rawMessage)) {
@@ -745,10 +757,10 @@ function formatWindowsSwitchErrorMessage(targetId, rawMessage) {
     const availableText = missingMonitorMatch[2];
 
     if (availableText === "<none>") {
-      return `Windows 当前没有看到共享屏“${requestedName}”。如果它已经切到 Mac，这是正常的，请在 Mac 端或显示器菜单把它切回；如果它本来就在 Windows 侧，请确认显示器已连接、已亮屏，并且 DDC/CI 已开启。`;
+      return `Windows 当前没有看到共享屏“${requestedName}”。如果它已经被切到不属于当前机器的其它接口，这是正常的；如果它本来就在当前机器这边，请确认显示器已连接、已亮屏，并且 DDC/CI 已开启。`;
     }
 
-    return `Windows 当前没有看到配置的共享屏“${requestedName}”。现在能看到的是：${availableText}。如果共享屏已经切到 Mac，这是预期行为，请到 Mac 端或显示器菜单切回；如果共享屏此刻明明在 Windows 侧，再把设置页里的“显示器名称”改成 Windows 实际识别到的名称。`;
+    return `Windows 当前没有看到配置的共享屏“${requestedName}”。现在能看到的是：${availableText}。如果共享屏已经被切到其它接口，这是预期行为；如果共享屏此刻明明仍在当前机器这边，再把设置页里的“显示器名称”改成 Windows 实际识别到的名称。`;
   }
 
   const noPhysicalHandleMatch = /^No physical monitor handles were found for '([^']+)'\.$/i.exec(rawMessage);
@@ -758,7 +770,7 @@ function formatWindowsSwitchErrorMessage(targetId, rawMessage) {
 
   const setInputFailedMatch = /^Setting VCP 0x60 to value ([0-9]+) failed for '([^']+)'\.$/i.exec(rawMessage);
   if (setInputFailedMatch) {
-    return `Windows 已找到“${setInputFailedMatch[2]}”，但显示器拒绝了输入值 ${setInputFailedMatch[1]}。请确认 DDC/CI 已开启，并检查模式 A / 模式 B 的输入值是否填对。`;
+    return `Windows 已找到“${setInputFailedMatch[2]}”，但显示器拒绝了输入值 ${setInputFailedMatch[1]}。请确认 DDC/CI 已开启，并检查对应接口的输入值是否填对。`;
   }
 
   const windowsMismatchMatch = /^Windows 已发送输入切换命令，但当前输入仍是 ([0-9]+)，未匹配目标值集合：([0-9 ]+)$/u.exec(
@@ -770,7 +782,7 @@ function formatWindowsSwitchErrorMessage(targetId, rawMessage) {
     const target = getTarget(targetId);
     return `Windows 已把切换命令发给 ${state.config.monitorName}，但这块共享屏仍停留在 ${describeInputValue(
       currentValue
-    )}。这通常说明 ${target.label} 的输入值还没配对，或者目标设备当前没有稳定可切入的信号。请先确认目标设备正在输出画面，再检查设置页里的输入值配置。当前候选集合：${expectedValues}。`;
+    )}。这通常说明 ${target.label} 的输入值还没配对，或者目标接口当前没有稳定可切入的信号。请先确认该接口对应的设备正在输出画面，再检查设置页里的输入值配置。当前候选集合：${expectedValues}。`;
   }
 
   const windowsVerificationMatch = /^Windows 已发送输入切换命令，但还没有确认 (.+) 是否真正接管了共享屏。$/u.exec(
@@ -923,13 +935,10 @@ async function handleControlRequest(request, response) {
   const statePath = `/api/${state.controlToken}/state`;
   const configPath = `/api/${state.controlToken}/config`;
   const monitorsPath = `/api/${state.controlToken}/monitors`;
-  const switchWindowsPath = `/api/${state.controlToken}/switch/windows`;
-  const switchMacPath = `/api/${state.controlToken}/switch/mac`;
-  const manualWindowsPath = `/api/${state.controlToken}/manual/windows`;
-  const manualMacPath = `/api/${state.controlToken}/manual/mac`;
   const windowsRefreshPath = `/api/${state.controlToken}/windows/refresh`;
   const macProbePath = `/api/${state.controlToken}/probe/mac`;
   const macProbeApplyPath = `/api/${state.controlToken}/probe/mac/apply`;
+  const switchPathMatch = new RegExp(`^/api/${state.controlToken}/switch/([^/]+)$`).exec(requestUrl.pathname);
 
   if (requestUrl.pathname === "/health") {
     return writeJson(response, 200, {
@@ -976,15 +985,16 @@ async function handleControlRequest(request, response) {
   }
 
   if (requestUrl.pathname === settingsPath) {
-    const [monitors, diagnostics, macProbeDiagnostics] = await Promise.all([
+    const [monitors, diagnostics, macProbeDiagnostics, localDisplays] = await Promise.all([
       getAvailableMonitorNames(),
       getMonitorDiagnostics(),
       getMacProbeDiagnostics(),
+      getLocalDisplaySummaries(),
     ]);
     return writeHtml(
       response,
       200,
-      renderSettingsPage(requestUrl, monitors, diagnostics, macProbeDiagnostics)
+      renderSettingsPage(requestUrl, monitors, diagnostics, macProbeDiagnostics, localDisplays)
     );
   }
 
@@ -992,12 +1002,15 @@ async function handleControlRequest(request, response) {
     return handleConfigSave(request, response, requestUrl);
   }
 
-  if (requestUrl.pathname === switchWindowsPath && request.method === "POST") {
-    return handleSwitchRequest(response, requestUrl, "windows");
-  }
+  if (switchPathMatch && request.method === "POST") {
+    const targetId = parseTargetId(decodeURIComponent(switchPathMatch[1]));
+    if (!targetId) {
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("未找到对应接口。");
+      return;
+    }
 
-  if (requestUrl.pathname === switchMacPath && request.method === "POST") {
-    return handleSwitchRequest(response, requestUrl, "mac");
+    return handleSwitchRequest(response, requestUrl, targetId);
   }
 
   if (requestUrl.pathname === macProbePath && request.method === "POST") {
@@ -1008,12 +1021,10 @@ async function handleControlRequest(request, response) {
     return handleMacProbeApply(request, response, requestUrl);
   }
 
-  if (requestUrl.pathname === manualWindowsPath) {
-    return handleManualHandoffRequest(request, response, requestUrl, "windows");
-  }
-
-  if (requestUrl.pathname === manualMacPath) {
-    return handleManualHandoffRequest(request, response, requestUrl, "mac");
+  if (requestUrl.pathname.startsWith(`/api/${state.controlToken}/manual/`)) {
+    response.writeHead(410, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("手动交接接口已移除。当前版本只保留当前主机直接切换到指定接口。");
+    return;
   }
 
   if (requestUrl.pathname === windowsRefreshPath && request.method === "POST") {
@@ -1125,10 +1136,10 @@ async function handleMacProbe(request, response, requestUrl) {
 
   if (!targetId) {
     state.macInputProbe = createMacInputProbeResult({
-      targetId: "windows",
+      targetId: getLocalInterfaceId(),
       candidate,
       status: "error",
-      message: "请选择要写回的目标模式。",
+      message: "请选择要写回的目标接口。",
     });
     saveState(state);
     redirectToSettingsPage(response, requestUrl, {});
@@ -1166,7 +1177,7 @@ async function handleMacProbeApply(request, response, requestUrl) {
     return;
   }
 
-  state.config.targets[targetId].inputValue = candidate;
+  state.config.interfaces[targetId].inputValue = candidate;
   state.macInputProbe = createMacInputProbeResult({
     targetId,
     candidate,
@@ -1280,7 +1291,7 @@ async function runMacInputProbe(targetId, candidate) {
     message:
       commandError ||
       afterResult.error ||
-      "命令已发送，但目前无法重新读回当前输入值。若画面已经切到另一台设备，请切回后把这个值保存到对应模式。",
+      "命令已发送，但目前无法重新读回当前输入值。若画面已经切到目标接口，请切回后再决定是否保存这个值。",
   });
 }
 
@@ -1330,7 +1341,7 @@ async function getMacCurrentInputResult() {
     const output = await runCommand("/bin/sh", [scriptPath, "--query-input"], {
       env: {
         DISPLAY_NAME: state.config.monitorName,
-        DISPLAY_INDEX: String(state.config.macDisplayIndex),
+        DISPLAY_INDEX: String(state.config.localDisplayIndex),
       },
     });
     const parsedValue = parseMacInputValueOutput(output);
@@ -1358,7 +1369,7 @@ function sendMacInputValue(candidate) {
   return runCommand("/bin/sh", [scriptPath, String(candidate)], {
     env: {
       DISPLAY_NAME: state.config.monitorName,
-      DISPLAY_INDEX: String(state.config.macDisplayIndex),
+      DISPLAY_INDEX: String(state.config.localDisplayIndex),
     },
   });
 }
@@ -1369,7 +1380,7 @@ function parseMacInputValueOutput(output) {
 }
 
 function createMacInputProbeResult({
-  targetId = "windows",
+  targetId = TARGET_IDS[0],
   candidate = null,
   status = "idle",
   message = "",
@@ -1394,23 +1405,23 @@ function createMacInputProbeResult({
 }
 
 function buildConfigFromForm(form) {
+  const interfaces = {};
+
+  for (const targetId of TARGET_IDS) {
+    interfaces[targetId] = {
+      inputValue: parseInputValue(form.get(`${targetId}InputValue`)),
+    };
+  }
+
   const config = {
     monitorName: normalizeText(form.get("monitorName")),
-    macDisplayIndex: normalizePositiveInteger(form.get("macDisplayIndex"), 1),
+    localDisplayIndex: normalizePositiveInteger(form.get("localDisplayIndex"), 1),
+    localInterfaceId: parseTargetId(form.get("localInterfaceId")) || TARGET_IDS[0],
     compatibilityMode: parseCompatibilityMode(form.get("compatibilityMode")),
     windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
       form.get("windowsDisplayHandoffMode")
     ),
-    targets: {
-      windows: {
-        label: normalizeText(form.get("windowsLabel")),
-        inputValue: parseInputValue(form.get("windowsInputValue")),
-      },
-      mac: {
-        label: normalizeText(form.get("macLabel")),
-        inputValue: parseInputValue(form.get("macInputValue")),
-      },
-    },
+    interfaces,
   };
 
   return {
@@ -1426,8 +1437,12 @@ function getConfigValidationErrors(config) {
     errors.push("显示器名称不能为空。");
   }
 
-  if (!Number.isInteger(config.macDisplayIndex) || config.macDisplayIndex < 1) {
-    errors.push("macOS 显示器序号必须是大于等于 1 的整数。");
+  if (!Number.isInteger(config.localDisplayIndex) || config.localDisplayIndex < 1) {
+    errors.push("本机共享屏序号必须是大于等于 1 的整数。");
+  }
+
+  if (!parseTargetId(config.localInterfaceId)) {
+    errors.push("请选择当前这台机器自己的共享屏接口。");
   }
 
   if (!["auto", "off", "samsung_mstar"].includes(config.compatibilityMode)) {
@@ -1439,11 +1454,7 @@ function getConfigValidationErrors(config) {
   }
 
   for (const targetId of TARGET_IDS) {
-    const target = config.targets?.[targetId];
-
-    if (!normalizeText(target?.label)) {
-      errors.push(`${getTargetSlotName(targetId)} 的名称不能为空。`);
-    }
+    const target = config.interfaces?.[targetId];
 
     if (!Number.isInteger(target?.inputValue) || target.inputValue < 1 || target.inputValue > 255) {
       errors.push(`${getTargetSlotName(targetId)} 的输入值必须是 1 到 255 的整数。`);
@@ -1454,7 +1465,7 @@ function getConfigValidationErrors(config) {
 }
 
 function getTargetSlotName(targetId) {
-  return targetId === "windows" ? "模式 A" : "模式 B";
+  return TARGET_SLOT_MAP.get(targetId)?.title || "接口";
 }
 
 function parseTargetId(value) {
@@ -1466,14 +1477,6 @@ function parseManualHandoffAction(value) {
 }
 
 function getOppositeTargetId(targetId) {
-  if (targetId === "windows") {
-    return "mac";
-  }
-
-  if (targetId === "mac") {
-    return "windows";
-  }
-
   return null;
 }
 
@@ -1517,10 +1520,6 @@ async function assertWindowsSharedMonitorAvailableForSwitch() {
 
   if (availability.status === "visible") {
     return;
-  }
-
-  if (availability.status === "away") {
-    throw new Error(availability.message || `${state.config.monitorName} 当前画面看起来已交给另一台电脑。`);
   }
 
   const availableText = names.length > 0 ? names.join("、") : "<none>";
@@ -1609,6 +1608,72 @@ async function getMonitorDiagnostics() {
   return diagnostics;
 }
 
+async function getLocalDisplaySummaries() {
+  const orderedDisplays = getOrderedLocalDisplays();
+  const topologyDisplays = process.platform === "win32" ? await getWindowsTopologyDisplays() : [];
+  let secondaryIndex = 2;
+
+  return orderedDisplays.map((display, index) => {
+    const roleLabel = display.primary ? "主屏幕" : `附屏幕 ${secondaryIndex++}`;
+    const topologyMatch =
+      process.platform === "win32"
+        ? matchWindowsTopologyDisplayToElectronDisplay(display, topologyDisplays)
+        : null;
+    const detectedName = normalizeText(
+      topologyMatch?.friendlyName ||
+        topologyMatch?.displayName ||
+        topologyMatch?.deviceString ||
+        display.label ||
+        ""
+    );
+
+    return {
+      index: index + 1,
+      roleLabel,
+      detectedName,
+      resolution: `${display.bounds.width} × ${display.bounds.height}`,
+      position: `${display.bounds.x}, ${display.bounds.y}`,
+      internal: Boolean(display.internal),
+      selected: index + 1 === state.config.localDisplayIndex,
+    };
+  });
+}
+
+function getOrderedLocalDisplays() {
+  try {
+    return [...screen.getAllDisplays()].sort((left, right) => {
+      if (left.primary !== right.primary) {
+        return left.primary ? -1 : 1;
+      }
+
+      if (left.bounds.y !== right.bounds.y) {
+        return left.bounds.y - right.bounds.y;
+      }
+
+      return left.bounds.x - right.bounds.x;
+    });
+  } catch {
+    return [];
+  }
+}
+
+function matchWindowsTopologyDisplayToElectronDisplay(display, topologyDisplays) {
+  if (!display || !Array.isArray(topologyDisplays) || topologyDisplays.length === 0) {
+    return null;
+  }
+
+  return (
+    topologyDisplays.find(
+      (topologyDisplay) =>
+        topologyDisplay.attached &&
+        topologyDisplay.width === display.bounds.width &&
+        topologyDisplay.height === display.bounds.height &&
+        topologyDisplay.positionX === display.bounds.x &&
+        topologyDisplay.positionY === display.bounds.y
+    ) || null
+  );
+}
+
 function parseSupportedInputsFromCapabilities(capabilities) {
   const match = /60\(([^)]*)\)/i.exec(String(capabilities || ""));
   if (!match) {
@@ -1651,13 +1716,14 @@ function redirectToPath(response, requestUrl, pathName, query) {
   response.end();
 }
 
-function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagnostics) {
+function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagnostics, localDisplays) {
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
   const statusHtml = renderSettingsBanner(status, message);
   const monitorHintHtml = renderMonitorHints(monitorNames);
   const diagnosticsHtml = renderMonitorDiagnostics(diagnostics);
-  const directSwitchHtml = renderDirectSwitchCard();
+  const localDisplaysHtml = renderLocalDisplaysCard(localDisplays);
+  const interfaceOverviewHtml = renderInterfaceOverviewCard(diagnostics, macProbeDiagnostics);
   const macProbeHtml = renderMacProbeAssistant(macProbeDiagnostics);
 
   return `<!doctype html>
@@ -1730,6 +1796,72 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
       gap: 12px;
       flex-wrap: wrap;
     }
+    .display-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .display-item {
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.62);
+      border: 1px solid var(--border);
+    }
+    .display-item.active {
+      border-color: rgba(13, 107, 98, 0.42);
+      box-shadow: inset 0 0 0 1px rgba(13, 107, 98, 0.12);
+    }
+    .display-meta {
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .interface-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-top: 14px;
+    }
+    .interface-card {
+      padding: 14px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.62);
+      border: 1px solid var(--border);
+    }
+    .interface-card.current {
+      border-color: rgba(13, 107, 98, 0.42);
+      box-shadow: inset 0 0 0 1px rgba(13, 107, 98, 0.12);
+    }
+    .status-pill.success {
+      background: var(--success-bg);
+      color: var(--success);
+    }
+    .status-pill.neutral {
+      background: rgba(13, 107, 98, 0.08);
+      color: var(--accent-strong);
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      margin-top: 10px;
+    }
+    .radio-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+      font-size: 14px;
+      color: var(--ink);
+    }
+    .radio-row input {
+      width: auto;
+      margin: 0;
+    }
     .probe-buttons {
       display: flex;
       flex-wrap: wrap;
@@ -1778,6 +1910,9 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
       .two-col {
         grid-template-columns: 1fr;
       }
+      .interface-grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -1785,28 +1920,60 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
   <main>
     <div class="eyebrow">Local Setup · v${escapeHtml(app.getVersion())}</div>
     <h1>${escapeHtml(APP_NAME)} 设置</h1>
-    <p>这里现在按“当前这台主机直接发切源命令”的逻辑工作；不再把手动交接、归属判断或双端协同放在主流程里。</p>
+    <p>这里现在只按“当前这台主机直接切换共享屏接口”的逻辑工作。界面会先展示本机识别到的屏幕，再展示这块共享屏的 4 个接口。</p>
     <div class="stack">
       ${statusHtml}
       ${diagnosticsHtml}
-      ${directSwitchHtml}
+      ${localDisplaysHtml}
+      ${interfaceOverviewHtml}
       ${macProbeHtml}
       <div class="card">
         <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/config">
           <label>
-            显示器名称
+            共享屏显示器名称
             <input name="monitorName" value="${escapeHtml(state.config.monitorName)}" placeholder="例如：G72、DELL U2723QE、LG ULTRAGEAR">
           </label>
           <div class="help">
-            Windows 会按这个名字去匹配目标显示器。macOS 会优先按这个名字调用 BetterDisplay CLI；如果回退到 ddcctl，再参考下面的显示器序号。
+            Windows 会按这个名字去匹配要控制的共享屏。macOS 会优先按这个名字调用 BetterDisplay CLI；如果回退到 ddcctl，再参考下面的本机共享屏序号。
           </div>
           ${monitorHintHtml}
           <label>
-            macOS 显示器序号
-            <input name="macDisplayIndex" type="number" min="1" step="1" value="${escapeHtml(String(state.config.macDisplayIndex))}">
+            当前这台机器里的共享屏序号
+            ${
+              localDisplays.length > 0
+                ? `<select name="localDisplayIndex">
+                    ${localDisplays
+                      .map((display) =>
+                        renderNamedOption(
+                          String(display.index),
+                          `${display.roleLabel}${display.detectedName ? ` · ${display.detectedName}` : ""}`,
+                          String(state.config.localDisplayIndex)
+                        )
+                      )
+                      .join("")}
+                  </select>`
+                : `<input name="localDisplayIndex" type="number" min="1" step="1" value="${escapeHtml(
+                    String(state.config.localDisplayIndex)
+                  )}">`
+            }
           </label>
           <div class="help">
-            这个值只影响 Mac 版本在“当前有画面时”的本机切换。应用会先试这里的序号，再自动补试常见序号；单屏通常填 1，多屏时可能需要改成 2、3 等。
+            识别到几块本机屏幕，这里就会显示几项。macOS 会把这个序号传给切屏脚本；Windows 也会把它当成当前机器的共享屏参考序号。
+          </div>
+          <label>
+            当前这台机器的共享屏接口
+            <select name="localInterfaceId">
+              ${TARGET_IDS.map((targetId) =>
+                renderNamedOption(
+                  targetId,
+                  `${getTarget(targetId).label}${targetId === getLocalInterfaceId() ? "（当前）" : ""}`,
+                  getLocalInterfaceId()
+                )
+              ).join("")}
+            </select>
+          </label>
+          <div class="help">
+            这里只告诉软件：这台机器自己的共享屏线，实际上接在共享屏的哪一个接口上。Windows 的缩屏/恢复逻辑会以这个接口为准。
           </div>
           <label>
             兼容模式
@@ -1832,35 +1999,10 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
             </select>
           </label>
           <div class="help">
-            只影响 Windows 版。切给另一台设备后，应用会尝试把 Windows 桌面退回主显示器；共享屏回到 Windows 后，再恢复扩展显示。要想切走后真正只剩保底屏，请先把保底屏设为 Windows 主显示器。
+            只影响 Windows 版。切到“不是当前机器接口”的其它接口后，应用会尝试把 Windows 桌面退回主显示器；切回“当前机器接口”后，再恢复扩展显示。要想切走后真正只剩保底屏，请先把保底屏设为 Windows 主显示器。
           </div>
-          <div class="card soft">
-            <div class="section-title">模式 A</div>
-            <div class="two-col">
-              <label>
-                名称
-                <input name="windowsLabel" value="${escapeHtml(state.config.targets.windows.label)}" placeholder="例如：工作电脑、游戏主机、Windows">
-              </label>
-              <label>
-                输入值
-                <input name="windowsInputValue" type="number" min="1" max="255" step="1" value="${escapeHtml(String(state.config.targets.windows.inputValue))}">
-              </label>
-            </div>
-            <div class="help">常见值：DP1=15，DP2=16，HDMI1=17，HDMI2=18。</div>
-          </div>
-          <div class="card soft">
-            <div class="section-title">模式 B</div>
-            <div class="two-col">
-              <label>
-                名称
-                <input name="macLabel" value="${escapeHtml(state.config.targets.mac.label)}" placeholder="例如：Mac mini、笔记本、Apple TV">
-              </label>
-              <label>
-                输入值
-                <input name="macInputValue" type="number" min="1" max="255" step="1" value="${escapeHtml(String(state.config.targets.mac.inputValue))}">
-              </label>
-            </div>
-            <div class="help">如果你的显示器把 USB-C 当作 DP，通常会用 15 或 16，而不一定是独立值。</div>
+          <div class="interface-grid">
+            ${TARGET_IDS.map((targetId) => renderInterfaceConfigCard(targetId)).join("")}
           </div>
           <div class="card">
             <div class="help">常见输入值参考</div>
@@ -1875,6 +2017,120 @@ function renderSettingsPage(requestUrl, monitorNames, diagnostics, macProbeDiagn
   </main>
 </body>
 </html>`;
+}
+
+function renderLocalDisplaysCard(localDisplays) {
+  const emptyHtml =
+    localDisplays.length === 0
+      ? `<div class="help">当前没有从系统里读到本机屏幕列表；如果这是临时状态，重新打开设置页即可。</div>`
+      : `<div class="display-list">
+          ${localDisplays
+            .map(
+              (display) => `<div class="display-item${display.selected ? " active" : ""}">
+                <div><strong>${escapeHtml(display.roleLabel)}</strong></div>
+                <div class="display-meta">
+                  ${display.detectedName ? `系统名称：${escapeHtml(display.detectedName)}<br>` : ""}
+                  分辨率：${escapeHtml(display.resolution)}<br>
+                  位置：${escapeHtml(display.position)}${display.internal ? "<br>类型：内建屏幕" : "<br>类型：外接屏幕"}
+                  ${display.selected ? "<br>当前已选为这台机器的共享屏序号。" : ""}
+                </div>
+              </div>`
+            )
+            .join("")}
+        </div>`;
+
+  return `<div class="card soft">
+    <div class="section-title">本机识别到的屏幕</div>
+    <div class="help" style="margin-top: 12px;">识别到几块本机屏幕，这里就显示几块。主屏幕永远排在最前面，其余依次显示为附屏幕 2、附屏幕 3。</div>
+    ${emptyHtml}
+  </div>`;
+}
+
+function renderInterfaceOverviewCard(diagnostics, macProbeDiagnostics) {
+  return `<div class="card soft">
+    <div class="section-title">共享屏的 4 个接口</div>
+    <div class="help" style="margin-top: 12px;">这里固定按 DP1、DP2、HDMI1、HDMI2 展示。软件能可靠读到的是“当前正在显示哪个接口”；其余未激活接口是否真的有机器连着，只能如实显示为未知。</div>
+    <div class="interface-grid">
+      ${TARGET_IDS.map((targetId) => renderInterfaceOverviewItem(targetId, diagnostics, macProbeDiagnostics)).join("")}
+    </div>
+  </div>`;
+}
+
+function renderInterfaceOverviewItem(targetId, diagnostics, macProbeDiagnostics) {
+  const target = getTarget(targetId);
+  const status = getInterfaceStatusModel(targetId, diagnostics, macProbeDiagnostics);
+  const localBadge = isLocalInterfaceTarget(targetId)
+    ? `<div class="status-pill neutral">当前机器接口</div>`
+    : "";
+
+  return `<div class="interface-card${status.current ? " current" : ""}">
+    <div class="section-title">${escapeHtml(target.label)}</div>
+    ${localBadge}
+    <div class="status-pill ${escapeHtml(status.tone)}">${escapeHtml(status.text)}</div>
+    <div class="display-meta">
+      输入值：${escapeHtml(String(target.inputValue))}<br>
+      ${escapeHtml(status.detail)}
+    </div>
+    <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/${encodeURIComponent(
+      targetId
+    )}" style="margin-top: 14px;">
+      <button type="submit">直接切到 ${escapeHtml(getSwitchActionLabel(targetId))}</button>
+    </form>
+  </div>`;
+}
+
+function renderInterfaceConfigCard(targetId) {
+  const target = getTarget(targetId);
+
+  return `<div class="interface-card${isLocalInterfaceTarget(targetId) ? " current" : ""}">
+    <div class="section-title">${escapeHtml(target.label)}</div>
+    <div class="help">默认标准值：${escapeHtml(String(TARGET_SLOT_MAP.get(targetId)?.defaultInputValue || target.inputValue))}</div>
+    <label>
+      输入值
+      <input name="${escapeHtml(targetId)}InputValue" type="number" min="1" max="255" step="1" value="${escapeHtml(
+        String(target.inputValue)
+      )}">
+    </label>
+    <label class="radio-row">
+      <input type="radio" name="localInterfaceId" value="${escapeHtml(targetId)}"${
+        isLocalInterfaceTarget(targetId) ? " checked" : ""
+      }>
+      这一路就是当前机器自己的共享屏接口
+    </label>
+  </div>`;
+}
+
+function getInterfaceStatusModel(targetId, diagnostics, macProbeDiagnostics) {
+  const target = getTarget(targetId);
+  const currentInputValue = Number.isInteger(diagnostics?.currentInputValue)
+    ? diagnostics.currentInputValue
+    : Number.isInteger(macProbeDiagnostics?.currentInputValue)
+      ? macProbeDiagnostics.currentInputValue
+      : null;
+
+  if (Number.isInteger(currentInputValue)) {
+    const current = getExpectedProbeInputValues(target.inputValue).includes(currentInputValue);
+    return {
+      current,
+      tone: current ? "success" : "neutral",
+      text: current ? "当前正在显示" : "当前未显示",
+      detail: current
+        ? `当前输入回报是 ${describeInputValue(currentInputValue)}。`
+        : `当前输入回报是 ${describeInputValue(currentInputValue)}；未激活接口的接入状态无法直接读取。`,
+    };
+  }
+
+  const supportedByMonitor = Array.isArray(diagnostics?.supportedInputs)
+    ? diagnostics.supportedInputs.some((item) => item.value === target.inputValue)
+    : false;
+  return {
+    current: false,
+    tone: "neutral",
+    text: supportedByMonitor ? "显示器声明支持" : "连接状态未知",
+    detail: supportedByMonitor
+      ? "显示器能力串里声明支持这个接口值，但当前没有读到它是否正在显示。"
+      : "当前没有可靠的输入回报，软件无法无损判断这个接口上是否真的有设备接入。",
+  };
 }
 
 function renderMonitorHints(monitorNames) {
@@ -1892,7 +2148,7 @@ function renderMonitorHints(monitorNames) {
           .map(escapeHtml)
           .join(
             "、"
-          )}。如果共享屏现在已经切到另一台电脑，这是正常的；如果它此刻明明在 Windows 侧却仍不匹配，再把这里改成 Windows 实际识别到的名称。</div>`
+          )}。如果共享屏现在已经切到别的接口，这可能是正常的；如果它此刻明明仍在当前机器这边却仍不匹配，再把这里改成系统实际识别到的名称。</div>`
       : "";
 
   return `<div>
@@ -1939,7 +2195,7 @@ function renderMonitorDiagnostics(diagnostics) {
     ? `支持列表读取失败：${escapeHtml(diagnostics.capabilitiesError)}`
     : "这些值是显示器自己通过 DDC/CI 能力串声明的输入目标。";
   const compatibilityHelp = shouldUseSamsungMstarCompat(state.config)
-    ? "当前已启用 Samsung / MStar 兼容补发。像这台 G72 这种切走后仍会保持 Windows 连接的屏，兼容补发比“判断是否断开”更可靠。"
+    ? "当前已启用 Samsung / MStar 兼容补发。对一部分三星或 MStar 方案显示器，这会比只发标准值更稳。"
     : "如果这台屏手动菜单能切、软件却没反应，建议把兼容模式改成 Samsung / MStar 再试。";
   const windowsHandoffHelp = getWindowsDisplayHandoffHelpText(state.config);
 
@@ -2033,14 +2289,14 @@ function renderMacProbeAssistant(macProbeDiagnostics) {
     : "当前 macOS 侧暂时没有读到可用的输入回报值。";
   const currentInputHelp = macProbeDiagnostics.currentInputError
     ? `读取失败：${escapeHtml(macProbeDiagnostics.currentInputError)}`
-    : "探测助手会真的向显示器发送输入切换命令。若画面切到另一台设备，请从另一台设备或显示器按键切回后，再回来查看结果。";
+    : "探测助手会真的向显示器发送输入切换命令。若画面切到目标接口，请通过当前设备的输入切换方式或显示器按键切回后，再回来查看结果。";
   const lastProbe = state.macInputProbe;
   const quickGroupsHtml = macProbeDiagnostics.quickCandidateGroups
     .map((group) => renderMacProbeQuickGroup(group))
     .join("");
   const candidateValue = Number.isInteger(lastProbe?.candidate)
     ? lastProbe.candidate
-    : state.config.targets.windows.inputValue;
+    : getTarget(getLocalInterfaceId()).inputValue;
   const resultHtml = renderMacProbeResult(lastProbe);
   const canApplyProbe = Boolean(
     lastProbe &&
@@ -2062,7 +2318,7 @@ function renderMacProbeAssistant(macProbeDiagnostics) {
           把结果用于
           <select name="targetId">
             ${TARGET_IDS.map((targetId) =>
-              renderNamedOption(targetId, getTargetSlotName(targetId), lastProbe?.targetId || "windows")
+              renderNamedOption(targetId, getTargetSlotName(targetId), lastProbe?.targetId || getLocalInterfaceId())
             ).join("")}
           </select>
         </label>
@@ -2326,19 +2582,34 @@ function getListeningPort() {
 }
 
 function getTarget(targetId) {
-  return state.config.targets[targetId];
+  const slot = TARGET_SLOT_MAP.get(targetId);
+  const configuredTarget = state.config.interfaces?.[targetId] || {};
+  return {
+    id: targetId,
+    label: slot?.title || targetId,
+    inputValue: Number.isInteger(configuredTarget.inputValue)
+      ? configuredTarget.inputValue
+      : slot?.defaultInputValue,
+  };
 }
 
 function getLocalPlatformTargetId() {
-  if (process.platform === "win32") {
-    return "windows";
-  }
+  return getLocalInterfaceId();
+}
 
-  if (process.platform === "darwin") {
-    return "mac";
-  }
+function getLocalInterfaceId() {
+  return parseTargetId(state.config.localInterfaceId) || TARGET_IDS[0];
+}
 
-  return null;
+function isLocalInterfaceTarget(targetId) {
+  return parseTargetId(targetId) === getLocalInterfaceId();
+}
+
+function getSwitchActionLabel(targetId) {
+  const target = getTarget(targetId);
+  return isLocalInterfaceTarget(targetId)
+    ? `${target.label}（当前机器接口）`
+    : target.label;
 }
 
 function getManualHandoffModelForCurrentPlatform() {
@@ -2575,13 +2846,14 @@ async function verifyWindowsSwitchOutcome(targetId, target, expectedValues) {
   let lastObservedValue = null;
   let lastErrorMessage = "";
   let missingSince = 0;
+  const localInterfaceId = getLocalInterfaceId();
 
   while (Date.now() - startedAt < 3000) {
     const names = await getAvailableMonitorNames();
     updateWindowsMonitorAvailability(names);
 
     if (!doesMonitorListContainConfiguredMonitor(names, state.config.monitorName)) {
-      if (targetId !== "windows") {
+      if (targetId !== localInterfaceId) {
         if (!missingSince) {
           missingSince = Date.now();
         }
@@ -2828,15 +3100,15 @@ function getWindowsDisplayHandoffDisabledReason() {
 
 function getWindowsDisplayHandoffHelpText(config) {
   if (process.platform !== "win32") {
-    return "如果切到另一台设备后 Windows 主屏内容还留在原位，可以在 Windows 版里调整“桌面联动”设置。";
+    return "如果切到其它接口后 Windows 主屏内容还留在原位，可以在 Windows 版里调整“桌面联动”设置。";
   }
 
   if (shouldUseWindowsDisplayHandoff(config)) {
-    return "当前已启用 Windows 桌面联动。切到模式 B 后，应用会尝试把 Windows 桌面退回主显示器；等这台共享屏回到 Windows 后，再自动恢复扩展显示。要想切走后只保留保底屏，请先把保底屏设为 Windows 主显示器。";
+    return "当前已启用 Windows 桌面联动。切到不是当前机器接口的其它接口后，应用会尝试把 Windows 桌面退回主显示器；切回当前机器接口后，再自动恢复扩展显示。要想切走后只保留保底屏，请先把保底屏设为 Windows 主显示器。";
   }
 
   if (config.windowsDisplayHandoffMode === "off") {
-    return "当前已关闭 Windows 桌面联动。切到另一台设备后，Windows 桌面布局将保持原状。";
+    return "当前已关闭 Windows 桌面联动。切到其它接口后，Windows 桌面布局将保持原状。";
   }
 
   const disabledReason = getWindowsDisplayHandoffDisabledReason();
@@ -2844,7 +3116,7 @@ function getWindowsDisplayHandoffHelpText(config) {
     return disabledReason;
   }
 
-  return "如果切到另一台设备后 Windows 主屏内容还留在原位，可以把“Windows 桌面联动”改成自动判断或强制开启。";
+  return "如果切到其它接口后 Windows 主屏内容还留在原位，可以把“Windows 桌面联动”改成自动判断或强制开启。";
 }
 
 function getSamsungMstarCandidates(inputValue) {
@@ -3386,7 +3658,7 @@ function shouldAttemptWindowsDesktopHandoffRecovery(error) {
 }
 
 async function attemptWindowsDesktopHandoffRecovery(targetId, expectedRestoreDisplayCount = null) {
-  if (process.platform !== "win32" || targetId === "windows") {
+  if (process.platform !== "win32" || isLocalInterfaceTarget(targetId)) {
     return false;
   }
 
@@ -3529,32 +3801,24 @@ async function createWindowsMonitorAvailabilitySnapshot(monitorNames, options = 
 
   const topologyDisplays = await getWindowsTopologyDisplays();
   const attachedDisplayCount = getAttachedWindowsTopologyDisplayCount(topologyDisplays);
-
-  if (shouldInferWindowsAwayFromTopology(attachedDisplayCount, options.attemptedTargetId)) {
-    return {
-      status: "away",
-      names: monitorNames,
-      message: `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据当前只剩主屏的状态，推断共享屏已经交给 Mac。`,
-      owner: "mac",
-      currentInputValue: null,
-    };
-  }
+  const inferredOwnerFromTopology = inferWindowsOwnerFromLocalDisplayState(
+    monitorNames,
+    attachedDisplayCount,
+    options.attemptedTargetId
+  );
 
   if (!doesMonitorListContainConfiguredMonitor(monitorNames, state.config.monitorName)) {
     const visibleText = monitorNames.length > 0 ? monitorNames.join("、") : "没有检测到任何显示器";
-    const inferredOwnerTargetId = inferWindowsOwnerFromLocalDisplayState(
-      monitorNames,
-      attachedDisplayCount,
-      options.attemptedTargetId
-    );
     return {
       status: "missing",
       names: monitorNames,
       message:
-        inferredOwnerTargetId === "mac"
-          ? `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；本机根据当前显示拓扑推断共享屏已经交给 Mac。现在看到的是 ${visibleText}。`
-          : `${state.config.monitorName} 当前看起来不在 Windows 侧；现在看到的是 ${visibleText}。请到 Mac 端或显示器菜单切回。`,
-      owner: inferredOwnerTargetId || "unknown",
+        inferredOwnerFromTopology && inferredOwnerFromTopology !== getLocalInterfaceId()
+          ? `${state.config.monitorName} 已经不在 Windows 当前桌面拓扑里；软件当前根据本机只剩其它屏幕的状态，推断共享屏更可能已经切到 ${getTarget(
+              inferredOwnerFromTopology
+            ).label}。现在看到的是 ${visibleText}。`
+          : `${state.config.monitorName} 当前没有出现在 Windows 本机可见列表里；现在看到的是 ${visibleText}。`,
+      owner: inferredOwnerFromTopology || "unknown",
       currentInputValue: null,
     };
   }
@@ -3573,24 +3837,12 @@ async function createWindowsMonitorAvailabilitySnapshot(monitorNames, options = 
   const currentInputValue = currentInputResult.value;
   const ownerTargetId = getOwnerTargetIdForInputValue(currentInputValue);
 
-  if (ownerTargetId === "windows") {
+  if (ownerTargetId !== "unknown") {
     return {
       status: "visible",
       names: monitorNames,
       message: "",
-      owner: "windows",
-      currentInputValue,
-    };
-  }
-
-  if (ownerTargetId === "mac") {
-    return {
-      status: "away",
-      names: monitorNames,
-      message: `${state.config.monitorName} 仍然被 Windows 枚举到，但当前输入回报是 ${describeInputValue(
-        currentInputValue
-      )}，软件当前据此推断这块共享屏的画面已经交给 Mac 了。请在 Mac 端或显示器菜单里切回 Windows。`,
-      owner: "mac",
+      owner: ownerTargetId,
       currentInputValue,
     };
   }
@@ -3675,14 +3927,14 @@ async function attemptPendingWindowsDesktopRestoreInternal({ notifyOnSuccess = t
   try {
     const names = await getAvailableMonitorNames();
     const availability = await updateWindowsMonitorAvailability(names);
-    if (availability.status !== "visible" || availability.owner !== "windows") {
+    if (availability.status !== "visible" || availability.owner !== getLocalInterfaceId()) {
       return false;
     }
 
     await restoreWindowsDesktopToTargetMonitor();
     clearPendingWindowsDesktopRestore();
     if (notifyOnSuccess) {
-      notify(`软件当前判断 ${state.config.monitorName} 已回到 Windows，并已把桌面恢复为扩展显示。`);
+      notify(`软件当前判断 ${state.config.monitorName} 已回到当前机器接口，并已把桌面恢复为扩展显示。`);
     }
     return true;
   } catch {
@@ -3752,8 +4004,13 @@ async function refreshWindowsDisplayState({ notifyOnSuccess = false } = {}) {
   const attachedDisplayCount = await getCurrentWindowsAttachedDisplayCount();
   const recentTargetId = getRecentSuccessfulTargetId();
   const lastRequestedTargetId = parseTargetId(state.lastTarget);
+  const localInterfaceId = getLocalInterfaceId();
 
-  if (state.windowsDesktop.pendingRestore && availability.status === "visible" && availability.owner === "windows") {
+  if (
+    state.windowsDesktop.pendingRestore &&
+    availability.status === "visible" &&
+    availability.owner === localInterfaceId
+  ) {
     const restored = await attemptPendingWindowsDesktopRestoreInternal({
       notifyOnSuccess: false,
     });
@@ -3776,14 +4033,15 @@ async function refreshWindowsDisplayState({ notifyOnSuccess = false } = {}) {
     state.config.windowsDisplayHandoffMode !== "off" &&
     Number.isInteger(attachedDisplayCount) &&
     attachedDisplayCount > 1 &&
-    availability.owner !== "windows" &&
-    (availability.owner === "mac" || recentTargetId === "mac");
+    availability.owner !== localInterfaceId &&
+    (parseTargetId(availability.owner) !== null || (recentTargetId && recentTargetId !== localInterfaceId));
 
   const shouldForceCollapseSharedMonitor =
     state.config.windowsDisplayHandoffMode !== "off" &&
     Number.isInteger(attachedDisplayCount) &&
     attachedDisplayCount > 1 &&
-    lastRequestedTargetId === "mac";
+    lastRequestedTargetId &&
+    lastRequestedTargetId !== localInterfaceId;
 
   if (shouldCollapseSharedMonitor || shouldForceCollapseSharedMonitor) {
     if (shouldForceCollapseSharedMonitor && !shouldCollapseSharedMonitor) {
@@ -3843,8 +4101,9 @@ function inferWindowsOwnerFromLocalDisplayState(
   attachedDisplayCount = null,
   attemptedTargetId = null
 ) {
+  const localInterfaceId = getLocalInterfaceId();
   const recentTargetId = attemptedTargetId || getRecentSuccessfulTargetId();
-  if (recentTargetId !== "mac") {
+  if (!recentTargetId || recentTargetId === localInterfaceId) {
     return null;
   }
 
@@ -3858,7 +4117,7 @@ function inferWindowsOwnerFromLocalDisplayState(
   );
 
   if (displayCount <= 1 || !configuredMonitorVisible) {
-    return "mac";
+    return recentTargetId;
   }
 
   return null;
@@ -3871,22 +4130,23 @@ function shouldInferWindowsAwayFromTopology(attachedDisplayCount = null, attempt
       : getWindowsDisplayCount();
   return (
     displayCount <= 1 &&
-    inferWindowsOwnerFromLocalDisplayState([], displayCount, attemptedTargetId) === "mac"
+    Boolean(inferWindowsOwnerFromLocalDisplayState([], displayCount, attemptedTargetId))
   );
 }
 
 function inferMacOwnerFromLocalDisplayState(attemptedTargetId = null) {
+  const localInterfaceId = getLocalInterfaceId();
   const recentTargetId = attemptedTargetId || getRecentSuccessfulTargetId();
-  if (recentTargetId !== "windows") {
+  if (!recentTargetId || recentTargetId === localInterfaceId) {
     return null;
   }
 
   try {
     if (screen.getAllDisplays().length === 0) {
-      return "windows";
+      return recentTargetId;
     }
   } catch {
-    return "windows";
+    return recentTargetId;
   }
 
   return null;
@@ -3977,22 +4237,83 @@ function resetManualSessionState() {
   state.manualSession = createDefaultManualSessionState();
 }
 
+function createDefaultInterfacesConfig() {
+  const interfaces = {};
+
+  for (const slot of TARGET_SLOTS) {
+    interfaces[slot.id] = {
+      inputValue: slot.defaultInputValue,
+    };
+  }
+
+  return interfaces;
+}
+
+function getInterfaceIdByDefaultInputValue(inputValue) {
+  const parsedValue = normalizePositiveInteger(inputValue, 0);
+  const matchedSlot = TARGET_SLOTS.find((slot) => slot.defaultInputValue === parsedValue);
+  return matchedSlot ? matchedSlot.id : null;
+}
+
+function migrateLegacyInterfacesConfig(rawConfig, defaults) {
+  const nextInterfaces = { ...defaults.config.interfaces };
+
+  if (rawConfig.interfaces && typeof rawConfig.interfaces === "object") {
+    for (const targetId of TARGET_IDS) {
+      nextInterfaces[targetId] = {
+        inputValue: normalizePositiveInteger(
+          rawConfig.interfaces?.[targetId]?.inputValue,
+          defaults.config.interfaces[targetId].inputValue
+        ),
+      };
+    }
+
+    return nextInterfaces;
+  }
+
+  const rawTargets = rawConfig.targets || {};
+  for (const legacyTarget of [rawTargets.windows, rawTargets.mac]) {
+    const mappedTargetId = getInterfaceIdByDefaultInputValue(legacyTarget?.inputValue);
+    if (!mappedTargetId) {
+      continue;
+    }
+
+    nextInterfaces[mappedTargetId] = {
+      inputValue: normalizePositiveInteger(
+        legacyTarget?.inputValue,
+        defaults.config.interfaces[mappedTargetId].inputValue
+      ),
+    };
+  }
+
+  return nextInterfaces;
+}
+
+function inferLocalInterfaceIdFromConfig(rawConfig, defaults) {
+  const configuredLocalInterfaceId = parseTargetId(rawConfig.localInterfaceId);
+  if (configuredLocalInterfaceId) {
+    return configuredLocalInterfaceId;
+  }
+
+  const rawTargets = rawConfig.targets || {};
+  const legacyLocalTarget =
+    process.platform === "win32"
+      ? rawTargets.windows
+      : process.platform === "darwin"
+        ? rawTargets.mac
+        : null;
+  const migratedInterfaceId = getInterfaceIdByDefaultInputValue(legacyLocalTarget?.inputValue);
+  return migratedInterfaceId || defaults.config.localInterfaceId;
+}
+
 function createDefaultConfig() {
   return {
-    monitorName: "G72",
-    macDisplayIndex: 1,
+    monitorName: "",
+    localDisplayIndex: 1,
+    localInterfaceId: TARGET_IDS[0],
     compatibilityMode: "auto",
     windowsDisplayHandoffMode: "auto",
-    targets: {
-      windows: {
-        label: "Windows（DP2）",
-        inputValue: 16,
-      },
-      mac: {
-        label: "Mac mini（HDMI1）",
-        inputValue: 17,
-      },
-    },
+    interfaces: createDefaultInterfacesConfig(),
   };
 }
 
@@ -4035,7 +4356,6 @@ function loadState() {
 function normalizeState(nextState) {
   const defaults = createDefaultState();
   const rawConfig = nextState.config || {};
-  const rawTargets = rawConfig.targets || {};
 
   return {
     lastTarget: TARGET_IDS.includes(nextState.lastTarget) ? nextState.lastTarget : null,
@@ -4051,22 +4371,17 @@ function normalizeState(nextState) {
     lastSwitchOutcome: createSwitchOutcome(nextState.lastSwitchOutcome),
     macInputProbe: normalizeMacInputProbeState(nextState.macInputProbe, defaults.macInputProbe),
     config: {
-      monitorName: normalizeText(rawConfig.monitorName) || defaults.config.monitorName,
-      macDisplayIndex: normalizePositiveInteger(rawConfig.macDisplayIndex, defaults.config.macDisplayIndex),
+      monitorName: normalizeText(rawConfig.monitorName),
+      localDisplayIndex: normalizePositiveInteger(
+        rawConfig.localDisplayIndex ?? rawConfig.macDisplayIndex,
+        defaults.config.localDisplayIndex
+      ),
+      localInterfaceId: inferLocalInterfaceIdFromConfig(rawConfig, defaults),
       compatibilityMode: parseCompatibilityMode(rawConfig.compatibilityMode || defaults.config.compatibilityMode),
       windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
         rawConfig.windowsDisplayHandoffMode || defaults.config.windowsDisplayHandoffMode
       ),
-      targets: {
-        windows: {
-          label: normalizeText(rawTargets.windows?.label) || defaults.config.targets.windows.label,
-          inputValue: normalizePositiveInteger(rawTargets.windows?.inputValue, defaults.config.targets.windows.inputValue),
-        },
-        mac: {
-          label: normalizeText(rawTargets.mac?.label) || defaults.config.targets.mac.label,
-          inputValue: normalizePositiveInteger(rawTargets.mac?.inputValue, defaults.config.targets.mac.inputValue),
-        },
-      },
+      interfaces: migrateLegacyInterfacesConfig(rawConfig, defaults),
     },
   };
 }
