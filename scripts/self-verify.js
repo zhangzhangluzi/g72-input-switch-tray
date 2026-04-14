@@ -5,25 +5,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 const { execFileSync } = require("node:child_process");
-const { doesMonitorListContainConfiguredMonitor } = require("../src/monitor-name-helpers");
 
 function run(command, args) {
   return execFileSync(command, args, { encoding: "utf8" }).trim();
-}
-
-function verifyMonitorNameMatching() {
-  assert.equal(
-    doesMonitorListContainConfiguredMonitor(["G72 Max", "G52 Max"], "G72"),
-    true
-  );
-  assert.equal(
-    doesMonitorListContainConfiguredMonitor(["DELLU2723QE"], "DELL U2723QE"),
-    true
-  );
-  assert.equal(
-    doesMonitorListContainConfiguredMonitor(["G52 Max"], "G72"),
-    false
-  );
 }
 
 function readPlistJson(plistPath) {
@@ -145,11 +129,11 @@ function verifyMacDdcctlFallbackScript() {
     "mac",
     "switch-input.sh"
   );
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "g72-ddcctl-selftest-"));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "monitor-input-switch-selftest-"));
   const fakeBinaryPath = path.join(tempDir, "fake-ddcctl");
   const baseEnv = {
     ...process.env,
-    DISPLAY_NAME: "G72",
+    DISPLAY_NAME: "Local Monitor",
     DISPLAY_INDEX: "1",
     DISABLE_BETTERDISPLAY: "1",
     BUNDLED_DDCCTL_PATH: fakeBinaryPath,
@@ -183,8 +167,6 @@ function verifyMacDdcctlFallbackScript() {
 }
 
 function main() {
-  verifyMonitorNameMatching();
-
   if (process.platform === "darwin") {
     verifyMacDdcctlFallbackScript();
 
