@@ -1,6 +1,8 @@
 param(
     [string]$MonitorName,
 
+    [string]$GdiDeviceName,
+
     [ValidateRange(1, 255)]
     [int]$InputValue,
 
@@ -14,8 +16,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $ListOnly -and -not $ReadInputValue -and -not $ReadCapabilities) {
-    if ([string]::IsNullOrWhiteSpace($MonitorName)) {
-        throw "MonitorName was not provided."
+    if ([string]::IsNullOrWhiteSpace($MonitorName) -and [string]::IsNullOrWhiteSpace($GdiDeviceName)) {
+        throw "MonitorName or GdiDeviceName was not provided."
     }
 
     if (-not $PSBoundParameters.ContainsKey("InputValue")) {
@@ -343,6 +345,7 @@ function Get-MonitorEntries {
             FriendlyName          = $friendlyName
             DisplayName           = $displayName
             ProductCode           = $logicalMonitor.DisplayProductCode
+            GdiDeviceName         = $logicalMonitor.GdiDeviceName
             NormalizedDisplayName = Normalize-MonitorToken $displayName
             NormalizedProductCode = Normalize-MonitorToken $logicalMonitor.DisplayProductCode
         }
@@ -370,8 +373,22 @@ function Get-AvailableMonitorNames {
 function Select-TargetMonitorEntry {
     param(
         [array]$MonitorEntries,
-        [string]$MonitorName
+        [string]$MonitorName,
+        [string]$GdiDeviceName
     )
+
+    if (-not [string]::IsNullOrWhiteSpace($GdiDeviceName)) {
+        $requestedDeviceName = $GdiDeviceName.Trim()
+        $deviceMatches = @(
+            $MonitorEntries | Where-Object {
+                $_.GdiDeviceName -ieq $requestedDeviceName
+            }
+        )
+
+        if ($deviceMatches.Count -eq 1) {
+            return $deviceMatches[0]
+        }
+    }
 
     if ([string]::IsNullOrWhiteSpace($MonitorName)) {
         return $null
@@ -449,12 +466,16 @@ try {
         exit 0
     }
 
-    $targetMonitorEntry = Select-TargetMonitorEntry -MonitorEntries $monitorEntries -MonitorName $MonitorName
+    $targetMonitorEntry = Select-TargetMonitorEntry -MonitorEntries $monitorEntries -MonitorName $MonitorName -GdiDeviceName $GdiDeviceName
     if ($null -eq $targetMonitorEntry) {
         $availableText = if ($availableMonitors.Count -gt 0) {
             $availableMonitors -join ", "
         } else {
             "<none>"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($GdiDeviceName)) {
+            throw "No monitor matched GDI device '$GdiDeviceName'. Available monitors: $availableText"
         }
 
         throw "No monitor matched '$MonitorName'. Available monitors: $availableText"
@@ -475,6 +496,7 @@ try {
                 if ([NativeDisplayMapper]::TryGetInput($physicalMonitor, [ref]$currentValue, [ref]$maximumValue)) {
                     Write-Output (@{
                         monitor = $targetDisplayName
+                        gdiDeviceName = $targetMonitorEntry.GdiDeviceName
                         currentInputValue = [int]$currentValue
                         maximumValue = [int]$maximumValue
                     } | ConvertTo-Json -Compress)
@@ -496,6 +518,7 @@ try {
                 if (-not [string]::IsNullOrWhiteSpace($capabilities)) {
                     Write-Output (@{
                         monitor = $targetDisplayName
+                        gdiDeviceName = $targetMonitorEntry.GdiDeviceName
                         capabilities = $capabilities
                     } | ConvertTo-Json -Compress)
                     exit 0

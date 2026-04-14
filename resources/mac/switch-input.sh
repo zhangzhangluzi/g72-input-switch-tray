@@ -5,6 +5,7 @@ COMMAND="${1:-}"
 INPUT_VALUE="$COMMAND"
 DISPLAY_NAME="${DISPLAY_NAME:-}"
 DISPLAY_INDEX="${DISPLAY_INDEX:-1}"
+DISPLAY_ID="${DISPLAY_ID:-}"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BUNDLED_DDCCTL="${BUNDLED_DDCCTL_PATH:-$SCRIPT_DIR/../bin/ddcctl}"
 BETTERDISPLAY_APP_PATH="${BETTERDISPLAY_APP_PATH:-}"
@@ -96,12 +97,12 @@ query_betterdisplay_input() {
   betterdisplay_path="$1"
   betterdisplay_mode="$2"
 
-  if [ "$betterdisplay_mode" = "cli" ]; then
-    "$betterdisplay_path" get -namelike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value 2>&1
+  if [ -n "$DISPLAY_ID" ]; then
+    "$betterdisplay_path" get -displayID="$DISPLAY_ID" -feature=ddc -vcp=inputSelect -value 2>&1
     return $?
   fi
 
-  "$betterdisplay_path" get -nameLike="$DISPLAY_NAME" -ddc -vcp=inputSelect -value 2>&1
+  "$betterdisplay_path" get -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value 2>&1
 }
 
 extract_numeric_output() {
@@ -123,7 +124,7 @@ resolve_betterdisplay() {
       ;;
   esac
 
-  if [ -z "$DISPLAY_NAME" ]; then
+  if [ -z "$DISPLAY_NAME" ] && [ -z "$DISPLAY_ID" ]; then
     return 1
   fi
 
@@ -181,28 +182,56 @@ verify_betterdisplay_switch() {
   betterdisplay_path="$1"
   betterdisplay_mode="$2"
   expected_values=$(get_expected_input_values)
+  attempt=1
+  max_attempts=5
+  output=""
+  current_value=""
 
-  if ! output=$(query_betterdisplay_input "$betterdisplay_path" "$betterdisplay_mode"); then
-    remember_error "$output" 3
-    return 1
-  fi
-
-  current_value=$(printf '%s\n' "$output" | tr -d '\r' | tail -n 1 | tr -d '[:space:]')
-
-  case "$current_value" in
-    ''|*[!0-9]*)
-      remember_error "BetterDisplay 写入后返回了无法识别的当前输入值：${output}" 3
-      return 1
-      ;;
-  esac
-
-  for expected_value in $expected_values; do
-    if [ "$current_value" = "$expected_value" ]; then
-      return 0
+  while [ "$attempt" -le "$max_attempts" ]; do
+    if [ "$attempt" -gt 1 ]; then
+      sleep 1
     fi
+
+    if ! output=$(query_betterdisplay_input "$betterdisplay_path" "$betterdisplay_mode"); then
+      if [ "$attempt" -lt "$max_attempts" ]; then
+        attempt=$((attempt + 1))
+        continue
+      fi
+
+      remember_error "$output" 3
+      return 1
+    fi
+
+    current_value=$(printf '%s\n' "$output" | tr -d '\r' | tail -n 1 | tr -d '[:space:]')
+
+    case "$current_value" in
+      ''|*[!0-9]*)
+        if [ "$attempt" -lt "$max_attempts" ]; then
+          attempt=$((attempt + 1))
+          continue
+        fi
+
+        remember_error "BetterDisplay 写入后返回了无法识别的当前输入值：${output}" 3
+        return 1
+        ;;
+    esac
+
+    for expected_value in $expected_values; do
+      if [ "$current_value" = "$expected_value" ]; then
+        return 0
+      fi
+    done
+
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    remember_error "BetterDisplay 已发送输入切换命令，但当前输入仍是 ${current_value}，未匹配目标值集合：${expected_values}" 3
+    return 1
   done
 
-  remember_error "BetterDisplay 已发送输入切换命令，但当前输入仍是 ${current_value}，未匹配目标值集合：${expected_values}" 3
+  remember_error "BetterDisplay 写入后没有得到可确认的输入值回读。" 3
   return 1
 }
 
@@ -293,8 +322,8 @@ try_betterdisplay() {
     return 1
   fi
 
-  if [ "$BETTERDISPLAY_MODE" = "cli" ]; then
-    if output=$("$BETTERDISPLAY_PATH" set -namelike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value="$INPUT_VALUE" 2>&1); then
+  if [ -n "$DISPLAY_ID" ]; then
+    if output=$("$BETTERDISPLAY_PATH" set -displayID="$DISPLAY_ID" -feature=ddc -vcp=inputSelect -value="$INPUT_VALUE" 2>&1); then
       if verify_betterdisplay_switch "$BETTERDISPLAY_PATH" "$BETTERDISPLAY_MODE"; then
         return 0
       fi
@@ -302,7 +331,7 @@ try_betterdisplay() {
 
     remember_error "$output" 2
 
-    if output=$("$BETTERDISPLAY_PATH" set -namelike="$DISPLAY_NAME" -feature=ddc -vcp=0x60 -value="$INPUT_VALUE" 2>&1); then
+    if output=$("$BETTERDISPLAY_PATH" set -displayID="$DISPLAY_ID" -feature=ddc -vcp=0x60 -value="$INPUT_VALUE" 2>&1); then
       if verify_betterdisplay_switch "$BETTERDISPLAY_PATH" "$BETTERDISPLAY_MODE"; then
         return 0
       fi
@@ -312,7 +341,7 @@ try_betterdisplay() {
     return 1
   fi
 
-  if output=$("$BETTERDISPLAY_PATH" set -nameLike="$DISPLAY_NAME" -ddc -vcp=inputSelect -value="$INPUT_VALUE" 2>&1); then
+  if output=$("$BETTERDISPLAY_PATH" set -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value="$INPUT_VALUE" 2>&1); then
     if verify_betterdisplay_switch "$BETTERDISPLAY_PATH" "$BETTERDISPLAY_MODE"; then
       return 0
     fi
@@ -320,7 +349,7 @@ try_betterdisplay() {
 
   remember_error "$output" 2
 
-  if output=$("$BETTERDISPLAY_PATH" set -nameLike="$DISPLAY_NAME" -ddc -vcp=0x60 -value="$INPUT_VALUE" 2>&1); then
+  if output=$("$BETTERDISPLAY_PATH" set -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=0x60 -value="$INPUT_VALUE" 2>&1); then
     if verify_betterdisplay_switch "$BETTERDISPLAY_PATH" "$BETTERDISPLAY_MODE"; then
       return 0
     fi

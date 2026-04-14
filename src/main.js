@@ -122,19 +122,20 @@ app.on("before-quit", () => {
   }
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   if (process.platform === "darwin" && app.dock) {
     app.dock.hide();
   }
 
   state = loadState();
   state.manualSession = createDefaultManualSessionState();
+  await syncMonitorConfigsFromLocalDisplays({ persist: false });
   saveState(state);
   startControlServer();
   startWindowsRestoreWatcher();
   startWindowsTrayWatcher();
   createTray();
-  refreshMenu();
+  void refreshMenu();
 });
 
 function createTray() {
@@ -644,10 +645,7 @@ function switchOnMac(targetId, target) {
     .then(() =>
       runCandidateSequence(candidates, (candidate) =>
         runCommand("/bin/sh", [scriptPath, String(candidate)], {
-          env: {
-            DISPLAY_NAME: state.config.monitorName,
-            DISPLAY_INDEX: String(state.config.localDisplayIndex),
-          },
+          env: getMacSwitchScriptEnv(),
         })
       )
     )
@@ -1339,10 +1337,7 @@ async function getMacCurrentInputResult() {
 
   try {
     const output = await runCommand("/bin/sh", [scriptPath, "--query-input"], {
-      env: {
-        DISPLAY_NAME: state.config.monitorName,
-        DISPLAY_INDEX: String(state.config.localDisplayIndex),
-      },
+      env: getMacSwitchScriptEnv(),
     });
     const parsedValue = parseMacInputValueOutput(output);
 
@@ -1367,10 +1362,7 @@ async function getMacCurrentInputResult() {
 function sendMacInputValue(candidate) {
   const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
   return runCommand("/bin/sh", [scriptPath, String(candidate)], {
-    env: {
-      DISPLAY_NAME: state.config.monitorName,
-      DISPLAY_INDEX: String(state.config.localDisplayIndex),
-    },
+    env: getMacSwitchScriptEnv(),
   });
 }
 
@@ -1660,6 +1652,30 @@ function getOrderedLocalDisplays() {
   } catch {
     return [];
   }
+}
+
+function getConfiguredLocalDisplay() {
+  const orderedDisplays = getOrderedLocalDisplays();
+  if (orderedDisplays.length === 0) {
+    return null;
+  }
+
+  const configuredIndex = normalizePositiveInteger(state.config.localDisplayIndex, 1);
+  return orderedDisplays[configuredIndex - 1] || orderedDisplays[0] || null;
+}
+
+function getMacSwitchScriptEnv() {
+  const env = {
+    DISPLAY_NAME: state.config.monitorName,
+    DISPLAY_INDEX: String(state.config.localDisplayIndex),
+  };
+  const localDisplay = getConfiguredLocalDisplay();
+
+  if (process.platform === "darwin" && localDisplay && Number.isInteger(localDisplay.id)) {
+    env.DISPLAY_ID = String(localDisplay.id);
+  }
+
+  return env;
 }
 
 function matchWindowsTopologyDisplayToElectronDisplay(display, topologyDisplays) {
@@ -4562,4 +4578,1754 @@ function shellEscape(value) {
 
 function appleScriptEscape(value) {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+let monitorMenuRefreshInFlight = false;
+let monitorMenuRefreshQueued = false;
+
+function cloneInterfacesConfig(sourceInterfaces = null) {
+  const defaults = createDefaultInterfacesConfig();
+  const nextInterfaces = {};
+
+  for (const targetId of TARGET_IDS) {
+    nextInterfaces[targetId] = {
+      inputValue: normalizePositiveInteger(
+        sourceInterfaces?.[targetId]?.inputValue,
+        defaults[targetId].inputValue
+      ),
+    };
+  }
+
+  return nextInterfaces;
+}
+
+function getMonitorIdForDisplayKey(displayKey) {
+  const normalizedKey = normalizeText(displayKey) || crypto.randomBytes(6).toString("hex");
+  return `monitor-${crypto.createHash("sha1").update(normalizedKey).digest("hex").slice(0, 12)}`;
+}
+
+function createDefaultMonitorConfig(partial = {}) {
+  const displayKey = normalizeText(partial.displayKey);
+
+  return {
+    id: normalizeText(partial.id) || getMonitorIdForDisplayKey(displayKey),
+    displayKey,
+    roleLabel: normalizeText(partial.roleLabel),
+    displayName: normalizeText(partial.displayName),
+    localInterfaceId: parseTargetId(partial.localInterfaceId) || TARGET_IDS[0],
+    compatibilityMode: parseCompatibilityMode(partial.compatibilityMode),
+    windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(partial.windowsDisplayHandoffMode),
+    interfaces: cloneInterfacesConfig(partial.interfaces),
+    match: {
+      electronDisplayId: Number.isInteger(partial.match?.electronDisplayId)
+        ? partial.match.electronDisplayId
+        : null,
+      gdiDeviceName: normalizeText(partial.match?.gdiDeviceName),
+      productCode: normalizeText(partial.match?.productCode),
+    },
+  };
+}
+
+function normalizeMonitorConfig(rawMonitorConfig = {}, fallbackMonitorConfig = {}) {
+  const baseline = createDefaultMonitorConfig(fallbackMonitorConfig);
+  return createDefaultMonitorConfig({
+    ...baseline,
+    ...rawMonitorConfig,
+    id: normalizeText(rawMonitorConfig.id) || baseline.id,
+    displayKey: normalizeText(rawMonitorConfig.displayKey) || baseline.displayKey,
+    roleLabel: normalizeText(rawMonitorConfig.roleLabel) || baseline.roleLabel,
+    displayName: normalizeText(rawMonitorConfig.displayName) || baseline.displayName,
+    localInterfaceId:
+      parseTargetId(rawMonitorConfig.localInterfaceId) || baseline.localInterfaceId,
+    compatibilityMode:
+      parseCompatibilityMode(rawMonitorConfig.compatibilityMode) || baseline.compatibilityMode,
+    windowsDisplayHandoffMode:
+      parseWindowsDisplayHandoffMode(rawMonitorConfig.windowsDisplayHandoffMode) ||
+      baseline.windowsDisplayHandoffMode,
+    interfaces: cloneInterfacesConfig(rawMonitorConfig.interfaces || baseline.interfaces),
+    match: {
+      electronDisplayId: Number.isInteger(rawMonitorConfig.match?.electronDisplayId)
+        ? rawMonitorConfig.match.electronDisplayId
+        : baseline.match.electronDisplayId,
+      gdiDeviceName:
+        normalizeText(rawMonitorConfig.match?.gdiDeviceName) || baseline.match.gdiDeviceName,
+      productCode:
+        normalizeText(rawMonitorConfig.match?.productCode) || baseline.match.productCode,
+    },
+  });
+}
+
+function createDefaultConfig() {
+  return {
+    monitorName: "",
+    localDisplayIndex: 1,
+    localInterfaceId: TARGET_IDS[0],
+    compatibilityMode: "auto",
+    windowsDisplayHandoffMode: "auto",
+    interfaces: createDefaultInterfacesConfig(),
+    monitors: [],
+  };
+}
+
+function createDefaultState() {
+  return {
+    lastTarget: null,
+    controlToken: crypto.randomBytes(12).toString("hex"),
+    windowsDesktop: {
+      pendingRestore: false,
+      expectedAttachedDisplayCount: 0,
+      byMonitorId: {},
+    },
+    manualSession: createDefaultManualSessionState(),
+    lastSwitchOutcome: createSwitchOutcome(),
+    macInputProbe: createMacInputProbeResult(),
+    config: createDefaultConfig(),
+  };
+}
+
+function createLegacyMonitorConfig(rawConfig, defaults) {
+  return normalizeMonitorConfig(
+    {
+      id: "legacy-monitor",
+      displayKey: normalizeText(rawConfig.displayKey),
+      roleLabel: "当前机器屏幕",
+      displayName: normalizeText(rawConfig.monitorName),
+      localInterfaceId: inferLocalInterfaceIdFromConfig(rawConfig, defaults),
+      compatibilityMode: parseCompatibilityMode(
+        rawConfig.compatibilityMode || defaults.config.compatibilityMode
+      ),
+      windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
+        rawConfig.windowsDisplayHandoffMode || defaults.config.windowsDisplayHandoffMode
+      ),
+      interfaces: migrateLegacyInterfacesConfig(rawConfig, defaults),
+      match: {
+        electronDisplayId: null,
+        gdiDeviceName: normalizeText(rawConfig.gdiDeviceName),
+        productCode: normalizeText(rawConfig.productCode),
+      },
+    },
+    {}
+  );
+}
+
+function normalizeWindowsDesktopRuntime(nextStateWindowsDesktop = {}) {
+  const byMonitorId = {};
+  const rawMap = nextStateWindowsDesktop.byMonitorId;
+
+  if (rawMap && typeof rawMap === "object") {
+    for (const [monitorId, runtime] of Object.entries(rawMap)) {
+      const normalizedId = normalizeText(monitorId);
+      if (!normalizedId) {
+        continue;
+      }
+
+      byMonitorId[normalizedId] = {
+        pendingRestore: Boolean(runtime?.pendingRestore),
+        expectedAttachedDisplayCount: normalizePositiveInteger(
+          runtime?.expectedAttachedDisplayCount,
+          0
+        ),
+      };
+    }
+  }
+
+  return {
+    pendingRestore: Boolean(nextStateWindowsDesktop.pendingRestore),
+    expectedAttachedDisplayCount: normalizePositiveInteger(
+      nextStateWindowsDesktop.expectedAttachedDisplayCount,
+      0
+    ),
+    byMonitorId,
+  };
+}
+
+function normalizeState(nextState) {
+  const defaults = createDefaultState();
+  const rawConfig = nextState.config || {};
+  const rawMonitorConfigs = Array.isArray(rawConfig.monitors) ? rawConfig.monitors : [];
+  const normalizedMonitorConfigs =
+    rawMonitorConfigs.length > 0
+      ? rawMonitorConfigs.map((monitorConfig, index) =>
+          normalizeMonitorConfig(monitorConfig, {
+            id: normalizeText(monitorConfig?.id) || `legacy-monitor-${index + 1}`,
+          })
+        )
+      : [createLegacyMonitorConfig(rawConfig, defaults)];
+
+  return {
+    lastTarget: normalizeText(nextState.lastTarget),
+    controlToken: normalizeText(nextState.controlToken) || defaults.controlToken,
+    windowsDesktop: normalizeWindowsDesktopRuntime(nextState.windowsDesktop),
+    manualSession: normalizeManualSessionState(nextState.manualSession, defaults.manualSession),
+    lastSwitchOutcome: createSwitchOutcome(nextState.lastSwitchOutcome),
+    macInputProbe: normalizeMacInputProbeState(nextState.macInputProbe, defaults.macInputProbe),
+    config: {
+      monitorName: normalizeText(rawConfig.monitorName),
+      localDisplayIndex: normalizePositiveInteger(
+        rawConfig.localDisplayIndex ?? rawConfig.macDisplayIndex,
+        defaults.config.localDisplayIndex
+      ),
+      localInterfaceId: inferLocalInterfaceIdFromConfig(rawConfig, defaults),
+      compatibilityMode: parseCompatibilityMode(
+        rawConfig.compatibilityMode || defaults.config.compatibilityMode
+      ),
+      windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
+        rawConfig.windowsDisplayHandoffMode || defaults.config.windowsDisplayHandoffMode
+      ),
+      interfaces: migrateLegacyInterfacesConfig(rawConfig, defaults),
+      monitors: normalizedMonitorConfigs,
+    },
+  };
+}
+
+function getStoredMonitorConfigs() {
+  return Array.isArray(state.config?.monitors) ? state.config.monitors : [];
+}
+
+function getMonitorDesktopRuntime(monitorId) {
+  const normalizedId = normalizeText(monitorId);
+  if (!state.windowsDesktop || typeof state.windowsDesktop !== "object") {
+    state.windowsDesktop = {
+      pendingRestore: false,
+      expectedAttachedDisplayCount: 0,
+      byMonitorId: {},
+    };
+  }
+
+  if (!state.windowsDesktop.byMonitorId || typeof state.windowsDesktop.byMonitorId !== "object") {
+    state.windowsDesktop.byMonitorId = {};
+  }
+
+  if (!state.windowsDesktop.byMonitorId[normalizedId]) {
+    state.windowsDesktop.byMonitorId[normalizedId] = {
+      pendingRestore: false,
+      expectedAttachedDisplayCount: 0,
+    };
+  }
+
+  return state.windowsDesktop.byMonitorId[normalizedId];
+}
+
+function buildDisplayKeyForLocalDisplay(display, displayIndex, topologyDisplay = null) {
+  if (process.platform === "win32") {
+    const gdiDeviceName = normalizeText(topologyDisplay?.deviceName);
+    if (gdiDeviceName) {
+      return `win:${gdiDeviceName}`;
+    }
+  }
+
+  if (process.platform === "darwin" && Number.isInteger(display?.id)) {
+    return `mac:${display.id}`;
+  }
+
+  return `fallback:${displayIndex}:${display?.bounds?.x || 0}:${display?.bounds?.y || 0}:${
+    display?.bounds?.width || 0
+  }x${display?.bounds?.height || 0}`;
+}
+
+async function getLocalDisplaySummaries() {
+  const orderedDisplays = getOrderedLocalDisplays();
+  const topologyDisplays = process.platform === "win32" ? await getWindowsTopologyDisplays() : [];
+  const singleDisplayOnly = orderedDisplays.length <= 1;
+  let secondaryIndex = 2;
+
+  return orderedDisplays.map((display, index) => {
+    const topologyMatch =
+      process.platform === "win32"
+        ? matchWindowsTopologyDisplayToElectronDisplay(display, topologyDisplays)
+        : null;
+    const roleLabel = singleDisplayOnly
+      ? "当前机器屏幕"
+      : display.primary
+        ? "主屏幕"
+        : `附屏幕 ${secondaryIndex++}`;
+    const displayKey = buildDisplayKeyForLocalDisplay(display, index + 1, topologyMatch);
+    const displayName = normalizeText(
+      topologyMatch?.friendlyName ||
+        topologyMatch?.displayName ||
+        topologyMatch?.deviceString ||
+        display.label ||
+        ""
+    );
+
+    return {
+      id: getMonitorIdForDisplayKey(displayKey),
+      displayKey,
+      index: index + 1,
+      roleLabel,
+      detectedName: displayName,
+      resolution: `${display.bounds.width} × ${display.bounds.height}`,
+      position: `${display.bounds.x}, ${display.bounds.y}`,
+      internal: Boolean(display.internal),
+      primary: Boolean(display.primary),
+      electronDisplayId: Number.isInteger(display.id) ? display.id : null,
+      gdiDeviceName: normalizeText(topologyMatch?.deviceName),
+      productCode: normalizeText(topologyMatch?.productCode),
+      bounds: {
+        x: display.bounds.x,
+        y: display.bounds.y,
+        width: display.bounds.width,
+        height: display.bounds.height,
+      },
+    };
+  });
+}
+
+function resolveStoredMonitorConfigForDisplay(displaySummary, storedMonitorConfigs, usedMonitorIds) {
+  const normalizedDisplayKey = normalizeText(displaySummary.displayKey);
+  const normalizedDeviceName = normalizeText(displaySummary.gdiDeviceName);
+  const electronDisplayId = Number.isInteger(displaySummary.electronDisplayId)
+    ? displaySummary.electronDisplayId
+    : null;
+
+  const directMatch = storedMonitorConfigs.find((monitorConfig) => {
+    if (usedMonitorIds.has(monitorConfig.id)) {
+      return false;
+    }
+
+    return (
+      normalizeText(monitorConfig.displayKey) === normalizedDisplayKey ||
+      (normalizedDeviceName &&
+        normalizeText(monitorConfig.match?.gdiDeviceName) === normalizedDeviceName) ||
+      (Number.isInteger(electronDisplayId) &&
+        monitorConfig.match?.electronDisplayId === electronDisplayId)
+    );
+  });
+
+  if (directMatch) {
+    return directMatch;
+  }
+
+  return (
+    storedMonitorConfigs.find((monitorConfig) => {
+      if (usedMonitorIds.has(monitorConfig.id)) {
+        return false;
+      }
+
+      return !normalizeText(monitorConfig.displayKey);
+    }) || null
+  );
+}
+
+async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
+  const displaySummaries = await getLocalDisplaySummaries();
+  const storedMonitorConfigs = getStoredMonitorConfigs();
+  const usedMonitorIds = new Set();
+  const nextMonitorConfigs = [];
+
+  for (const displaySummary of displaySummaries) {
+    const matchedMonitorConfig = resolveStoredMonitorConfigForDisplay(
+      displaySummary,
+      storedMonitorConfigs,
+      usedMonitorIds
+    );
+    const nextMonitorConfig = normalizeMonitorConfig(
+      {
+        ...matchedMonitorConfig,
+        id: displaySummary.id,
+        displayKey: displaySummary.displayKey,
+        roleLabel: displaySummary.roleLabel,
+        displayName: displaySummary.detectedName || matchedMonitorConfig?.displayName || "",
+        match: {
+          electronDisplayId: displaySummary.electronDisplayId,
+          gdiDeviceName: displaySummary.gdiDeviceName,
+          productCode: displaySummary.productCode,
+        },
+      },
+      createDefaultMonitorConfig({
+        id: displaySummary.id,
+        displayKey: displaySummary.displayKey,
+        roleLabel: displaySummary.roleLabel,
+        displayName: displaySummary.detectedName,
+        match: {
+          electronDisplayId: displaySummary.electronDisplayId,
+          gdiDeviceName: displaySummary.gdiDeviceName,
+          productCode: displaySummary.productCode,
+        },
+      })
+    );
+
+    usedMonitorIds.add(nextMonitorConfig.id);
+    nextMonitorConfigs.push(nextMonitorConfig);
+  }
+
+  for (const storedMonitorConfig of storedMonitorConfigs) {
+    if (usedMonitorIds.has(storedMonitorConfig.id)) {
+      continue;
+    }
+
+    if (!normalizeText(storedMonitorConfig.displayKey)) {
+      continue;
+    }
+
+    nextMonitorConfigs.push(normalizeMonitorConfig(storedMonitorConfig));
+  }
+
+  const nextSerialized = JSON.stringify(nextMonitorConfigs);
+  const previousSerialized = JSON.stringify(storedMonitorConfigs);
+  if (nextSerialized !== previousSerialized) {
+    state.config.monitors = nextMonitorConfigs;
+    if (persist) {
+      saveState(state);
+    }
+  } else if (!Array.isArray(state.config.monitors)) {
+    state.config.monitors = nextMonitorConfigs;
+    if (persist) {
+      saveState(state);
+    }
+  }
+
+  return displaySummaries;
+}
+
+function buildConnectedMonitorContextsFromSummaries(displaySummaries) {
+  const monitorConfigsById = new Map(
+    getStoredMonitorConfigs().map((monitorConfig) => [monitorConfig.id, monitorConfig])
+  );
+
+  return displaySummaries
+    .map((displaySummary) => {
+      const monitorConfig = monitorConfigsById.get(displaySummary.id);
+      if (!monitorConfig) {
+        return null;
+      }
+
+      return {
+        id: monitorConfig.id,
+        monitor: monitorConfig,
+        display: displaySummary,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function getConnectedMonitorContexts() {
+  const displaySummaries = await syncMonitorConfigsFromLocalDisplays();
+  return buildConnectedMonitorContextsFromSummaries(displaySummaries);
+}
+
+async function getMonitorContextById(monitorId) {
+  const monitorContexts = await getConnectedMonitorContexts();
+  return (
+    monitorContexts.find((monitorContext) => monitorContext.id === normalizeText(monitorId)) || null
+  );
+}
+
+function getMonitorConfigValidationErrors(monitorConfig) {
+  const errors = [];
+
+  if (!parseTargetId(monitorConfig.localInterfaceId)) {
+    errors.push("当前机器接口配置无效。");
+  }
+
+  if (!["auto", "off", "samsung_mstar"].includes(monitorConfig.compatibilityMode)) {
+    errors.push("兼容模式配置无效。");
+  }
+
+  if (!["auto", "off", "external"].includes(monitorConfig.windowsDisplayHandoffMode)) {
+    errors.push("Windows 屏幕联动配置无效。");
+  }
+
+  for (const targetId of TARGET_IDS) {
+    const inputValue = monitorConfig.interfaces?.[targetId]?.inputValue;
+    if (!Number.isInteger(inputValue) || inputValue < 1 || inputValue > 255) {
+      errors.push(`${getTargetSlotName(targetId)} 的输入值必须是 1 到 255 的整数。`);
+    }
+  }
+
+  return Array.from(new Set(errors));
+}
+
+function buildMonitorConfigFromForm(form, existingMonitorConfig) {
+  const nextMonitorConfig = normalizeMonitorConfig(
+    {
+      ...existingMonitorConfig,
+      localInterfaceId:
+        parseTargetId(form.get("localInterfaceId")) || existingMonitorConfig.localInterfaceId,
+      compatibilityMode: parseCompatibilityMode(form.get("compatibilityMode")),
+      windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
+        form.get("windowsDisplayHandoffMode")
+      ),
+      interfaces: TARGET_IDS.reduce((result, targetId) => {
+        result[targetId] = {
+          inputValue: parseInputValue(form.get(`${targetId}InputValue`)),
+        };
+        return result;
+      }, {}),
+    },
+    existingMonitorConfig
+  );
+
+  return {
+    monitorConfig: nextMonitorConfig,
+    errors: getMonitorConfigValidationErrors(nextMonitorConfig),
+  };
+}
+
+function getTarget(targetId, monitorConfig = state.config) {
+  const slot = TARGET_SLOT_MAP.get(targetId);
+  const configuredTarget = monitorConfig?.interfaces?.[targetId] || state.config.interfaces?.[targetId] || {};
+  return {
+    id: targetId,
+    label: slot?.title || targetId,
+    inputValue: Number.isInteger(configuredTarget.inputValue)
+      ? configuredTarget.inputValue
+      : slot?.defaultInputValue,
+  };
+}
+
+function getLocalInterfaceId(monitorConfig = state.config) {
+  return parseTargetId(monitorConfig?.localInterfaceId) || TARGET_IDS[0];
+}
+
+function isLocalInterfaceTarget(targetId, monitorConfig = state.config) {
+  return parseTargetId(targetId) === getLocalInterfaceId(monitorConfig);
+}
+
+function getSwitchActionLabel(targetId, monitorConfig = state.config) {
+  const target = getTarget(targetId, monitorConfig);
+  return isLocalInterfaceTarget(targetId, monitorConfig)
+    ? `${target.label}（当前机器接口）`
+    : target.label;
+}
+
+function shouldUseSamsungMstarCompat(config) {
+  if (config?.compatibilityMode === "samsung_mstar") {
+    return true;
+  }
+
+  if (config?.compatibilityMode === "off") {
+    return false;
+  }
+
+  return /\b(g7|g72|odyssey|samsung)\b/i.test(
+    normalizeText(config?.displayName || config?.monitorName)
+  );
+}
+
+function getInputCandidates(target, monitorConfig = state.config) {
+  const candidates = [target.inputValue];
+
+  if (!shouldUseSamsungMstarCompat(monitorConfig)) {
+    return candidates;
+  }
+
+  for (const candidate of getSamsungMstarCandidates(target.inputValue)) {
+    if (!candidates.includes(candidate)) {
+      candidates.push(candidate);
+    }
+  }
+
+  return candidates;
+}
+
+function getMonitorDisplayName(monitorContextOrConfig) {
+  return normalizeText(
+    monitorContextOrConfig?.display?.detectedName ||
+      monitorContextOrConfig?.monitor?.displayName ||
+      monitorContextOrConfig?.displayName
+  );
+}
+
+function getMonitorDisplayTitle(monitorContextOrConfig) {
+  const roleLabel = normalizeText(
+    monitorContextOrConfig?.display?.roleLabel || monitorContextOrConfig?.roleLabel
+  );
+  const displayName = getMonitorDisplayName(monitorContextOrConfig);
+  return displayName ? `${roleLabel} · ${displayName}` : roleLabel || "本机屏幕";
+}
+
+function getWindowsMonitorSelectorArgs(monitorContextOrConfig) {
+  const gdiDeviceName = normalizeText(
+    monitorContextOrConfig?.display?.gdiDeviceName ||
+      monitorContextOrConfig?.monitor?.match?.gdiDeviceName ||
+      monitorContextOrConfig?.match?.gdiDeviceName
+  );
+  if (gdiDeviceName) {
+    return ["-GdiDeviceName", gdiDeviceName];
+  }
+
+  const displayName = getMonitorDisplayName(monitorContextOrConfig);
+  if (displayName) {
+    return ["-MonitorName", displayName];
+  }
+
+  throw new Error("Windows 当前没有这块屏幕的可用设备标识。");
+}
+
+function getWindowsTopologySelectorValue(monitorContextOrConfig) {
+  const selectorArgs = getWindowsMonitorSelectorArgs(monitorContextOrConfig);
+  return selectorArgs[1];
+}
+
+function getMacSwitchScriptEnvForContext(monitorContext) {
+  const displayName = getMonitorDisplayName(monitorContext);
+  const env = {
+    DISPLAY_NAME: displayName,
+    DISPLAY_INDEX: String(monitorContext.display.index),
+  };
+
+  if (Number.isInteger(monitorContext.display.electronDisplayId)) {
+    env.DISPLAY_ID = String(monitorContext.display.electronDisplayId);
+  }
+
+  return env;
+}
+
+function createSwitchOutcome({
+  status = "idle",
+  monitorId = null,
+  targetId = null,
+  mode = "switch",
+  message = "",
+  updatedAt = null,
+} = {}) {
+  return {
+    status: ["idle", "success", "error"].includes(status) ? status : "idle",
+    monitorId: normalizeText(monitorId),
+    targetId: parseTargetId(targetId),
+    mode: ["switch", "manual_prep"].includes(normalizeText(mode)) ? normalizeText(mode) : "switch",
+    message: normalizeText(message),
+    updatedAt: normalizeText(updatedAt) || new Date().toISOString(),
+  };
+}
+
+function recordSwitchOutcome(status, monitorId, targetId, message = "") {
+  state.lastSwitchOutcome = createSwitchOutcome({
+    status,
+    monitorId,
+    targetId,
+    message,
+  });
+}
+
+function persistSuccessfulLocalSwitch(monitorContext, targetId, target) {
+  state.lastTarget = `${monitorContext.id}:${targetId}`;
+  state.macInputProbe = createMacInputProbeResult();
+  recordSwitchOutcome(
+    "success",
+    monitorContext.id,
+    targetId,
+    `${getMonitorDisplayTitle(monitorContext)} 已执行切换：${target.label}。`
+  );
+  saveState(state);
+  refreshMenu();
+}
+
+function getConnectedDisplayCount() {
+  return getOrderedLocalDisplays().length;
+}
+
+function shouldUseWindowsDisplayHandoffForMonitor(monitorConfig) {
+  if (process.platform !== "win32") {
+    return false;
+  }
+
+  if (monitorConfig.windowsDisplayHandoffMode === "off") {
+    return false;
+  }
+
+  if (monitorConfig.windowsDisplayHandoffMode === "external") {
+    return true;
+  }
+
+  return getConnectedDisplayCount() >= 2;
+}
+
+function isWindowsMonitorAttachedInTopology(topologyDisplays, monitorContextOrConfig) {
+  const selectorValue = normalizeText(getWindowsTopologySelectorValue(monitorContextOrConfig));
+  if (!selectorValue) {
+    return false;
+  }
+
+  return topologyDisplays.some((display) => {
+    if (!display.attached) {
+      return false;
+    }
+
+    return (
+      normalizeText(display.deviceName).toLowerCase() === selectorValue.toLowerCase() ||
+      normalizeText(display.displayName).toLowerCase() === selectorValue.toLowerCase() ||
+      normalizeText(display.friendlyName).toLowerCase() === selectorValue.toLowerCase()
+    );
+  });
+}
+
+async function getWindowsCurrentInputResultForContext(monitorContext) {
+  if (process.platform !== "win32") {
+    return {
+      ok: false,
+      value: null,
+      error: "当前平台不支持 Windows 输入读取。",
+    };
+  }
+
+  const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
+
+  try {
+    const output = await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      ...getWindowsMonitorSelectorArgs(monitorContext),
+      "-ReadInputValue",
+    ]);
+    const parsed = JSON.parse(output);
+    const parsedValue = Number.isInteger(parsed?.currentInputValue) ? parsed.currentInputValue : NaN;
+
+    if (!Number.isInteger(parsedValue)) {
+      throw new Error(`无法从 Windows 输入探测输出里解析输入值：${output}`);
+    }
+
+    return {
+      ok: true,
+      value: parsedValue,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      value: null,
+      error: normalizeText(error.message),
+    };
+  }
+}
+
+async function getMacCurrentInputResultForContext(monitorContext) {
+  if (process.platform !== "darwin") {
+    return {
+      ok: false,
+      value: null,
+      error: "当前平台不支持 macOS 输入读取。",
+    };
+  }
+
+  const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
+
+  try {
+    const output = await runCommand("/bin/sh", [scriptPath, "--query-input"], {
+      env: getMacSwitchScriptEnvForContext(monitorContext),
+    });
+    const parsedValue = parseMacInputValueOutput(output);
+
+    if (!Number.isInteger(parsedValue)) {
+      throw new Error(`无法从探测输出里解析输入值：${output}`);
+    }
+
+    return {
+      ok: true,
+      value: parsedValue,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      value: null,
+      error: normalizeText(error.message),
+    };
+  }
+}
+
+async function getMonitorLiveStatus(monitorContext) {
+  if (process.platform === "win32") {
+    const topologyDisplays = await getWindowsTopologyDisplays();
+    const visible = isWindowsMonitorAttachedInTopology(topologyDisplays, monitorContext);
+    if (!visible) {
+      return {
+        visible: false,
+        currentInputValue: null,
+        currentInputError: "当前这块屏幕不在 Windows 桌面里。",
+      };
+    }
+
+    const currentInputResult = await getWindowsCurrentInputResultForContext(monitorContext);
+    return {
+      visible: true,
+      currentInputValue: currentInputResult.ok ? currentInputResult.value : null,
+      currentInputError: currentInputResult.ok ? null : currentInputResult.error,
+    };
+  }
+
+  const currentInputResult = await getMacCurrentInputResultForContext(monitorContext);
+  return {
+    visible: true,
+    currentInputValue: currentInputResult.ok ? currentInputResult.value : null,
+    currentInputError: currentInputResult.ok ? null : currentInputResult.error,
+  };
+}
+
+async function buildMonitorContextsWithStatus() {
+  const monitorContexts = await getConnectedMonitorContexts();
+  return Promise.all(
+    monitorContexts.map(async (monitorContext) => ({
+      ...monitorContext,
+      status: await getMonitorLiveStatus(monitorContext),
+    }))
+  );
+}
+
+async function waitForWindowsMonitorAttachmentState(monitorConfig, expectedAttached, errorMessage) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < 8000) {
+    const topologyDisplays = await getWindowsTopologyDisplays();
+    if (isWindowsMonitorAttachedInTopology(topologyDisplays, monitorConfig) === expectedAttached) {
+      return;
+    }
+
+    await delay(250);
+  }
+
+  throw new Error(errorMessage);
+}
+
+async function detachWindowsDisplayForMonitor(monitorConfig, expectedAttachedDisplayCount) {
+  const selectorValue = getWindowsTopologySelectorValue(monitorConfig);
+  await runWindowsTopologyCommand(["-MonitorName", selectorValue, "-DetachMonitor"]);
+  await waitForWindowsMonitorAttachmentState(
+    monitorConfig,
+    false,
+    "Windows 没有把这块共享屏从桌面拓扑里移除。"
+  );
+  markMonitorPendingRestore(monitorConfig.id, expectedAttachedDisplayCount);
+}
+
+async function attachWindowsDisplayForMonitor(monitorConfig, expectedAttachedDisplayCount) {
+  const selectorValue = getWindowsTopologySelectorValue(monitorConfig);
+  await runWindowsTopologyCommand(["-MonitorName", selectorValue, "-AttachMonitor"]);
+  await waitForWindowsMonitorAttachmentState(
+    monitorConfig,
+    true,
+    "Windows 没有把这块共享屏重新加回桌面拓扑。"
+  );
+
+  if (Number.isInteger(expectedAttachedDisplayCount) && expectedAttachedDisplayCount > 1) {
+    await waitForDisplayCount(expectedAttachedDisplayCount, "Windows 没有恢复到预期的扩展显示数量。");
+  }
+}
+
+function markMonitorPendingRestore(monitorId, expectedAttachedDisplayCount = null) {
+  const runtime = getMonitorDesktopRuntime(monitorId);
+  runtime.pendingRestore = true;
+  runtime.expectedAttachedDisplayCount =
+    Number.isInteger(expectedAttachedDisplayCount) && expectedAttachedDisplayCount > 1
+      ? expectedAttachedDisplayCount
+      : 0;
+  saveState(state);
+  refreshMenu();
+}
+
+function clearMonitorPendingRestore(monitorId) {
+  const runtime = getMonitorDesktopRuntime(monitorId);
+  if (!runtime.pendingRestore && runtime.expectedAttachedDisplayCount === 0) {
+    return;
+  }
+
+  runtime.pendingRestore = false;
+  runtime.expectedAttachedDisplayCount = 0;
+  saveState(state);
+  refreshMenu();
+}
+
+async function verifyWindowsSwitchOutcomeForContext(monitorContext, targetId, target, expectedValues) {
+  const startedAt = Date.now();
+  const switchingToLocalInterface = isLocalInterfaceTarget(targetId, monitorContext.monitor);
+  let lastObservedValue = null;
+  let lastErrorMessage = "";
+
+  while (Date.now() - startedAt < 4000) {
+    const topologyDisplays = await getWindowsTopologyDisplays();
+    const visible = isWindowsMonitorAttachedInTopology(topologyDisplays, monitorContext);
+    if (!visible && !switchingToLocalInterface) {
+      return;
+    }
+
+    const currentInputResult = await getWindowsCurrentInputResultForContext(monitorContext);
+    if (currentInputResult.ok) {
+      if (expectedValues.includes(currentInputResult.value)) {
+        return;
+      }
+
+      lastObservedValue = currentInputResult.value;
+      lastErrorMessage = "";
+    } else {
+      lastErrorMessage = currentInputResult.error;
+    }
+
+    await delay(250);
+  }
+
+  if (Number.isInteger(lastObservedValue)) {
+    throw new Error(
+      `${getMonitorDisplayTitle(monitorContext)} 当前输入仍是 ${lastObservedValue}，未匹配目标值集合：${expectedValues.join(
+        " "
+      )}`
+    );
+  }
+
+  throw new Error(
+    lastErrorMessage || `${getMonitorDisplayTitle(monitorContext)} 还没有确认真正切到 ${target.label}。`
+  );
+}
+
+async function switchOnWindowsForContext(monitorContext, targetId, target) {
+  const monitorConfig = monitorContext.monitor;
+  const switchingToLocalInterface = isLocalInterfaceTarget(targetId, monitorConfig);
+  const topologyDisplays = await getWindowsTopologyDisplays();
+  if (!isWindowsMonitorAttachedInTopology(topologyDisplays, monitorContext)) {
+    throw new Error(
+      `${getMonitorDisplayTitle(
+        monitorContext
+      )} 当前不在 Windows 桌面里，Windows 这侧不能直接控制它。请在当前持有这块屏的主机上切，或用显示器按键切回。`
+    );
+  }
+
+  const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
+  const candidates = getInputCandidates(target, monitorConfig);
+  const expectedValues = getExpectedProbeInputValues(target.inputValue);
+  const attachedDisplayCountBeforeSwitch = await getCurrentWindowsAttachedDisplayCount();
+
+  await runCandidateSequence(candidates, async (candidate) => {
+    await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      ...getWindowsMonitorSelectorArgs(monitorContext),
+      "-InputValue",
+      String(candidate),
+    ]);
+    await verifyWindowsSwitchOutcomeForContext(monitorContext, targetId, target, expectedValues);
+  });
+
+  if (!switchingToLocalInterface && shouldUseWindowsDisplayHandoffForMonitor(monitorConfig)) {
+    await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
+    await detachWindowsDisplayForMonitor(monitorConfig, attachedDisplayCountBeforeSwitch);
+  } else if (switchingToLocalInterface) {
+    clearMonitorPendingRestore(monitorConfig.id);
+  }
+}
+
+async function switchOnMacForContext(monitorContext, targetId, target) {
+  const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
+  const candidates = getInputCandidates(target, monitorContext.monitor);
+  await runCandidateSequence(candidates, (candidate) =>
+    runCommand("/bin/sh", [scriptPath, String(candidate)], {
+      env: getMacSwitchScriptEnvForContext(monitorContext),
+    })
+  );
+}
+
+function formatMonitorSwitchError(monitorContext, targetId, error) {
+  const target = getTarget(targetId, monitorContext.monitor);
+  const rawMessage = normalizeText(error?.message);
+  if (!rawMessage) {
+    return new Error(`${getMonitorDisplayTitle(monitorContext)} 切换失败。`);
+  }
+
+  if (/^No monitor matched GDI device /i.test(rawMessage)) {
+    return new Error(
+      `${getMonitorDisplayTitle(
+        monitorContext
+      )} 当前没有出现在本机可控列表里。这通常说明它已经切到别的主机，当前这台机器无法直接发切换命令。`
+    );
+  }
+
+  if (/^No physical monitor handles were found /i.test(rawMessage)) {
+    return new Error(
+      `${getMonitorDisplayTitle(
+        monitorContext
+      )} 已被系统识别，但没有拿到可控的物理显示器句柄。请确认它是支持 DDC/CI 的外接显示器，并在菜单里开启 DDC/CI。`
+    );
+  }
+
+  if (/^Failed\.?$/i.test(rawMessage)) {
+    return new Error(
+      `${getMonitorDisplayTitle(
+        monitorContext
+      )} 的底层工具只返回了 “Failed.”。请检查该接口输入值是否填对。`
+    );
+  }
+
+  if (/未匹配目标值集合/u.test(rawMessage)) {
+    return new Error(
+      `${getMonitorDisplayTitle(
+        monitorContext
+      )} 没有真正切到 ${target.label}。常见原因是输入值还没配对，或者目标接口当前没有稳定视频信号。`
+    );
+  }
+
+  return new Error(rawMessage);
+}
+
+async function switchMonitor(monitorId, targetId, options = {}) {
+  const { notifyOnSuccess = true, showErrorDialog = false } = options;
+  const monitorContext = await getMonitorContextById(monitorId);
+
+  if (!monitorContext) {
+    throw new Error("当前没有找到这块本机屏幕，可能它已经不在当前主机上。");
+  }
+
+  const monitorConfig = monitorContext.monitor;
+  const target = getTarget(targetId, monitorConfig);
+  const configErrors = getMonitorConfigValidationErrors(monitorConfig);
+  if (configErrors.length > 0) {
+    const error = new Error(configErrors.join(" "));
+    recordSwitchOutcome("error", monitorContext.id, targetId, error.message);
+    saveState(state);
+    refreshMenu();
+
+    if (showErrorDialog) {
+      dialog.showErrorBox(APP_NAME, error.message);
+    }
+
+    throw error;
+  }
+
+  try {
+    if (process.platform === "win32") {
+      await switchOnWindowsForContext(monitorContext, targetId, target);
+    } else if (process.platform === "darwin") {
+      await switchOnMacForContext(monitorContext, targetId, target);
+    } else {
+      throw new Error(`当前平台不受支持：${process.platform}`);
+    }
+
+    persistSuccessfulLocalSwitch(monitorContext, targetId, target);
+
+    if (notifyOnSuccess) {
+      notify(`${getMonitorDisplayTitle(monitorContext)} 已切到 ${target.label}。`);
+    }
+  } catch (error) {
+    const userFacingError = formatMonitorSwitchError(monitorContext, targetId, error);
+    recordSwitchOutcome("error", monitorContext.id, targetId, userFacingError.message);
+    saveState(state);
+    refreshMenu();
+
+    if (showErrorDialog) {
+      dialog.showErrorBox(APP_NAME, userFacingError.message);
+    }
+
+    throw userFacingError;
+  }
+}
+
+async function attemptPendingWindowsRestores() {
+  if (process.platform !== "win32" || windowsRestoreInFlight) {
+    return false;
+  }
+
+  windowsRestoreInFlight = true;
+
+  try {
+    await syncMonitorConfigsFromLocalDisplays({ persist: false });
+    const topologyDisplays = await getWindowsTopologyDisplays();
+    const pendingMonitorConfigs = getStoredMonitorConfigs().filter(
+      (monitorConfig) => getMonitorDesktopRuntime(monitorConfig.id).pendingRestore
+    );
+
+    let restored = false;
+    for (const monitorConfig of pendingMonitorConfigs) {
+      const selectorValue = normalizeText(monitorConfig.match?.gdiDeviceName);
+      if (!selectorValue) {
+        continue;
+      }
+
+      const targetDisplay = topologyDisplays.find(
+        (display) => normalizeText(display.deviceName).toLowerCase() === selectorValue.toLowerCase()
+      );
+      if (!targetDisplay) {
+        continue;
+      }
+
+      if (!targetDisplay.attached) {
+        const runtime = getMonitorDesktopRuntime(monitorConfig.id);
+        try {
+          await attachWindowsDisplayForMonitor(
+            monitorConfig,
+            runtime.expectedAttachedDisplayCount || null
+          );
+          restored = true;
+        } catch (error) {
+          appendDiagnosticLog("Failed to restore detached Windows display", error);
+          continue;
+        }
+      }
+
+      clearMonitorPendingRestore(monitorConfig.id);
+      restored = true;
+    }
+
+    return restored;
+  } finally {
+    windowsRestoreInFlight = false;
+  }
+}
+
+async function refreshWindowsDisplayState(options = {}) {
+  const { monitorId = null, notifyOnSuccess = false } = options;
+  if (process.platform !== "win32") {
+    return {
+      changed: false,
+      message: "当前平台不是 Windows。",
+    };
+  }
+
+  await syncMonitorConfigsFromLocalDisplays({ persist: false });
+  const topologyDisplays = await getWindowsTopologyDisplays();
+  let changed = false;
+
+  for (const monitorConfig of getStoredMonitorConfigs()) {
+    if (monitorId && monitorConfig.id !== monitorId) {
+      continue;
+    }
+
+    const runtime = getMonitorDesktopRuntime(monitorConfig.id);
+    if (!runtime.pendingRestore) {
+      continue;
+    }
+
+    const visible = isWindowsMonitorAttachedInTopology(topologyDisplays, monitorConfig);
+    if (visible) {
+      clearMonitorPendingRestore(monitorConfig.id);
+      changed = true;
+      continue;
+    }
+
+    const restored = await attemptPendingWindowsRestores();
+    changed = changed || restored;
+  }
+
+  const message = changed ? "Windows 已刷新并处理共享屏恢复。" : "Windows 已刷新当前屏幕状态。";
+  if (notifyOnSuccess) {
+    notify(message);
+  }
+
+  return {
+    changed,
+    message,
+  };
+}
+
+function startWindowsRestoreWatcher() {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const scheduleAttempt = () => {
+    void syncMonitorConfigsFromLocalDisplays();
+    void attemptPendingWindowsRestores();
+    void refreshMenu();
+  };
+
+  screen.on("display-added", () => {
+    scheduleTrayRebuild("display-added");
+    scheduleAttempt();
+  });
+  screen.on("display-removed", () => {
+    scheduleTrayRebuild("display-removed");
+    scheduleAttempt();
+  });
+
+  if (windowsRestoreTimer) {
+    clearInterval(windowsRestoreTimer);
+  }
+  windowsRestoreTimer = setInterval(scheduleAttempt, 2500);
+  scheduleAttempt();
+}
+
+function handleTrayDirectSwitch(monitorId, targetId) {
+  void switchMonitor(monitorId, targetId, {
+    notifyOnSuccess: true,
+    showErrorDialog: false,
+  }).catch((error) => {
+    appendDiagnosticLog(`Direct switch failed (${monitorId}:${targetId})`, error);
+  });
+}
+
+async function refreshMenu() {
+  if (!tray) {
+    return;
+  }
+
+  if (monitorMenuRefreshInFlight) {
+    monitorMenuRefreshQueued = true;
+    return;
+  }
+
+  monitorMenuRefreshInFlight = true;
+
+  try {
+    const openAtLogin = app.getLoginItemSettings().openAtLogin;
+    const monitorContexts = await getConnectedMonitorContexts();
+    const monitorMenuItems =
+      monitorContexts.length === 0
+        ? [
+            {
+              label: "当前没有识别到本机已连接的可控屏幕",
+              enabled: false,
+            },
+          ]
+        : monitorContexts.map((monitorContext) => ({
+            label: getMonitorDisplayTitle(monitorContext),
+            submenu: [
+              {
+                label: `当前机器接口：${getTarget(
+                  getLocalInterfaceId(monitorContext.monitor),
+                  monitorContext.monitor
+                ).label}`,
+                enabled: false,
+              },
+              {
+                label: `系统标识：${
+                  normalizeText(monitorContext.display.gdiDeviceName) ||
+                  normalizeText(monitorContext.display.electronDisplayId) ||
+                  "未知"
+                }`,
+                enabled: false,
+              },
+              { type: "separator" },
+              ...TARGET_IDS.map((targetId) => ({
+                label: `直接切到 ${getSwitchActionLabel(targetId, monitorContext.monitor)}`,
+                click: () => handleTrayDirectSwitch(monitorContext.id, targetId),
+              })),
+              ...(process.platform === "win32"
+                ? [
+                    { type: "separator" },
+                    {
+                      label: "主动刷新这块 Windows 屏幕",
+                      click: () => {
+                        void refreshWindowsDisplayState({
+                          monitorId: monitorContext.id,
+                          notifyOnSuccess: true,
+                        });
+                      },
+                    },
+                  ]
+                : []),
+            ],
+          }));
+
+    const menu = Menu.buildFromTemplate([
+      {
+        label: `版本：v${app.getVersion()}`,
+        enabled: false,
+      },
+      ...monitorMenuItems,
+      ...(process.platform === "win32"
+        ? [
+            { type: "separator" },
+            {
+              label: "主动刷新全部等待接回的 Windows 屏幕",
+              click: () => {
+                void refreshWindowsDisplayState({
+                  notifyOnSuccess: true,
+                });
+              },
+            },
+          ]
+        : []),
+      { type: "separator" },
+      {
+        label: "开机时启动",
+        type: "checkbox",
+        checked: openAtLogin,
+        click: (item) => {
+          app.setLoginItemSettings({
+            openAtLogin: item.checked,
+          });
+          refreshMenu();
+        },
+      },
+      {
+        label: "打开应用所在文件夹",
+        click: () => shell.showItemInFolder(process.execPath),
+      },
+      { type: "separator" },
+      {
+        label: "卸载...",
+        click: () => uninstallApp(),
+      },
+      {
+        label: "退出",
+        click: () => app.quit(),
+      },
+    ]);
+
+    tray.setContextMenu(menu);
+  } catch (error) {
+    appendDiagnosticLog("Failed to refresh tray menu", error);
+  } finally {
+    monitorMenuRefreshInFlight = false;
+    if (monitorMenuRefreshQueued) {
+      monitorMenuRefreshQueued = false;
+      void refreshMenu();
+    }
+  }
+}
+
+function renderMonitorRuntimeHint(monitorContext) {
+  if (process.platform !== "win32") {
+    return "";
+  }
+
+  const runtime = getMonitorDesktopRuntime(monitorContext.id);
+  if (!runtime.pendingRestore) {
+    return "";
+  }
+
+  return `<div class="banner success" style="margin-top: 12px;">这块屏已标记为“等待接回”。当它重新回到 Windows 信号链路后，软件会自动把它加回桌面拓扑。</div>`;
+}
+
+function renderMonitorInterfaceStatusCard(monitorContext, targetId) {
+  const target = getTarget(targetId, monitorContext.monitor);
+  const currentInputValue = Number.isInteger(monitorContext.status?.currentInputValue)
+    ? monitorContext.status.currentInputValue
+    : null;
+  const current = Number.isInteger(currentInputValue)
+    ? getExpectedProbeInputValues(target.inputValue).includes(currentInputValue)
+    : false;
+
+  let statusText = "连接状态未知";
+  let detailText = "未激活接口是否真的接了设备，DDC/CI 没法无损读出来。";
+  if (!monitorContext.status?.visible) {
+    statusText = "当前不在本机";
+    detailText = "这块屏当前不在本机显示拓扑里，因此本机无法直接读取它的当前输入。";
+  } else if (current) {
+    statusText = "当前正在显示";
+    detailText = `当前输入回报：${describeInputValue(currentInputValue)}。`;
+  } else if (Number.isInteger(currentInputValue)) {
+    statusText = "当前未显示";
+    detailText = `当前输入回报：${describeInputValue(currentInputValue)}。`;
+  } else if (monitorContext.status?.currentInputError) {
+    statusText = "读取失败";
+    detailText = monitorContext.status.currentInputError;
+  }
+
+  return `<div class="interface-card${current ? " current" : ""}">
+    <div class="section-title">${escapeHtml(target.label)}</div>
+    <div class="status-pill ${escapeHtml(current ? "success" : "neutral")}">${escapeHtml(statusText)}</div>
+    <div class="display-meta">
+      输入值：${escapeHtml(String(target.inputValue))}<br>
+      ${escapeHtml(detailText)}
+    </div>
+    <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/${encodeURIComponent(
+      monitorContext.id
+    )}/${encodeURIComponent(targetId)}" style="margin-top: 14px;">
+      <button type="submit">直接切到 ${escapeHtml(getSwitchActionLabel(targetId, monitorContext.monitor))}</button>
+    </form>
+  </div>`;
+}
+
+function renderMonitorConfigForm(monitorContext) {
+  const monitorConfig = monitorContext.monitor;
+  return `<form method="post" action="/api/${encodeURIComponent(
+    state.controlToken
+  )}/config/${encodeURIComponent(monitorContext.id)}" style="margin-top: 18px;">
+    <div class="two-col">
+      <label>
+        当前机器接口
+        <select name="localInterfaceId">
+          ${TARGET_IDS.map((targetId) =>
+            renderNamedOption(
+              targetId,
+              getTarget(targetId, monitorConfig).label,
+              getLocalInterfaceId(monitorConfig)
+            )
+          ).join("")}
+        </select>
+      </label>
+      <label>
+        兼容模式
+        <select name="compatibilityMode">
+          ${renderNamedOption("auto", "自动判断", monitorConfig.compatibilityMode)}
+          ${renderNamedOption("off", "关闭兼容补发", monitorConfig.compatibilityMode)}
+          ${renderNamedOption("samsung_mstar", "Samsung / MStar", monitorConfig.compatibilityMode)}
+        </select>
+      </label>
+    </div>
+    ${
+      process.platform === "win32"
+        ? `<label style="margin-top: 14px;">
+            Windows 屏幕联动
+            <select name="windowsDisplayHandoffMode">
+              ${renderNamedOption(
+                "auto",
+                "自动：切走后移出桌面，回来后自动接回",
+                monitorConfig.windowsDisplayHandoffMode
+              )}
+              ${renderNamedOption("off", "关闭联动", monitorConfig.windowsDisplayHandoffMode)}
+              ${renderNamedOption("external", "强制启用", monitorConfig.windowsDisplayHandoffMode)}
+            </select>
+          </label>`
+        : `<input type="hidden" name="windowsDisplayHandoffMode" value="${escapeHtml(
+            monitorConfig.windowsDisplayHandoffMode
+          )}">`
+    }
+    <div class="interface-grid" style="margin-top: 14px;">
+      ${TARGET_IDS.map((targetId) => {
+        const target = getTarget(targetId, monitorConfig);
+        return `<div class="interface-card${isLocalInterfaceTarget(targetId, monitorConfig) ? " current" : ""}">
+          <div class="section-title">${escapeHtml(target.label)}</div>
+          <label>
+            输入值
+            <input name="${escapeHtml(targetId)}InputValue" type="number" min="1" max="255" step="1" value="${escapeHtml(
+              String(target.inputValue)
+            )}">
+          </label>
+        </div>`;
+      }).join("")}
+    </div>
+    <button type="submit" style="margin-top: 16px;">保存这块屏幕配置</button>
+  </form>`;
+}
+
+function renderMonitorSection(monitorContext) {
+  const systemId = normalizeText(monitorContext.display.gdiDeviceName)
+    ? `Windows DeviceName：${monitorContext.display.gdiDeviceName}`
+    : Number.isInteger(monitorContext.display.electronDisplayId)
+      ? `Display ID：${monitorContext.display.electronDisplayId}`
+      : "系统标识：未知";
+  const refreshButtonHtml =
+    process.platform === "win32"
+      ? `<form method="post" action="/api/${encodeURIComponent(
+          state.controlToken
+        )}/windows/refresh/${encodeURIComponent(monitorContext.id)}" style="margin-top: 16px;">
+          <button type="submit" class="secondary">主动刷新这块 Windows 屏幕</button>
+        </form>`
+      : "";
+
+  return `<div class="card soft">
+    <div class="section-title">${escapeHtml(getMonitorDisplayTitle(monitorContext))}</div>
+    <div class="help" style="margin-top: 12px;">
+      ${escapeHtml(systemId)}<br>
+      分辨率：${escapeHtml(monitorContext.display.resolution)}<br>
+      位置：${escapeHtml(monitorContext.display.position)}<br>
+      当前机器接口：${escapeHtml(
+        getTarget(getLocalInterfaceId(monitorContext.monitor), monitorContext.monitor).label
+      )}
+    </div>
+    ${renderMonitorRuntimeHint(monitorContext)}
+    <div class="interface-grid">
+      ${TARGET_IDS.map((targetId) => renderMonitorInterfaceStatusCard(monitorContext, targetId)).join("")}
+    </div>
+    ${renderMonitorConfigForm(monitorContext)}
+    ${refreshButtonHtml}
+  </div>`;
+}
+
+function renderSettingsPage(requestUrl, monitorContexts) {
+  const status = requestUrl.searchParams.get("status");
+  const message = requestUrl.searchParams.get("message");
+  const statusHtml = renderSettingsBanner(status, message);
+  const globalRefreshHtml =
+    process.platform === "win32"
+      ? `<div class="card soft">
+          <div class="section-title">Windows 主动刷新</div>
+          <div class="help" style="margin-top: 12px;">如果显示器已经切回 Windows，但系统还没把它重新接回桌面，可以手动触发一次全局刷新。</div>
+          <form method="post" action="/api/${encodeURIComponent(
+            state.controlToken
+          )}/windows/refresh" style="margin-top: 16px;">
+            <button type="submit" class="secondary">主动刷新全部等待接回的 Windows 屏幕</button>
+          </form>
+        </div>`
+      : "";
+  const emptyStateHtml =
+    monitorContexts.length === 0
+      ? `<div class="card soft">
+          <div class="section-title">当前没有本机已连接屏幕</div>
+          <div class="help" style="margin-top: 12px;">
+            如果你刚把共享屏移交出去，这是正常的。Windows 版会在信号回来后自动尝试接回；macOS 版会在这块屏重新回到本机后再次显示出来。
+          </div>
+        </div>`
+      : monitorContexts.map((monitorContext) => renderMonitorSection(monitorContext)).join("");
+
+  return `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(APP_NAME)} 设置页</title>
+  <style>
+    ${renderSharedStyles()}
+    form {
+      display: grid;
+      gap: 16px;
+    }
+    label {
+      display: grid;
+      gap: 8px;
+      font-weight: 700;
+      color: var(--ink);
+    }
+    input, select {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 13px 14px;
+      font-size: 16px;
+      background: rgba(255, 255, 255, 0.96);
+      color: var(--ink);
+    }
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .section-title {
+      margin: 4px 0 0;
+      font-size: 20px;
+    }
+    .interface-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-top: 14px;
+    }
+    .interface-card {
+      padding: 14px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.62);
+      border: 1px solid var(--border);
+    }
+    .interface-card.current {
+      border-color: rgba(13, 107, 98, 0.42);
+      box-shadow: inset 0 0 0 1px rgba(13, 107, 98, 0.12);
+    }
+    .display-meta {
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .status-pill.success {
+      background: var(--success-bg);
+      color: var(--success);
+    }
+    .status-pill.neutral {
+      background: rgba(13, 107, 98, 0.08);
+      color: var(--accent-strong);
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      margin-top: 10px;
+    }
+    .help {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    @media (max-width: 640px) {
+      .two-col {
+        grid-template-columns: 1fr;
+      }
+      .interface-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">Local Setup · v${escapeHtml(app.getVersion())}</div>
+    <h1>${escapeHtml(APP_NAME)} 设置</h1>
+    <p>这里不再做跨主机伪状态推断，只按“当前主机直接控制当前主机已连接的物理屏”工作。识别到几块本机屏幕，就展示几块。</p>
+    <div class="stack">
+      ${statusHtml}
+      ${globalRefreshHtml}
+      ${emptyStateHtml}
+    </div>
+  </main>
+</body>
+</html>`;
+}
+
+async function handleConfigSave(request, response, requestUrl, monitorId) {
+  const body = await readRequestBody(request);
+  const form = new URLSearchParams(body);
+  const existingMonitorConfig = getStoredMonitorConfigs().find(
+    (monitorConfig) => monitorConfig.id === normalizeText(monitorId)
+  );
+
+  if (!existingMonitorConfig) {
+    redirectToSettingsPage(response, requestUrl, {
+      status: "error",
+      message: "没有找到要保存的屏幕配置。",
+    });
+    return;
+  }
+
+  const { monitorConfig, errors } = buildMonitorConfigFromForm(form, existingMonitorConfig);
+  if (errors.length > 0) {
+    redirectToSettingsPage(response, requestUrl, {
+      status: "error",
+      message: errors.join(" "),
+    });
+    return;
+  }
+
+  state.config.monitors = getStoredMonitorConfigs().map((storedMonitorConfig) =>
+    storedMonitorConfig.id === monitorConfig.id ? monitorConfig : storedMonitorConfig
+  );
+  saveState(state);
+  refreshMenu();
+
+  redirectToSettingsPage(response, requestUrl, {
+    status: "success",
+    message: `${getMonitorDisplayTitle(monitorConfig)} 配置已保存。`,
+  });
+}
+
+async function handleSwitchRequest(response, requestUrl, monitorId, targetId) {
+  try {
+    await switchMonitor(monitorId, targetId, {
+      notifyOnSuccess: true,
+      showErrorDialog: false,
+    });
+    redirectToSettingsPage(response, requestUrl, {
+      status: "success",
+      message: "切换命令已发送。",
+    });
+  } catch (error) {
+    redirectToSettingsPage(response, requestUrl, {
+      status: "error",
+      message: normalizeText(error.message) || "切换失败。",
+    });
+  }
+}
+
+async function handleWindowsRefreshRequest(response, requestUrl, monitorId = null) {
+  try {
+    const result = await refreshWindowsDisplayState({
+      monitorId: normalizeText(monitorId) || null,
+      notifyOnSuccess: false,
+    });
+    redirectToSettingsPage(response, requestUrl, {
+      status: "success",
+      message: result.message,
+    });
+  } catch (error) {
+    redirectToSettingsPage(response, requestUrl, {
+      status: "error",
+      message: normalizeText(error.message) || "Windows 刷新失败。",
+    });
+  }
+}
+
+async function handleControlRequest(request, response) {
+  const baseUrl = `http://${request.headers.host || "127.0.0.1"}`;
+  const requestUrl = new URL(request.url || "/", baseUrl);
+  const controlPath = getControlPath();
+  const settingsPath = getSettingsPath();
+  const statePath = `/api/${state.controlToken}/state`;
+  const configPath = `/api/${state.controlToken}/config`;
+  const switchPathMatch = new RegExp(`^/api/${state.controlToken}/switch/([^/]+)/([^/]+)$`).exec(
+    requestUrl.pathname
+  );
+  const configPathMatch = new RegExp(`^/api/${state.controlToken}/config/([^/]+)$`).exec(
+    requestUrl.pathname
+  );
+  const windowsRefreshPathMatch = new RegExp(
+    `^/api/${state.controlToken}/windows/refresh(?:/([^/]+))?$`
+  ).exec(requestUrl.pathname);
+
+  if (requestUrl.pathname === "/health") {
+    const monitorContexts = await getConnectedMonitorContexts();
+    return writeJson(response, 200, {
+      ok: true,
+      appName: APP_NAME,
+      version: app.getVersion(),
+      connectedMonitors: monitorContexts.map((monitorContext) => ({
+        id: monitorContext.id,
+        title: getMonitorDisplayTitle(monitorContext),
+      })),
+      lastSwitchOutcome: state.lastSwitchOutcome,
+    });
+  }
+
+  if (!isLoopbackRequest(request)) {
+    response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("仅允许本机访问设置与控制接口。");
+    return;
+  }
+
+  if (requestUrl.pathname === statePath) {
+    return writeJson(response, 200, {
+      ok: true,
+      version: app.getVersion(),
+      config: state.config,
+      lastSwitchOutcome: state.lastSwitchOutcome,
+    });
+  }
+
+  if (requestUrl.pathname === configPath && request.method === "GET") {
+    return writeJson(response, 200, {
+      ok: true,
+      config: state.config,
+    });
+  }
+
+  if (requestUrl.pathname === controlPath) {
+    return redirectToSettingsPage(response, requestUrl, {});
+  }
+
+  if (requestUrl.pathname === settingsPath) {
+    const monitorContexts = await buildMonitorContextsWithStatus();
+    return writeHtml(response, 200, renderSettingsPage(requestUrl, monitorContexts));
+  }
+
+  if (configPathMatch && request.method === "POST") {
+    return handleConfigSave(
+      request,
+      response,
+      requestUrl,
+      decodeURIComponent(configPathMatch[1])
+    );
+  }
+
+  if (switchPathMatch && request.method === "POST") {
+    const targetId = parseTargetId(decodeURIComponent(switchPathMatch[2]));
+    if (!targetId) {
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("未找到对应接口。");
+      return;
+    }
+
+    return handleSwitchRequest(
+      response,
+      requestUrl,
+      decodeURIComponent(switchPathMatch[1]),
+      targetId
+    );
+  }
+
+  if (windowsRefreshPathMatch && request.method === "POST") {
+    return handleWindowsRefreshRequest(
+      response,
+      requestUrl,
+      windowsRefreshPathMatch[1] ? decodeURIComponent(windowsRefreshPathMatch[1]) : null
+    );
+  }
+
+  if (
+    requestUrl.pathname.startsWith(`/api/${state.controlToken}/manual/`) ||
+    requestUrl.pathname.startsWith(`/api/${state.controlToken}/probe/`) ||
+    requestUrl.pathname === `/api/${state.controlToken}/monitors`
+  ) {
+    response.writeHead(410, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("旧的交接、probe 和单屏监控接口已移除。当前版本只保留按本机物理屏直接切换。");
+    return;
+  }
+
+  response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+  response.end("未找到对应页面。");
 }
