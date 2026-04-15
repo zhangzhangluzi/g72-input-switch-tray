@@ -52,6 +52,8 @@ This project now uses one rule set only:
 - If the monitor does not report it reliably, the UI must say that the state is unknown.
 - The app must not claim that an inactive interface definitely has or does not have a connected machine behind it.
 - A confirmed mismatch after readback is a real switch failure; missing readback support is not.
+- On Windows, only displays that can be stably mapped to a local external screen are allowed into the switchable list.
+- On macOS, if `ddcctl` cannot reliably report the external-display count, the fallback path must stop instead of scanning candidate indices blindly.
 
 ## Error interpretation
 

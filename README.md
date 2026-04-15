@@ -54,11 +54,12 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - If `betterdisplaycli` is not installed but `BetterDisplay.app` is present in `/Applications` or `~/Applications`, the app uses the BetterDisplay bundle binary directly.
 - When BetterDisplay is used for input switching, the app reads the input value back after each write so Samsung / MStar displays can keep falling through to alternate values when the standard MCCS value is acknowledged but does not actually take effect.
 - If BetterDisplay CLI is unavailable, the app falls back to the bundled `ddcctl` binary built during the macOS GitHub Actions release job, and then to `ddcctl` from `PATH`.
-- On macOS, `ddcctl` fallback is only considered safe when there is a single external display. If multiple external displays are attached and BetterDisplay is unavailable, the app refuses the fallback instead of risking a wrong-screen switch.
+- On macOS, `ddcctl` fallback is only considered safe when there is a single external display and the tool can report that count reliably. If multiple external displays are attached, or the count cannot be determined, the app refuses the fallback instead of risking a wrong-screen switch.
 - When the app has to use `ddcctl`, it tries the configured local display index first, discovers how many external displays `ddcctl` can see, and then tries the remaining valid indices automatically.
 - The app starts a local settings page on port `3847` and binds it to `127.0.0.1` only. The HTTP server is only used for local setup and local direct switch actions; the app does not rely on LAN peer discovery or cross-machine coordination.
 - If port `3847` is unavailable, the local pages automatically fall back to another free local port.
 - macOS only switches screens that are still visible to the current Mac. Once a screen has moved to another host, the current Mac no longer pretends it can still control that screen locally.
+- On Windows, only screens that can be stably mapped to a local external display are exposed as switch targets.
 
 ## Development
 

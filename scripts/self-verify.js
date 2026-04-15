@@ -26,7 +26,10 @@ function verifyMainSourceBusinessGuards() {
     /verificationStatus === "confirmed"[\s\S]*detachWindowsDisplayForMonitor/u
   );
   assert.match(mainSource, /const externalDisplays = orderedDisplays\.filter\(\(display\) => !display\.internal\);/u);
-  assert.match(mainSource, /\.filter\(\(\{ electronDisplay \}\) => !electronDisplay\?\.internal\);/u);
+  assert.match(
+    mainSource,
+    /\.filter\(\(\{ electronDisplay \}\) => Boolean\(electronDisplay\) && !electronDisplay\.internal\);/u
+  );
 }
 
 function verifyLocalOnlyDocs() {
@@ -173,11 +176,18 @@ function writeFakeDdcctlBinary(fakeBinaryPath, mode) {
   const script = `#!/bin/sh
 set -eu
 if [ "\${1:-}" = "-h" ]; then
-  cat <<'EOF'
+  if [ "${mode}" = "missing-count" ]; then
+    cat <<'EOF'
+Usage:
+ddcctl    -d <1-..> [display#]
+EOF
+  else
+    cat <<'EOF'
 Usage:
 ddcctl    -d <1-..> [display#]
 I: found 1 external display
 EOF
+  fi
   exit 0
 fi
 
@@ -256,6 +266,41 @@ function verifyMacDdcctlFallbackScript() {
     encoding: "utf8",
   });
   assert.match(unconfirmedOutput, /UNCONFIRMED/u);
+
+  writeFakeDdcctlBinary(fakeBinaryPath, "missing-count");
+  let queryFailure = null;
+  try {
+    execFileSync("/bin/sh", [switchScriptPath, "--query-input"], {
+      env: baseEnv,
+      stdio: "pipe",
+      encoding: "utf8",
+    });
+  } catch (error) {
+    queryFailure = error;
+  }
+
+  assert.ok(queryFailure, "ddcctl query fallback should fail closed when display count is unknown");
+  assert.match(
+    `${queryFailure.stderr || queryFailure.message}`,
+    /ddcctl 没有可靠返回外接屏数量/u
+  );
+
+  let missingCountFailure = null;
+  try {
+    execFileSync("/bin/sh", [switchScriptPath, "16"], {
+      env: baseEnv,
+      stdio: "pipe",
+      encoding: "utf8",
+    });
+  } catch (error) {
+    missingCountFailure = error;
+  }
+
+  assert.ok(missingCountFailure, "ddcctl switch fallback should fail closed when display count is unknown");
+  assert.match(
+    `${missingCountFailure.stderr || missingCountFailure.message}`,
+    /ddcctl 没有可靠返回外接屏数量/u
+  );
 }
 
 function verifyMacBetterDisplayDisplayIdSafety() {

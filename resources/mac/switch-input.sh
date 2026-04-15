@@ -256,6 +256,11 @@ try_ddcctl_query_binary() {
 
   detected_display_count=$(discover_ddcctl_display_count "$binary_path")
 
+  if [ -z "$detected_display_count" ]; then
+    remember_error "ddcctl 没有可靠返回外接屏数量，当前版本不会在屏幕数量未知时盲切。请安装 BetterDisplay / betterdisplaycli 后再控制这块屏。" 3
+    return 1
+  fi
+
   if [ -n "$detected_display_count" ] && [ "$detected_display_count" -eq 0 ]; then
     remember_error "ddcctl 没有检测到可控制的外接显示器。请确认显示器已连接、当前 Mac 仍然能看到它，并且显示器开启了 DDC/CI。" 2
     return 1
@@ -385,6 +390,11 @@ try_ddcctl_binary() {
   [ -x "$binary_path" ] || return 1
 
   detected_display_count=$(discover_ddcctl_display_count "$binary_path")
+
+  if [ -z "$detected_display_count" ]; then
+    remember_error "ddcctl 没有可靠返回外接屏数量，当前版本不会在屏幕数量未知时盲切。请安装 BetterDisplay / betterdisplaycli 后再控制这块屏。" 3
+    return 1
+  fi
 
   if [ -n "$detected_display_count" ] && [ "$detected_display_count" -eq 0 ]; then
     remember_error "ddcctl 没有检测到可控制的外接显示器。请确认显示器已连接、当前 Mac 仍然能看到它，并且显示器开启了 DDC/CI。" 2

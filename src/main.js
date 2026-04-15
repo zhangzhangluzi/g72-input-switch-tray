@@ -1269,7 +1269,7 @@ async function getLocalDisplaySummaries() {
           attachedTopologyDisplays
         ),
       }))
-      .filter(({ electronDisplay }) => !electronDisplay?.internal);
+      .filter(({ electronDisplay }) => Boolean(electronDisplay) && !electronDisplay.internal);
     let secondaryIndex = 2;
     const singleDisplayOnly = switchableTopologyDisplays.length <= 1;
 
