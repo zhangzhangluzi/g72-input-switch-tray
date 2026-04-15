@@ -224,6 +224,30 @@ function verifyMacDdcctlFallbackScript() {
   );
 }
 
+function verifyMacHelperAppsIfAvailable() {
+  const builtAppPath = path.resolve(
+    __dirname,
+    "..",
+    "release",
+    "mac-arm64",
+    "显示器输入切换.app"
+  );
+  const installedAppPath = "/Applications/显示器输入切换.app";
+  if (fs.existsSync(builtAppPath)) {
+    verifyMacHelperApps(builtAppPath);
+    return;
+  }
+
+  if (fs.existsSync(installedAppPath)) {
+    verifyMacHelperApps(installedAppPath);
+    return;
+  }
+
+  if (process.env.SELF_VERIFY_REQUIRE_MAC_APP_BUNDLE === "1") {
+    throw new Error("No macOS app bundle was found for self verification.");
+  }
+}
+
 function main() {
   verifyMainSourceSyntax();
   verifyLocalOnlyDocs();
@@ -234,22 +258,7 @@ function main() {
 
   if (process.platform === "darwin") {
     verifyMacDdcctlFallbackScript();
-
-    const builtAppPath = path.resolve(
-      __dirname,
-      "..",
-      "release",
-      "mac-arm64",
-      "显示器输入切换.app"
-    );
-    const installedAppPath = "/Applications/显示器输入切换.app";
-    if (fs.existsSync(builtAppPath)) {
-      verifyMacHelperApps(builtAppPath);
-    } else if (fs.existsSync(installedAppPath)) {
-      verifyMacHelperApps(installedAppPath);
-    } else {
-      throw new Error("No macOS app bundle was found for self verification.");
-    }
+    verifyMacHelperAppsIfAvailable();
   }
 
   process.stdout.write("Self verification passed.\n");

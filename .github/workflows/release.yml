@@ -76,6 +76,9 @@ jobs:
             npm run dist:mac
           fi
 
+      - name: Verify bundled macOS app
+        run: SELF_VERIFY_REQUIRE_MAC_APP_BUNDLE=1 npm run verify:self
+
       - name: Upload macOS artifacts
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/upload-artifact@v4
