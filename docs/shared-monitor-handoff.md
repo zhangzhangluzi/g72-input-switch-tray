@@ -1,166 +1,80 @@
-# Shared Monitor Handoff Logic
+# Local Monitor Switching Rules
 
-This note separates three concerns that are easy to mix together when one monitor is shared by a macOS machine and a Windows machine.
+This project now uses one rule set only:
 
-## 1. Monitor input ownership
+- each app instance controls only the physical screens that are currently attached to the local host
+- no LAN peer discovery
+- no cross-machine ownership endpoint
+- no shared-screen negotiation layer
+- no remote prepare / receive handshake
 
-This is the DDC/CI input-switch command sent to the monitor itself.
+## Current business rules
 
-- On macOS, the app sends the switch locally through `resources/mac/switch-input.sh`.
-- On Windows, the app sends the switch locally through `resources/windows/set-input.ps1`.
-- The two apps do not currently talk to each other when sending the switch command.
+### 1. Screen discovery
 
-Implication:
+- The app reads the screens that the current host can see right now.
+- If the current host sees 1 screen, the UI shows 1 screen.
+- If the current host sees 2 or 3 screens, the UI shows 2 or 3 screens.
+- The app does not keep showing screens that are no longer attached to the current host.
 
-- `Mac -> Windows` does **not** require the Windows app to be running in order to send the DDC command.
-- `Windows -> Mac` does **not** require the macOS app to be running in order to send the DDC command.
+### 2. Interface model
 
-## 2. Windows desktop handoff
+- Every local screen profile exposes four configurable interface slots:
+  - `DP1`
+  - `DP2`
+  - `HDMI1`
+  - `HDMI2`
+- Each slot stores one DDC input value.
+- Each screen profile also stores which slot is the current host's own cable for that screen.
 
-This is a Windows-only concern. It is not the same thing as monitor input switching.
+### 3. Direct switching
 
-- When Windows switches the shared monitor away to the other device, the Windows app can call `DisplaySwitch.exe /internal` so the desktop falls back to Windows' primary display.
-- When the shared monitor later comes back to Windows, the Windows app can call `DisplaySwitch.exe /extend` to restore extended desktop mode.
-- If Windows still keeps the shared screen attached after `/internal`, the app should fall back to an explicit topology helper that detaches every non-primary display.
+- macOS switches locally through `resources/mac/switch-input.sh`.
+- Windows switches locally through `resources/windows/set-input.ps1`.
+- A direct switch action means: "send a DDC input-switch command from this host to this local screen now."
+- It does not mean the other host is ready.
+- It does not mean the other host has already accepted the screen.
 
-Operational constraint:
+### 4. Windows desktop handoff
 
-- This handoff only lands on the display Windows considers primary.
-- If the fallback screen should stay alive after `Windows -> Mac`, make that fallback screen the Windows primary display.
+- This is local to Windows only.
+- When Windows switches a screen away from Windows' own cable, the app can remove that screen from the Windows desktop topology.
+- When the same screen later returns to the Windows cable, the app can add that screen back into the Windows desktop topology.
+- This is not remote coordination. It is only Windows repairing its own local desktop state.
 
-Implication:
+### 5. Current input readback
 
-- The Windows app must be running if you want automatic desktop topology recovery on Windows.
-- But this still does not control the monitor input switch itself; it only controls where Windows places the desktop.
+- If the monitor reports its current input reliably, the app shows it.
+- If the monitor does not report it reliably, the UI must say that the state is unknown.
+- The app must not claim that an inactive interface definitely has or does not have a connected machine behind it.
 
-## 3. Target-device signal readiness
-
-Even if the DDC command is sent correctly, the monitor may stay on the current picture when:
-
-- the target device is asleep
-- the target device is not outputting a stable signal yet
-- the configured input value is wrong for that path
-
-Current macOS behavior:
-
-- The app writes the input value.
-- It then reads the monitor's current input back.
-- If the readback still reports the old input, the app knows only that the monitor did not switch away.
-- It cannot prove whether the cause was "wrong input value" or "target device had no stable signal".
-
-## What the current code really does
+## Error interpretation
 
 ### macOS side
 
-- `switchMonitor()` dispatches to `switchOnMac()` on macOS.
-- `switchOnMac()` only runs the local shell helper with the configured candidate input values.
-- No remote call to the Windows app happens in this path.
-
-Result:
-
-- A macOS-side failure means "the monitor did not switch away from the current input after the local DDC attempt".
-- It does **not** mean "the Windows handoff agent was missing".
+- If macOS writes the input value and readback still stays on the old input, the failure means:
+  - wrong input value, or
+  - target interface has no stable signal, or
+  - the monitor acknowledged the write but did not actually switch
 
 ### Windows side
 
-- `switchMonitor()` dispatches to `switchOnWindows()` on Windows.
-- `switchOnWindows()` sends the local DDC command.
-- If Windows desktop handoff is enabled, it also manages `/internal` when switching away and `/extend` when the shared monitor returns.
+- If Windows cannot map the target screen to a local physical monitor handle, the failure means:
+  - Windows does not currently see that screen in a controllable way, or
+  - the monitor handle is unavailable, or
+  - DDC/CI is blocked or disabled
 
-Result:
+## Explicit non-goals
 
-- A Windows-side name-mismatch failure means "the Windows helper could not map the configured monitor name to what Windows currently sees".
-- It is unrelated to the macOS-side DDC write path.
-- Some monitors keep a logical display path alive on Windows even after the picture has switched to Mac. In that case, the app must not use "still enumerated" as a proxy for ownership; it should read the current input value and treat a Mac-family input as "ownership moved away".
+These are not part of the current product model and should not be reintroduced implicitly:
 
-## Recommended two-machine contract
+- peer URL input
+- LAN ownership checks
+- shared-screen session state
+- "prepare transfer" / "receive transfer" actions
+- remote trigger between macOS and Windows
+- stale `G72`-style single shared monitor assumptions
 
-Treat the shared screen as a **single-owner resource**, not as a monitor that both machines can safely seize at any time.
+## Engineering rule
 
-Treat the handoff as three ordered phases, not one blended action:
-
-1. Prepare the target machine.
-2. Switch the monitor input.
-3. Repair local desktop topology if needed.
-
-### Recommended operational rules
-
-- The machine that currently owns the visible picture should initiate the input switch.
-- Both tray apps should run at login.
-- Windows should keep its tray app running so desktop handoff and recovery stay automatic.
-- Tray/menu initiated switch failures should be recorded in the tray/menu state instead of interrupting the user with a blocking modal dialog.
-- macOS should use the built-in input probe assistant to verify the real input value for the Windows path.
-- Windows should use the exact monitor name that Windows currently detects.
-- If Windows no longer sees the shared screen, Windows should stop offering local switch actions and defer ownership return to the Mac side or the monitor's own buttons.
-
-### Recommended flow: Mac -> Windows
-
-1. Confirm Windows is awake and actively outputting to the shared monitor path.
-2. macOS sends the DDC input-switch command.
-3. If the monitor readback still reports the old input, interpret that as:
-   - wrong input value, or
-   - Windows target path not ready
-4. Do not blame Windows desktop handoff for this failure; that is a separate concern.
-
-### Recommended flow: Windows -> Mac
-
-1. Windows sends the DDC input-switch command.
-2. After the switch-away delay, Windows moves the desktop back to its primary display with `/internal`.
-3. Windows marks a pending restore.
-4. When the shared monitor later comes back, Windows restores `/extend`.
-
-## Recommended next implementation step
-
-The current app is still asymmetric because input switching is local-only.
-
-The app now includes a first peer-confirmation layer:
-
-- each machine exposes a read-only ownership endpoint on the LAN
-- each machine also advertises that endpoint over LAN discovery
-- when exactly one matching peer is discovered, the app uses it automatically
-- if local DDC readback is inconclusive, the app can ask the peer which side currently owns G72
-
-That LAN layer is only a secondary signal:
-
-- Windows should first use local input readback and local desktop-topology changes
-- macOS should first use local input readback and, in single-screen setups, whether its shared display disappeared after a successful handoff
-- peer confirmation is for the cases where local evidence is still ambiguous
-- for an in-flight switch, the app should use the current requested target as the local inference hint instead of waiting for that switch to be recorded as the last successful action
-- Windows desktop handoff verification should read back the real Win32 topology state, not only Electron's display cache
-- if Windows has already detached the shared screen from topology, macOS-to-Windows handoff can optionally ask the discovered Windows peer to restore the shared output path before sending DDC so the monitor sees a stable incoming signal
-- if Windows still remains on “only show on 1”, the Windows helper should re-attach detached displays from the stored registry modes instead of assuming `DisplaySwitch.exe /extend` is enough
-
-Normal operation should stay zero-config:
-
-- the user should not need to paste a peer URL by hand
-- discovery should happen automatically as long as both apps are running on the same LAN
-- any stored peer URL should be treated only as a legacy/debug fallback, not as the primary setup flow
-
-This improves two failure-prone cases:
-
-- Windows says "still attached" even though the picture has already moved to Mac
-- macOS or Windows reports a stale input value immediately after a successful handoff
-
-Remaining limitation:
-
-- desktop topology repair on Windows is still local-only; peer confirmation does not force Windows itself to drop a ghost display path
-
-If we want even tighter dual-machine coordination after this, add an optional peer handshake layer:
-
-- macOS can call a Windows "prepare" endpoint before attempting `Mac -> Windows`
-- Windows can call a macOS "prepare" endpoint before attempting `Windows -> Mac`
-- Windows can expose a "ready for shared monitor" state after forcing `/extend`
-- The switching machine can then decide whether the peer is ready before writing DDC
-
-That would let the app distinguish:
-
-- peer not reachable
-- peer reachable but not ready
-- DDC command sent but monitor stayed put
-- desktop restore pending
-
-Without that peer handshake, the best the current code can do is:
-
-- report the input-switch result honestly
-- keep Windows desktop handoff separate
-- make configuration and signal-readiness problems visible to the user
+If code, UI text, or documentation implies that one host knows the other host's live state over the network, that is a bug in the current model.

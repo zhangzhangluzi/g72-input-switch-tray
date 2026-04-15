@@ -95,11 +95,20 @@ get_expected_input_values() {
 
 query_betterdisplay_input() {
   betterdisplay_path="$1"
-  betterdisplay_mode="$2"
 
   if [ -n "$DISPLAY_ID" ]; then
-    "$betterdisplay_path" get -displayID="$DISPLAY_ID" -feature=ddc -vcp=inputSelect -value 2>&1
-    return $?
+    if output=$("$betterdisplay_path" get -displayID="$DISPLAY_ID" -feature=ddc -vcp=inputSelect -value 2>&1); then
+      printf '%s\n' "$output"
+      return 0
+    fi
+
+    if [ -n "$DISPLAY_NAME" ]; then
+      "$betterdisplay_path" get -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value 2>&1
+      return $?
+    fi
+
+    printf '%s\n' "$output" >&2
+    return 1
   fi
 
   "$betterdisplay_path" get -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value 2>&1
@@ -338,7 +347,6 @@ try_betterdisplay() {
     fi
 
     remember_error "$output" 2
-    return 1
   fi
 
   if output=$("$BETTERDISPLAY_PATH" set -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value="$INPUT_VALUE" 2>&1); then

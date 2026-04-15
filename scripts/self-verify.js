@@ -10,6 +10,64 @@ function run(command, args) {
   return execFileSync(command, args, { encoding: "utf8" }).trim();
 }
 
+function verifyMainSourceSyntax() {
+  execFileSync(process.execPath, ["--check", path.resolve(__dirname, "..", "src", "main.js")], {
+    stdio: "pipe",
+    encoding: "utf8",
+  });
+}
+
+function verifyLocalOnlyDocs() {
+  const readmePath = path.resolve(__dirname, "..", "README.md");
+  const handoffDocPath = path.resolve(__dirname, "..", "docs", "shared-monitor-handoff.md");
+  const readme = fs.readFileSync(readmePath, "utf8");
+  const handoffDoc = fs.readFileSync(handoffDocPath, "utf8");
+
+  assert.match(readme, /127\.0\.0\.1/u);
+  assert.match(handoffDoc, /no LAN peer discovery/u);
+  assert.match(handoffDoc, /controls only the physical screens that are currently attached to the local host/u);
+  assert.doesNotMatch(handoffDoc, /includes a first peer-confirmation layer/u);
+  assert.doesNotMatch(handoffDoc, /ownership endpoint on the LAN/u);
+  assert.doesNotMatch(handoffDoc, /discovered Windows peer/u);
+}
+
+function verifyWindowsScriptSyntax() {
+  const topologyScriptPath = path.resolve(
+    __dirname,
+    "..",
+    "resources",
+    "windows",
+    "display-topology.ps1"
+  );
+  const setInputScriptPath = path.resolve(
+    __dirname,
+    "..",
+    "resources",
+    "windows",
+    "set-input.ps1"
+  );
+  const syntaxCheckCommand = `
+$ErrorActionPreference = 'Stop'
+$scripts = @(
+  '${topologyScriptPath.replace(/'/gu, "''")}',
+  '${setInputScriptPath.replace(/'/gu, "''")}'
+)
+foreach ($script in $scripts) {
+  $tokens = $null
+  $errors = $null
+  [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors) | Out-Null
+  if ($errors.Count -gt 0) {
+    throw ($errors | ForEach-Object { $_.Message } | Out-String)
+  }
+}
+`;
+
+  execFileSync("powershell.exe", ["-NoProfile", "-Command", syntaxCheckCommand], {
+    stdio: "pipe",
+    encoding: "utf8",
+  });
+}
+
 function readPlistJson(plistPath) {
   return JSON.parse(run("/usr/bin/plutil", ["-convert", "json", "-o", "-", plistPath]));
 }
@@ -167,6 +225,13 @@ function verifyMacDdcctlFallbackScript() {
 }
 
 function main() {
+  verifyMainSourceSyntax();
+  verifyLocalOnlyDocs();
+
+  if (process.platform === "win32") {
+    verifyWindowsScriptSyntax();
+  }
+
   if (process.platform === "darwin") {
     verifyMacDdcctlFallbackScript();
 

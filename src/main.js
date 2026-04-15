@@ -9,6 +9,7 @@ const path = require("node:path");
 const APP_NAME = "显示器输入切换";
 const APP_ID = "com.zhangzhangluzi.g72inputswitchtray";
 const WINDOWS_TRAY_GUID = "f5b6f5d6-2917-42e3-b552-b5796b6f7f0d";
+const LOOPBACK_HOST = "127.0.0.1";
 const PREFERRED_CONTROL_PORT = 3847;
 const TRAY_REBUILD_DELAY_MS = 1200;
 const TRAY_HEALTHCHECK_INTERVAL_MS = 5000;
@@ -344,7 +345,7 @@ function startControlServer() {
       fallbackAttempted = true;
       setImmediate(() => {
         if (controlServer) {
-          controlServer.listen(0, "0.0.0.0");
+          controlServer.listen(0, LOOPBACK_HOST);
         }
       });
       return;
@@ -356,7 +357,7 @@ function startControlServer() {
     notify(`本机设置页启动失败：${error.message}`);
   });
 
-  controlServer.listen(PREFERRED_CONTROL_PORT, "0.0.0.0", () => {
+  controlServer.listen(PREFERRED_CONTROL_PORT, LOOPBACK_HOST, () => {
     activeControlPort = getListeningPort();
     controlServerError = null;
     void refreshMenu();
@@ -376,6 +377,12 @@ async function handleControlRequest(request, response) {
     `^/api/${state.controlToken}/windows/refresh(?:/([^/]+))?$`
   ).exec(requestUrl.pathname);
 
+  if (!isLoopbackRequest(request)) {
+    response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("仅允许本机访问设置与控制接口。");
+    return;
+  }
+
   if (requestUrl.pathname === "/health") {
     const monitorContexts = await getConnectedMonitorContexts();
     return writeJson(response, 200, {
@@ -389,12 +396,6 @@ async function handleControlRequest(request, response) {
       lastSwitchOutcome: state.lastSwitchOutcome,
       controlPort: getListeningPort(),
     });
-  }
-
-  if (!isLoopbackRequest(request)) {
-    response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
-    response.end("仅允许本机访问设置与控制接口。");
-    return;
   }
 
   if (requestUrl.pathname === getControlPath()) {
@@ -1113,6 +1114,11 @@ async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
   const unmatchedStoredMonitorConfigs = storedMonitorConfigs.filter(
     (monitorConfig) => normalizeText(monitorConfig.displayKey)
   );
+  const legacyMonitorConfig =
+    storedMonitorConfigs.length === 1 && !normalizeText(storedMonitorConfigs[0].displayKey)
+      ? storedMonitorConfigs[0]
+      : null;
+  let legacyMonitorConfigConsumed = false;
   const usedMonitorIds = new Set();
   const nextMonitorConfigs = [];
 
@@ -1131,9 +1137,11 @@ async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
             monitorConfig.match?.electronDisplayId === displaySummary.electronDisplayId)
         );
       }) ||
-      (storedMonitorConfigs.length > 0 && nextMonitorConfigs.length === 0
-        ? storedMonitorConfigs[0]
-        : null);
+      (!legacyMonitorConfigConsumed && legacyMonitorConfig ? legacyMonitorConfig : null);
+
+    if (matchingMonitorConfig === legacyMonitorConfig) {
+      legacyMonitorConfigConsumed = true;
+    }
 
     const nextMonitorConfig = normalizeMonitorConfig(
       {
@@ -1193,13 +1201,19 @@ async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
 async function getLocalDisplaySummaries() {
   const orderedDisplays = getOrderedLocalDisplays();
   const topologyDisplays = process.platform === "win32" ? await getWindowsTopologyDisplays() : [];
+  const attachedTopologyDisplays =
+    process.platform === "win32"
+      ? topologyDisplays
+          .filter((display) => display.attached)
+          .sort(compareDisplayLikeObjects)
+      : [];
   let secondaryIndex = 2;
   const singleDisplayOnly = orderedDisplays.length <= 1;
 
   return orderedDisplays.map((display, index) => {
     const topologyMatch =
       process.platform === "win32"
-        ? matchWindowsTopologyDisplayToElectronDisplay(display, topologyDisplays)
+        ? matchWindowsTopologyDisplayToElectronDisplay(display, orderedDisplays, attachedTopologyDisplays)
         : null;
     const roleLabel = singleDisplayOnly
       ? "当前机器屏幕"
@@ -1239,17 +1253,7 @@ async function getLocalDisplaySummaries() {
 
 function getOrderedLocalDisplays() {
   try {
-    return [...screen.getAllDisplays()].sort((left, right) => {
-      if (left.primary !== right.primary) {
-        return left.primary ? -1 : 1;
-      }
-
-      if (left.bounds.y !== right.bounds.y) {
-        return left.bounds.y - right.bounds.y;
-      }
-
-      return left.bounds.x - right.bounds.x;
-    });
+    return [...screen.getAllDisplays()].sort(compareDisplayLikeObjects);
   } catch {
     return [];
   }
@@ -1264,6 +1268,10 @@ function buildDisplayKeyForLocalDisplay(display, displayIndex, topologyDisplay =
     const gdiDeviceName = normalizeText(topologyDisplay?.deviceName);
     if (gdiDeviceName) {
       return `win:${gdiDeviceName}`;
+    }
+
+    if (Number.isInteger(display?.id)) {
+      return `win-electron:${display.id}`;
     }
   }
 
@@ -1317,21 +1325,40 @@ function normalizeWindowsTopologyDisplay(display) {
   };
 }
 
-function matchWindowsTopologyDisplayToElectronDisplay(display, topologyDisplays) {
-  if (!display || !Array.isArray(topologyDisplays) || topologyDisplays.length === 0) {
+function matchWindowsTopologyDisplayToElectronDisplay(
+  display,
+  orderedDisplays,
+  attachedTopologyDisplays
+) {
+  if (!display || !Array.isArray(attachedTopologyDisplays) || attachedTopologyDisplays.length === 0) {
     return null;
   }
 
-  return (
-    topologyDisplays.find(
+  const exactMatch =
+    attachedTopologyDisplays.find(
       (topologyDisplay) =>
-        topologyDisplay.attached &&
         topologyDisplay.width === display.bounds.width &&
         topologyDisplay.height === display.bounds.height &&
         topologyDisplay.positionX === display.bounds.x &&
         topologyDisplay.positionY === display.bounds.y
-    ) || null
+    ) || null;
+
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  if (!Array.isArray(orderedDisplays) || orderedDisplays.length !== attachedTopologyDisplays.length) {
+    return null;
+  }
+
+  const orderedDisplayIndex = orderedDisplays.findIndex(
+    (candidateDisplay) => candidateDisplay.id === display.id
   );
+  if (orderedDisplayIndex < 0) {
+    return null;
+  }
+
+  return attachedTopologyDisplays[orderedDisplayIndex] || null;
 }
 
 function isTopologyDisplayMatchMonitor(topologyDisplay, monitorContextOrConfig) {
@@ -2176,6 +2203,22 @@ function normalizeWindowsDesktopRuntime(rawRuntimeMap) {
   }
 
   return nextRuntimeMap;
+}
+
+function compareDisplayLikeObjects(left, right) {
+  if (Boolean(left?.primary) !== Boolean(right?.primary)) {
+    return left?.primary ? -1 : 1;
+  }
+
+  const leftY = Number.isFinite(left?.bounds?.y) ? left.bounds.y : left?.positionY || 0;
+  const rightY = Number.isFinite(right?.bounds?.y) ? right.bounds.y : right?.positionY || 0;
+  if (leftY !== rightY) {
+    return leftY - rightY;
+  }
+
+  const leftX = Number.isFinite(left?.bounds?.x) ? left.bounds.x : left?.positionX || 0;
+  const rightX = Number.isFinite(right?.bounds?.x) ? right.bounds.x : right?.positionX || 0;
+  return leftX - rightX;
 }
 
 function saveState(nextState) {
