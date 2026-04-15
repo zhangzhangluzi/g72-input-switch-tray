@@ -646,6 +646,7 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
   });
 
   if (
+    verificationStatus === "confirmed" &&
     !switchingToLocalInterface &&
     shouldUseWindowsDisplayHandoffForMonitor(monitorConfig, attachedTopologyDisplayCount)
   ) {
@@ -1259,15 +1260,20 @@ async function getLocalDisplaySummaries() {
     const attachedTopologyDisplays = topologyDisplays
       .filter((display) => display.attached)
       .sort(compareDisplayLikeObjects);
-    let secondaryIndex = 2;
-    const singleDisplayOnly = attachedTopologyDisplays.length <= 1;
-
-    return attachedTopologyDisplays.map((topologyDisplay, index) => {
-      const electronDisplay = matchElectronDisplayToWindowsTopologyDisplay(
+    const switchableTopologyDisplays = attachedTopologyDisplays
+      .map((topologyDisplay) => ({
         topologyDisplay,
-        orderedDisplays,
-        attachedTopologyDisplays
-      );
+        electronDisplay: matchElectronDisplayToWindowsTopologyDisplay(
+          topologyDisplay,
+          orderedDisplays,
+          attachedTopologyDisplays
+        ),
+      }))
+      .filter(({ electronDisplay }) => !electronDisplay?.internal);
+    let secondaryIndex = 2;
+    const singleDisplayOnly = switchableTopologyDisplays.length <= 1;
+
+    return switchableTopologyDisplays.map(({ topologyDisplay, electronDisplay }, index) => {
       const roleLabel = singleDisplayOnly
         ? "当前机器屏幕"
         : topologyDisplay.primary
@@ -1312,10 +1318,11 @@ async function getLocalDisplaySummaries() {
     });
   }
 
+  const externalDisplays = orderedDisplays.filter((display) => !display.internal);
   let secondaryIndex = 2;
-  const singleDisplayOnly = orderedDisplays.length <= 1;
+  const singleDisplayOnly = externalDisplays.length <= 1;
 
-  return orderedDisplays.map((display, index) => {
+  return externalDisplays.map((display, index) => {
     const roleLabel = singleDisplayOnly
       ? "当前机器屏幕"
       : display.primary

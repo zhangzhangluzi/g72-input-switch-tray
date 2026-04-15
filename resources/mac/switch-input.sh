@@ -107,12 +107,7 @@ query_betterdisplay_input() {
       return 0
     fi
 
-    if [ -n "$DISPLAY_NAME" ]; then
-      "$betterdisplay_path" get -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value 2>&1
-      return $?
-    fi
-
-    printf '%s\n' "$output" >&2
+    remember_error "$output" 2
     return 1
   fi
 
@@ -360,6 +355,7 @@ try_betterdisplay() {
     fi
 
     remember_error "$output" 2
+    return 1
   fi
 
   if output=$("$BETTERDISPLAY_PATH" set -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value="$INPUT_VALUE" 2>&1); then

@@ -1,12 +1,12 @@
 # Monitor Input Switch Tray
 
-Cross-platform tray app for switching each locally connected DDC/CI-capable monitor directly between four configurable input interfaces.
+Cross-platform tray app for switching each locally connected external DDC/CI-capable monitor directly between four configurable input interfaces.
 
 ## What it does
 
 - Windows: system tray app with a right-click menu
 - macOS: menu bar app with a click menu
-- The tray/menu groups actions by locally connected physical screen
+- The tray/menu groups actions by locally connected external physical screen
 - Each detected local screen exposes four switch actions:
   - `DP1`
   - `DP2`
@@ -24,8 +24,8 @@ Cross-platform tray app for switching each locally connected DDC/CI-capable moni
 
 ## How configuration works
 
-- The app auto-detects the screens currently attached to the local machine
-- Each detected local screen gets its own stored profile
+- The app auto-detects the external DDC/CI-capable screens currently attached to the local machine
+- Each detected local external screen gets its own stored profile
 - Each profile always has four interface slots:
   - `DP1`
   - `DP2`
@@ -35,6 +35,7 @@ Cross-platform tray app for switching each locally connected DDC/CI-capable moni
 - Each profile also stores which one of the four interfaces is the local machine's own cable for that screen
 - On Windows, the profile is matched primarily by the screen's Win32 `DeviceName`, so two same-model monitors can still be distinguished
 - On macOS, the profile is matched primarily by the local display ID
+- Internal laptop / built-in panels are not exposed as four-interface switch targets
 
 ## Platform notes
 

@@ -17,6 +17,18 @@ function verifyMainSourceSyntax() {
   });
 }
 
+function verifyMainSourceBusinessGuards() {
+  const mainSourcePath = path.resolve(__dirname, "..", "src", "main.js");
+  const mainSource = fs.readFileSync(mainSourcePath, "utf8");
+
+  assert.match(
+    mainSource,
+    /verificationStatus === "confirmed"[\s\S]*detachWindowsDisplayForMonitor/u
+  );
+  assert.match(mainSource, /const externalDisplays = orderedDisplays\.filter\(\(display\) => !display\.internal\);/u);
+  assert.match(mainSource, /\.filter\(\(\{ electronDisplay \}\) => !electronDisplay\?\.internal\);/u);
+}
+
 function verifyLocalOnlyDocs() {
   const readmePath = path.resolve(__dirname, "..", "README.md");
   const handoffDocPath = path.resolve(__dirname, "..", "docs", "shared-monitor-handoff.md");
@@ -25,7 +37,10 @@ function verifyLocalOnlyDocs() {
 
   assert.match(readme, /127\.0\.0\.1/u);
   assert.match(handoffDoc, /no LAN peer discovery/u);
-  assert.match(handoffDoc, /controls only the physical screens that are currently attached to the local host/u);
+  assert.match(
+    handoffDoc,
+    /controls only the external physical screens that are currently attached to the local host/u
+  );
   assert.doesNotMatch(handoffDoc, /includes a first peer-confirmation layer/u);
   assert.doesNotMatch(handoffDoc, /ownership endpoint on the LAN/u);
   assert.doesNotMatch(handoffDoc, /discovered Windows peer/u);
@@ -243,6 +258,26 @@ function verifyMacDdcctlFallbackScript() {
   assert.match(unconfirmedOutput, /UNCONFIRMED/u);
 }
 
+function verifyMacBetterDisplayDisplayIdSafety() {
+  const switchScriptPath = path.resolve(
+    __dirname,
+    "..",
+    "resources",
+    "mac",
+    "switch-input.sh"
+  );
+  const switchScript = fs.readFileSync(switchScriptPath, "utf8");
+
+  assert.match(
+    switchScript,
+    /query_betterdisplay_input\(\)[\s\S]*if \[ -n "\$DISPLAY_ID" \]; then[\s\S]*remember_error "\$output" 2[\s\S]*return 1[\s\S]*\n  fi/u
+  );
+  assert.match(
+    switchScript,
+    /try_betterdisplay\(\)[\s\S]*if \[ -n "\$DISPLAY_ID" \]; then[\s\S]*remember_error "\$output" 2[\s\S]*return 1[\s\S]*\n  fi/u
+  );
+}
+
 function verifyMacHelperAppsIfAvailable() {
   const builtAppPath = path.resolve(
     __dirname,
@@ -269,6 +304,7 @@ function verifyMacHelperAppsIfAvailable() {
 
 function main() {
   verifyMainSourceSyntax();
+  verifyMainSourceBusinessGuards();
   verifyLocalOnlyDocs();
   verifyPinnedMacDdcctlBuildScript();
 
@@ -278,6 +314,7 @@ function main() {
 
   if (process.platform === "darwin") {
     verifyMacDdcctlFallbackScript();
+    verifyMacBetterDisplayDisplayIdSafety();
     verifyMacHelperAppsIfAvailable();
   }
 

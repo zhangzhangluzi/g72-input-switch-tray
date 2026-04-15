@@ -2,7 +2,7 @@
 
 This project now uses one rule set only:
 
-- each app instance controls only the physical screens that are currently attached to the local host
+- each app instance controls only the external physical screens that are currently attached to the local host
 - no LAN peer discovery
 - no cross-machine ownership endpoint
 - no shared-screen negotiation layer
@@ -12,10 +12,11 @@ This project now uses one rule set only:
 
 ### 1. Screen discovery
 
-- The app reads the screens that the current host can see right now.
-- If the current host sees 1 screen, the UI shows 1 screen.
-- If the current host sees 2 or 3 screens, the UI shows 2 or 3 screens.
+- The app reads the external DDC/CI-capable screens that the current host can see right now.
+- If the current host sees 1 external screen, the UI shows 1 screen.
+- If the current host sees 2 or 3 external screens, the UI shows 2 or 3 screens.
 - The app does not keep showing screens that are no longer attached to the current host.
+- Internal / built-in panels are not treated as four-interface switch targets.
 
 ### 2. Interface model
 
@@ -41,6 +42,7 @@ This project now uses one rule set only:
 
 - This is local to Windows only.
 - When Windows switches a screen away from Windows' own cable, the app can remove that screen from the Windows desktop topology.
+- That detach step is allowed only after the switch result has been confirmed, not when the command is merely unconfirmed.
 - When the same screen later returns to the Windows cable, the app can add that screen back into the Windows desktop topology.
 - This is not remote coordination. It is only Windows repairing its own local desktop state.
 
