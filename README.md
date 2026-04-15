@@ -40,6 +40,7 @@ Cross-platform tray app for switching each locally connected DDC/CI-capable moni
 
 - Windows switching is done with a bundled PowerShell DDC/CI helper that maps the target monitor through Win32 / WMI / DXVA2. The installer does **not** bundle `.NET`.
 - Some monitors do not report a trustworthy “current input” value over DDC/CI. The settings page shows the current input only when it can be read back reliably.
+- If a switch command can be written but the monitor does not provide a reliable input readback, the app treats the action as “command sent, result not confirmed” instead of forcing a hard failure.
 - The app does **not** pretend to know whether every inactive interface has a live machine connected. It can reliably show the current active interface when the monitor reports it; inactive-interface connection state remains best-effort.
 - For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
 - On Windows, desktop handoff is per monitor profile:
@@ -52,6 +53,7 @@ Cross-platform tray app for switching each locally connected DDC/CI-capable moni
 - If `betterdisplaycli` is not installed but `BetterDisplay.app` is present in `/Applications` or `~/Applications`, the app uses the BetterDisplay bundle binary directly.
 - When BetterDisplay is used for input switching, the app reads the input value back after each write so Samsung / MStar displays can keep falling through to alternate values when the standard MCCS value is acknowledged but does not actually take effect.
 - If BetterDisplay CLI is unavailable, the app falls back to the bundled `ddcctl` binary built during the macOS GitHub Actions release job, and then to `ddcctl` from `PATH`.
+- On macOS, `ddcctl` fallback is only considered safe when there is a single external display. If multiple external displays are attached and BetterDisplay is unavailable, the app refuses the fallback instead of risking a wrong-screen switch.
 - When the app has to use `ddcctl`, it tries the configured local display index first, discovers how many external displays `ddcctl` can see, and then tries the remaining valid indices automatically.
 - The app starts a local settings page on port `3847` and binds it to `127.0.0.1` only. The HTTP server is only used for local setup and local direct switch actions; the app does not rely on LAN peer discovery or cross-machine coordination.
 - If port `3847` is unavailable, the local pages automatically fall back to another free local port.

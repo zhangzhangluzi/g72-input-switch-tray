@@ -34,6 +34,8 @@ This project now uses one rule set only:
 - A direct switch action means: "send a DDC input-switch command from this host to this local screen now."
 - It does not mean the other host is ready.
 - It does not mean the other host has already accepted the screen.
+- If the write succeeds but the monitor does not provide a trustworthy current-input readback, the action should be recorded as "command sent, state not confirmed", not as a hard failure.
+- On macOS, `ddcctl` fallback must not be used to target one specific screen when multiple external displays are attached.
 
 ### 4. Windows desktop handoff
 
@@ -47,6 +49,7 @@ This project now uses one rule set only:
 - If the monitor reports its current input reliably, the app shows it.
 - If the monitor does not report it reliably, the UI must say that the state is unknown.
 - The app must not claim that an inactive interface definitely has or does not have a connected machine behind it.
+- A confirmed mismatch after readback is a real switch failure; missing readback support is not.
 
 ## Error interpretation
 

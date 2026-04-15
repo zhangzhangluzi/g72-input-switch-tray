@@ -31,6 +31,14 @@ function verifyLocalOnlyDocs() {
   assert.doesNotMatch(handoffDoc, /discovered Windows peer/u);
 }
 
+function verifyPinnedMacDdcctlBuildScript() {
+  const buildScriptPath = path.resolve(__dirname, "..", "scripts", "build-macos-ddcctl.sh");
+  const buildScript = fs.readFileSync(buildScriptPath, "utf8");
+
+  assert.match(buildScript, /DDCCTL_COMMIT="([0-9a-f]{40})"/u);
+  assert.match(buildScript, /git -C "\$WORK_DIR" fetch --depth 1 origin "\$DDCCTL_COMMIT"/u);
+}
+
 function verifyWindowsScriptSyntax() {
   const topologyScriptPath = path.resolve(
     __dirname,
@@ -166,6 +174,9 @@ fi
 if [ "\${1:-}" = "-d" ] && [ "\${2:-}" = "1" ] && [ "\${3:-}" = "-i" ] && [ "\${4:-}" = "?" ]; then
   if [ "${mode}" = "matched" ]; then
     echo "VCP 0x60 current: 16 max: 18"
+  elif [ "${mode}" = "query-fails" ]; then
+    echo "readback unavailable" >&2
+    exit 1
   else
     echo "VCP 0x60 current: 6 max: 18"
   fi
@@ -222,6 +233,14 @@ function verifyMacDdcctlFallbackScript() {
     `${failure.stderr || failure.message}`,
     /ddcctl 已发送输入切换命令，但当前输入仍是 6，未匹配目标值集合：16 9 7/
   );
+
+  writeFakeDdcctlBinary(fakeBinaryPath, "query-fails");
+  const unconfirmedOutput = execFileSync("/bin/sh", [switchScriptPath, "16"], {
+    env: baseEnv,
+    stdio: "pipe",
+    encoding: "utf8",
+  });
+  assert.match(unconfirmedOutput, /UNCONFIRMED/u);
 }
 
 function verifyMacHelperAppsIfAvailable() {
@@ -251,6 +270,7 @@ function verifyMacHelperAppsIfAvailable() {
 function main() {
   verifyMainSourceSyntax();
   verifyLocalOnlyDocs();
+  verifyPinnedMacDdcctlBuildScript();
 
   if (process.platform === "win32") {
     verifyWindowsScriptSyntax();

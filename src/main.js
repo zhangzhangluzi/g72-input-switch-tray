@@ -293,6 +293,7 @@ function buildTrayMonitorItem(monitorContext) {
       { type: "separator" },
       ...TARGET_IDS.map((targetId) => ({
         label: `直接切到 ${getSwitchActionLabel(targetId, monitorContext.monitor)}`,
+        enabled: monitorContext.status.visible !== false,
         click: () => handleTrayDirectSwitch(monitorContext.id, targetId),
       })),
       ...(process.platform === "win32"
@@ -556,18 +557,36 @@ async function switchMonitor(monitorId, targetId, options = {}) {
     throw error;
   }
 
+  const runtimeStatus = await getMonitorStatus(monitorContext);
+  if (runtimeStatus.visible === false) {
+    const error = new Error(
+      `${getMonitorDisplayTitle(monitorContext)} 当前不在本机桌面里，不能从这台机器直接切换。`
+    );
+    recordSwitchOutcome("error", monitorId, targetId, error.message);
+    saveState(state);
+    void refreshMenu();
+
+    if (showErrorDialog) {
+      dialog.showErrorBox(APP_NAME, error.message);
+    }
+
+    throw error;
+  }
+
   try {
+    let switchResult = null;
     if (process.platform === "win32") {
-      await switchOnWindowsForContext(monitorContext, targetId, target);
+      switchResult = await switchOnWindowsForContext(monitorContext, targetId, target);
     } else if (process.platform === "darwin") {
-      await switchOnMacForContext(monitorContext, targetId, target);
+      switchResult = await switchOnMacForContext(monitorContext, targetId, target);
     } else {
       throw new Error(`当前平台不受支持：${process.platform}`);
     }
 
-    persistSuccessfulLocalSwitch(monitorContext, targetId, target);
+    const successMessages = getSwitchSuccessMessages(monitorContext, target, switchResult);
+    persistSuccessfulLocalSwitch(monitorContext, targetId, successMessages.outcomeMessage);
     if (notifyOnSuccess) {
-      notify(`${getMonitorDisplayTitle(monitorContext)} 已切到 ${target.label}。`);
+      notify(successMessages.notificationMessage);
     }
   } catch (error) {
     const userFacingError = formatMonitorSwitchError(monitorContext, targetId, error);
@@ -587,6 +606,7 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
   const monitorConfig = monitorContext.monitor;
   const switchingToLocalInterface = isLocalInterfaceTarget(targetId, monitorConfig);
   const topologyDisplays = await getWindowsTopologyDisplays();
+  const attachedTopologyDisplayCount = topologyDisplays.filter((display) => display.attached).length;
   if (!isWindowsMonitorAttachedInTopology(topologyDisplays, monitorContext)) {
     throw new Error(
       `${getMonitorDisplayTitle(
@@ -600,6 +620,7 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
   const candidates = getInputCandidates(target, monitorConfig);
   const expectedValues = getExpectedProbeInputValues(target.inputValue);
   const attachedDisplayCountBeforeSwitch = await getCurrentWindowsAttachedDisplayCount();
+  let verificationStatus = "unconfirmed";
 
   await runCandidateSequence(candidates, async (candidate) => {
     await runCommand("powershell.exe", [
@@ -612,26 +633,48 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
       "-InputValue",
       String(candidate),
     ]);
-    await verifyWindowsSwitchOutcomeForContext(monitorContext, target, expectedValues);
+    const verificationResult = await verifyWindowsSwitchOutcomeForContext(
+      monitorContext,
+      target,
+      expectedValues
+    );
+    if (verificationResult.status === "mismatch") {
+      throw new Error(verificationResult.message);
+    }
+
+    verificationStatus = verificationResult.status;
   });
 
-  if (!switchingToLocalInterface && shouldUseWindowsDisplayHandoffForMonitor(monitorConfig)) {
+  if (
+    !switchingToLocalInterface &&
+    shouldUseWindowsDisplayHandoffForMonitor(monitorConfig, attachedTopologyDisplayCount)
+  ) {
     await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
     await detachWindowsDisplayForMonitor(monitorConfig, attachedDisplayCountBeforeSwitch);
   } else if (switchingToLocalInterface) {
     clearMonitorPendingRestore(monitorConfig.id);
   }
+
+  return {
+    verificationStatus,
+  };
 }
 
 async function switchOnMacForContext(monitorContext, targetId, target) {
   const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
   const candidates = getInputCandidates(target, monitorContext.monitor);
+  let verificationStatus = "confirmed";
 
-  await runCandidateSequence(candidates, (candidate) =>
-    runCommand("/bin/sh", [scriptPath, String(candidate)], {
+  await runCandidateSequence(candidates, async (candidate) => {
+    const output = await runCommand("/bin/sh", [scriptPath, String(candidate)], {
       env: getMacSwitchScriptEnvForContext(monitorContext),
-    })
-  );
+    });
+    verificationStatus = /\bUNCONFIRMED\b/u.test(output) ? "unconfirmed" : "confirmed";
+  });
+
+  return {
+    verificationStatus,
+  };
 }
 
 function formatMonitorSwitchError(monitorContext, targetId, error) {
@@ -685,7 +728,10 @@ async function verifyWindowsSwitchOutcomeForContext(monitorContext, target, expe
     const currentInputResult = await getWindowsCurrentInputResultForContext(monitorContext);
     if (currentInputResult.ok) {
       if (expectedValues.includes(currentInputResult.value)) {
-        return;
+        return {
+          status: "confirmed",
+          message: "",
+        };
       }
 
       lastObservedValue = currentInputResult.value;
@@ -698,16 +744,20 @@ async function verifyWindowsSwitchOutcomeForContext(monitorContext, target, expe
   }
 
   if (Number.isInteger(lastObservedValue)) {
-    throw new Error(
-      `${getMonitorDisplayTitle(monitorContext)} 当前输入仍是 ${lastObservedValue}，未匹配目标值集合：${expectedValues.join(
-        " "
-      )}`
-    );
+    return {
+      status: "mismatch",
+      message: `${getMonitorDisplayTitle(
+        monitorContext
+      )} 当前输入仍是 ${lastObservedValue}，未匹配目标值集合：${expectedValues.join(" ")}`,
+    };
   }
 
-  throw new Error(
-    lastErrorMessage || `${getMonitorDisplayTitle(monitorContext)} 还没有确认真正切到 ${target.label}。`
-  );
+  return {
+    status: "unconfirmed",
+    message:
+      lastErrorMessage ||
+      `${getMonitorDisplayTitle(monitorContext)} 已发送切换命令，但当前显示器没有提供可靠的输入回读。`,
+  };
 }
 
 async function getWindowsCurrentInputResultForContext(monitorContext) {
@@ -875,7 +925,7 @@ async function waitForWindowsMonitorAttachmentState(monitorConfig, expectedAttac
   throw new Error(errorMessage);
 }
 
-function shouldUseWindowsDisplayHandoffForMonitor(monitorConfig) {
+function shouldUseWindowsDisplayHandoffForMonitor(monitorConfig, attachedDisplayCount = null) {
   if (process.platform !== "win32") {
     return false;
   }
@@ -886,6 +936,10 @@ function shouldUseWindowsDisplayHandoffForMonitor(monitorConfig) {
 
   if (monitorConfig.windowsDisplayHandoffMode === "external") {
     return true;
+  }
+
+  if (Number.isInteger(attachedDisplayCount)) {
+    return attachedDisplayCount >= 2;
   }
 
   return getConnectedDisplayCount() >= 2;
@@ -1200,34 +1254,75 @@ async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
 
 async function getLocalDisplaySummaries() {
   const orderedDisplays = getOrderedLocalDisplays();
-  const topologyDisplays = process.platform === "win32" ? await getWindowsTopologyDisplays() : [];
-  const attachedTopologyDisplays =
-    process.platform === "win32"
-      ? topologyDisplays
-          .filter((display) => display.attached)
-          .sort(compareDisplayLikeObjects)
-      : [];
+  if (process.platform === "win32") {
+    const topologyDisplays = await getWindowsTopologyDisplays();
+    const attachedTopologyDisplays = topologyDisplays
+      .filter((display) => display.attached)
+      .sort(compareDisplayLikeObjects);
+    let secondaryIndex = 2;
+    const singleDisplayOnly = attachedTopologyDisplays.length <= 1;
+
+    return attachedTopologyDisplays.map((topologyDisplay, index) => {
+      const electronDisplay = matchElectronDisplayToWindowsTopologyDisplay(
+        topologyDisplay,
+        orderedDisplays,
+        attachedTopologyDisplays
+      );
+      const roleLabel = singleDisplayOnly
+        ? "当前机器屏幕"
+        : topologyDisplay.primary
+          ? "主屏幕"
+          : `附屏幕 ${secondaryIndex++}`;
+      const displayKey = buildDisplayKeyForLocalDisplay(
+        electronDisplay || {
+          id: null,
+          bounds: {
+            x: topologyDisplay.positionX,
+            y: topologyDisplay.positionY,
+            width: topologyDisplay.width,
+            height: topologyDisplay.height,
+          },
+        },
+        index + 1,
+        topologyDisplay
+      );
+      const detectedName = normalizeText(
+        topologyDisplay.friendlyName || topologyDisplay.displayName || topologyDisplay.deviceString || ""
+      );
+
+      return {
+        id: createMonitorId(displayKey),
+        displayKey,
+        index: index + 1,
+        roleLabel,
+        detectedName,
+        resolution: `${topologyDisplay.width} × ${topologyDisplay.height}`,
+        position: `${topologyDisplay.positionX}, ${topologyDisplay.positionY}`,
+        internal: Boolean(electronDisplay?.internal),
+        electronDisplayId: Number.isInteger(electronDisplay?.id) ? electronDisplay.id : null,
+        gdiDeviceName: normalizeText(topologyDisplay.deviceName),
+        productCode: normalizeText(topologyDisplay.productCode),
+        bounds: {
+          x: topologyDisplay.positionX,
+          y: topologyDisplay.positionY,
+          width: topologyDisplay.width,
+          height: topologyDisplay.height,
+        },
+      };
+    });
+  }
+
   let secondaryIndex = 2;
   const singleDisplayOnly = orderedDisplays.length <= 1;
 
   return orderedDisplays.map((display, index) => {
-    const topologyMatch =
-      process.platform === "win32"
-        ? matchWindowsTopologyDisplayToElectronDisplay(display, orderedDisplays, attachedTopologyDisplays)
-        : null;
     const roleLabel = singleDisplayOnly
       ? "当前机器屏幕"
       : display.primary
         ? "主屏幕"
         : `附屏幕 ${secondaryIndex++}`;
-    const displayKey = buildDisplayKeyForLocalDisplay(display, index + 1, topologyMatch);
-    const detectedName = normalizeText(
-      topologyMatch?.friendlyName ||
-        topologyMatch?.displayName ||
-        topologyMatch?.deviceString ||
-        display.label ||
-        ""
-    );
+    const displayKey = buildDisplayKeyForLocalDisplay(display, index + 1, null);
+    const detectedName = normalizeText(display.label || "");
 
     return {
       id: createMonitorId(displayKey),
@@ -1239,8 +1334,8 @@ async function getLocalDisplaySummaries() {
       position: `${display.bounds.x}, ${display.bounds.y}`,
       internal: Boolean(display.internal),
       electronDisplayId: Number.isInteger(display.id) ? display.id : null,
-      gdiDeviceName: normalizeText(topologyMatch?.deviceName),
-      productCode: normalizeText(topologyMatch?.productCode),
+      gdiDeviceName: "",
+      productCode: "",
       bounds: {
         x: display.bounds.x,
         y: display.bounds.y,
@@ -1325,18 +1420,18 @@ function normalizeWindowsTopologyDisplay(display) {
   };
 }
 
-function matchWindowsTopologyDisplayToElectronDisplay(
-  display,
+function matchElectronDisplayToWindowsTopologyDisplay(
+  topologyDisplay,
   orderedDisplays,
   attachedTopologyDisplays
 ) {
-  if (!display || !Array.isArray(attachedTopologyDisplays) || attachedTopologyDisplays.length === 0) {
+  if (!topologyDisplay || !Array.isArray(orderedDisplays) || orderedDisplays.length === 0) {
     return null;
   }
 
   const exactMatch =
-    attachedTopologyDisplays.find(
-      (topologyDisplay) =>
+    orderedDisplays.find(
+      (display) =>
         topologyDisplay.width === display.bounds.width &&
         topologyDisplay.height === display.bounds.height &&
         topologyDisplay.positionX === display.bounds.x &&
@@ -1347,18 +1442,23 @@ function matchWindowsTopologyDisplayToElectronDisplay(
     return exactMatch;
   }
 
-  if (!Array.isArray(orderedDisplays) || orderedDisplays.length !== attachedTopologyDisplays.length) {
+  if (
+    !Array.isArray(attachedTopologyDisplays) ||
+    orderedDisplays.length !== attachedTopologyDisplays.length
+  ) {
     return null;
   }
 
-  const orderedDisplayIndex = orderedDisplays.findIndex(
-    (candidateDisplay) => candidateDisplay.id === display.id
+  const topologyDisplayIndex = attachedTopologyDisplays.findIndex(
+    (candidateDisplay) =>
+      normalizeText(candidateDisplay.deviceName) &&
+      normalizeText(candidateDisplay.deviceName) === normalizeText(topologyDisplay.deviceName)
   );
-  if (orderedDisplayIndex < 0) {
+  if (topologyDisplayIndex < 0) {
     return null;
   }
 
-  return attachedTopologyDisplays[orderedDisplayIndex] || null;
+  return orderedDisplays[topologyDisplayIndex] || null;
 }
 
 function isTopologyDisplayMatchMonitor(topologyDisplay, monitorContextOrConfig) {
@@ -1400,11 +1500,7 @@ async function runWindowsTopologyCommand(args) {
 async function getCurrentWindowsAttachedDisplayCount() {
   const topologyDisplays = await getWindowsTopologyDisplays();
   const attachedCount = topologyDisplays.filter((display) => display.attached).length;
-  if (attachedCount > 0) {
-    return attachedCount;
-  }
-
-  return getConnectedDisplayCount() || null;
+  return attachedCount > 0 ? attachedCount : null;
 }
 
 async function waitForDisplayCount(expectedCount, errorMessage) {
@@ -1594,6 +1690,7 @@ function renderInterfaceStatusCard(monitorContext, targetId) {
   const isCurrent = Number.isInteger(currentInputValue)
     ? getExpectedProbeInputValues(target.inputValue).includes(currentInputValue)
     : false;
+  const directSwitchEnabled = monitorContext.status.visible !== false;
 
   let statusText = "连接状态未知";
   let detailText = "未激活接口是否真的接了机器，DDC/CI 不能无损读出来。";
@@ -1621,7 +1718,13 @@ function renderInterfaceStatusCard(monitorContext, targetId) {
     <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/${encodeURIComponent(
       monitorContext.id
     )}/${encodeURIComponent(targetId)}" style="margin-top: 14px;">
-      <button type="submit">直接切到 ${escapeHtml(getSwitchActionLabel(targetId, monitorContext.monitor))}</button>
+      <button type="submit"${directSwitchEnabled ? "" : " disabled"}>
+        ${
+          directSwitchEnabled
+            ? `直接切到 ${escapeHtml(getSwitchActionLabel(targetId, monitorContext.monitor))}`
+            : "当前不可从本机直接切换"
+        }
+      </button>
     </form>
   </div>`;
 }
@@ -2080,14 +2183,27 @@ function recordSwitchOutcome(status, monitorId, targetId, message = "") {
   });
 }
 
-function persistSuccessfulLocalSwitch(monitorContext, targetId, target) {
+function getSwitchSuccessMessages(monitorContext, target, switchResult = null) {
+  if (switchResult?.verificationStatus === "unconfirmed") {
+    return {
+      outcomeMessage: `${getMonitorDisplayTitle(
+        monitorContext
+      )} 已发送切换命令：${target.label}。当前显示器未提供可靠回读，结果待人工确认。`,
+      notificationMessage: `${getMonitorDisplayTitle(
+        monitorContext
+      )} 已发送切换命令到 ${target.label}，当前无法可靠确认结果。`,
+    };
+  }
+
+  return {
+    outcomeMessage: `${getMonitorDisplayTitle(monitorContext)} 已执行切换：${target.label}。`,
+    notificationMessage: `${getMonitorDisplayTitle(monitorContext)} 已切到 ${target.label}。`,
+  };
+}
+
+function persistSuccessfulLocalSwitch(monitorContext, targetId, outcomeMessage) {
   state.lastTarget = `${monitorContext.id}:${targetId}`;
-  recordSwitchOutcome(
-    "success",
-    monitorContext.id,
-    targetId,
-    `${getMonitorDisplayTitle(monitorContext)} 已执行切换：${target.label}。`
-  );
+  recordSwitchOutcome("success", monitorContext.id, targetId, outcomeMessage);
   saveState(state);
   void refreshMenu();
 }
@@ -2344,11 +2460,6 @@ function runCommand(file, args, options = {}) {
       const combinedOutput = [stdout, stderr].filter(Boolean).join("\n").trim();
       if (error) {
         reject(new Error(combinedOutput || error.message));
-        return;
-      }
-
-      if (combinedOutput && /\b(error|failed)\b/i.test(combinedOutput)) {
-        reject(new Error(combinedOutput));
         return;
       }
 

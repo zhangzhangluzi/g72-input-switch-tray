@@ -15,6 +15,7 @@ LAST_ERROR_PRIORITY=0
 DISPLAY_INDEX_CANDIDATES=""
 BETTERDISPLAY_PATH=""
 BETTERDISPLAY_MODE=""
+LAST_VERIFICATION_RESULT=""
 
 if [ "$COMMAND" != "--query-input" ]; then
   case "$INPUT_VALUE" in
@@ -56,6 +57,10 @@ remember_error() {
     LAST_ERROR="$output"
     LAST_ERROR_PRIORITY="$priority"
   fi
+}
+
+set_verification_result() {
+  LAST_VERIFICATION_RESULT="${1:-}"
 }
 
 extract_external_display_count() {
@@ -207,8 +212,8 @@ verify_betterdisplay_switch() {
         continue
       fi
 
-      remember_error "$output" 3
-      return 1
+      set_verification_result "unknown"
+      return 0
     fi
 
     current_value=$(printf '%s\n' "$output" | tr -d '\r' | tail -n 1 | tr -d '[:space:]')
@@ -220,13 +225,14 @@ verify_betterdisplay_switch() {
           continue
         fi
 
-        remember_error "BetterDisplay 写入后返回了无法识别的当前输入值：${output}" 3
-        return 1
+        set_verification_result "unknown"
+        return 0
         ;;
     esac
 
     for expected_value in $expected_values; do
       if [ "$current_value" = "$expected_value" ]; then
+        set_verification_result "confirmed"
         return 0
       fi
     done
@@ -237,11 +243,12 @@ verify_betterdisplay_switch() {
     fi
 
     remember_error "BetterDisplay 已发送输入切换命令，但当前输入仍是 ${current_value}，未匹配目标值集合：${expected_values}" 3
+    set_verification_result "mismatch"
     return 1
   done
 
-  remember_error "BetterDisplay 写入后没有得到可确认的输入值回读。" 3
-  return 1
+  set_verification_result "unknown"
+  return 0
 }
 
 try_ddcctl_query_binary() {
@@ -256,6 +263,11 @@ try_ddcctl_query_binary() {
 
   if [ -n "$detected_display_count" ] && [ "$detected_display_count" -eq 0 ]; then
     remember_error "ddcctl 没有检测到可控制的外接显示器。请确认显示器已连接、当前 Mac 仍然能看到它，并且显示器开启了 DDC/CI。" 2
+    return 1
+  fi
+
+  if [ -n "$detected_display_count" ] && [ "$detected_display_count" -gt 1 ]; then
+    remember_error "当前 Mac 检测到多块外接屏，ddcctl 无法稳定锁定指定屏幕。请安装 BetterDisplay / betterdisplaycli 后再控制这块屏。" 3
     return 1
   fi
 
@@ -327,6 +339,7 @@ build_ddcctl_candidate_list() {
 }
 
 try_betterdisplay() {
+  set_verification_result ""
   if ! resolve_betterdisplay; then
     return 1
   fi
@@ -371,6 +384,7 @@ try_ddcctl_binary() {
   binary_path="$1"
   detected_display_count=""
   candidate_list=""
+  set_verification_result ""
 
   [ -x "$binary_path" ] || return 1
 
@@ -378,6 +392,11 @@ try_ddcctl_binary() {
 
   if [ -n "$detected_display_count" ] && [ "$detected_display_count" -eq 0 ]; then
     remember_error "ddcctl 没有检测到可控制的外接显示器。请确认显示器已连接、当前 Mac 仍然能看到它，并且显示器开启了 DDC/CI。" 2
+    return 1
+  fi
+
+  if [ -n "$detected_display_count" ] && [ "$detected_display_count" -gt 1 ]; then
+    remember_error "当前 Mac 检测到多块外接屏，ddcctl 无法稳定锁定指定屏幕。请安装 BetterDisplay / betterdisplaycli 后再控制这块屏。" 3
     return 1
   fi
 
@@ -413,28 +432,29 @@ verify_ddcctl_switch_binary() {
   if ! output=$("$binary_path" -d "$display_index" -i "?" 2>&1); then
     if is_ddcctl_usage_output "$output"; then
       remember_error "$output" 1
-    else
-      remember_error "ddcctl 已发送输入切换命令，但无法重新读回当前输入值：${output}" 3
     fi
-    return 1
+    set_verification_result "unknown"
+    return 0
   fi
 
   current_value=$(extract_ddcctl_current_value "$output")
 
   case "$current_value" in
     ''|*[!0-9]*)
-      remember_error "ddcctl 写入后返回了无法识别的当前输入值：${output}" 3
-      return 1
+      set_verification_result "unknown"
+      return 0
       ;;
   esac
 
   for expected_value in $expected_values; do
     if [ "$current_value" = "$expected_value" ]; then
+      set_verification_result "confirmed"
       return 0
     fi
   done
 
   remember_error "ddcctl 已发送输入切换命令，但当前输入仍是 ${current_value}，未匹配目标值集合：${expected_values}" 3
+  set_verification_result "mismatch"
   return 1
 }
 
@@ -469,15 +489,24 @@ if [ "$COMMAND" = "--query-input" ]; then
 fi
 
 if try_betterdisplay; then
+  if [ "$LAST_VERIFICATION_RESULT" = "unknown" ]; then
+    printf '%s\n' "UNCONFIRMED"
+  fi
   exit 0
 fi
 
 if try_ddcctl_binary "$BUNDLED_DDCCTL"; then
+  if [ "$LAST_VERIFICATION_RESULT" = "unknown" ]; then
+    printf '%s\n' "UNCONFIRMED"
+  fi
   exit 0
 fi
 
 if command -v ddcctl >/dev/null 2>&1; then
   if try_ddcctl_binary "$(command -v ddcctl)"; then
+    if [ "$LAST_VERIFICATION_RESULT" = "unknown" ]; then
+      printf '%s\n' "UNCONFIRMED"
+    fi
     exit 0
   fi
 fi
