@@ -27,6 +27,7 @@ This project now uses one rule set only:
   - `HDMI2`
 - Each slot stores one DDC input value.
 - Each screen profile also stores which slot is the current host's own cable for that screen.
+- On macOS, the app prefers hardware identity for profile matching when the monitor reports a usable vendor / product / serial tuple; otherwise it falls back to the local display ID.
 
 ### 3. Direct switching
 
@@ -54,6 +55,7 @@ This project now uses one rule set only:
 - A confirmed mismatch after readback is a real switch failure; missing readback support is not.
 - On Windows, only displays that can be stably mapped to a local external screen are allowed into the switchable list.
 - On macOS, if `ddcctl` cannot reliably report the external-display count, the fallback path must stop instead of scanning candidate indices blindly.
+- On macOS, topology refresh must reuse a short-lived cached `system_profiler` result during steady state and force-refresh it only on real display add / remove events.
 
 ## Error interpretation
 

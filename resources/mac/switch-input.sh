@@ -108,9 +108,9 @@ query_betterdisplay_input() {
     fi
 
     remember_error "$output" 2
-    return 1
   fi
 
+  [ -n "$DISPLAY_NAME" ] || return 1
   "$betterdisplay_path" get -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value 2>&1
 }
 
@@ -360,8 +360,9 @@ try_betterdisplay() {
     fi
 
     remember_error "$output" 2
-    return 1
   fi
+
+  [ -n "$DISPLAY_NAME" ] || return 1
 
   if output=$("$BETTERDISPLAY_PATH" set -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value="$INPUT_VALUE" 2>&1); then
     if verify_betterdisplay_switch "$BETTERDISPLAY_PATH" "$BETTERDISPLAY_MODE"; then

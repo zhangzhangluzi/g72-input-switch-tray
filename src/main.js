@@ -14,6 +14,7 @@ const PREFERRED_CONTROL_PORT = 3847;
 const TRAY_REBUILD_DELAY_MS = 1200;
 const TRAY_HEALTHCHECK_INTERVAL_MS = 5000;
 const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
+const MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000;
 const TARGET_SLOTS = [
   { id: "dp1", title: "DP1", defaultInputValue: 15 },
   { id: "dp2", title: "DP2", defaultInputValue: 16 },
@@ -45,6 +46,10 @@ let explorerSignature = null;
 let refreshMenuInFlight = false;
 let refreshMenuQueued = false;
 let windowsRestoreInFlight = false;
+let macDisplayMetadataCache = {
+  fetchedAt: 0,
+  displays: [],
+};
 let state = createDefaultState();
 
 app.commandLine.appendSwitch("log-level", "3");
@@ -107,6 +112,7 @@ app.whenReady().then(async () => {
   saveState(state);
   await syncMonitorConfigsFromLocalDisplays({ persist: true });
   startControlServer();
+  startDisplayChangeWatcher();
   startWindowsRestoreWatcher();
   startWindowsTrayWatcher();
   createTray();
@@ -171,7 +177,7 @@ function scheduleTrayRebuild(reason, delayMs = TRAY_REBUILD_DELAY_MS) {
   }, delayMs);
 }
 
-async function refreshMenu() {
+async function refreshMenu({ monitorContexts = null } = {}) {
   if (!tray) {
     return;
   }
@@ -185,22 +191,25 @@ async function refreshMenu() {
 
   try {
     const openAtLogin = app.getLoginItemSettings().openAtLogin;
-    const monitorContexts = await buildMonitorContextsWithStatus();
+    const nextMonitorContexts = Array.isArray(monitorContexts)
+      ? monitorContexts
+      : await buildMonitorContextsWithStatus();
     const monitorMenuItems =
-      monitorContexts.length === 0
+      nextMonitorContexts.length === 0
         ? [
             {
               label: "当前没有本机已连接的屏幕",
               enabled: false,
             },
           ]
-        : monitorContexts.map((monitorContext) => buildTrayMonitorItem(monitorContext));
+        : nextMonitorContexts.map((monitorContext) => buildTrayMonitorItem(monitorContext));
 
     const menu = Menu.buildFromTemplate([
       {
         label: `版本：v${app.getVersion()}`,
         enabled: false,
       },
+      ...buildLastSwitchOutcomeMenuItems(),
       ...monitorMenuItems,
       ...(process.platform === "win32"
         ? [
@@ -320,7 +329,32 @@ function handleTrayDirectSwitch(monitorId, targetId) {
     showErrorDialog: false,
   }).catch((error) => {
     appendDiagnosticLog(`Direct switch failed (${monitorId}:${targetId})`, error);
+    void refreshMenu();
   });
+}
+
+function buildLastSwitchOutcomeMenuItems() {
+  const lastSwitchOutcome = createSwitchOutcome(state.lastSwitchOutcome);
+  if (lastSwitchOutcome.status !== "error" || !lastSwitchOutcome.message) {
+    return [];
+  }
+
+  return [
+    {
+      label: truncateMenuLabel(`最近失败：${lastSwitchOutcome.message}`),
+      enabled: false,
+    },
+    { type: "separator" },
+  ];
+}
+
+function truncateMenuLabel(value, maxLength = 96) {
+  const normalized = normalizeText(value);
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength - 1)}…`;
 }
 
 function startControlServer() {
@@ -844,8 +878,12 @@ function getMacSwitchScriptEnvForContext(monitorContext) {
     DISPLAY_INDEX: String(monitorContext.display.index),
   };
 
-  if (Number.isInteger(monitorContext.display.electronDisplayId)) {
-    env.DISPLAY_ID = String(monitorContext.display.electronDisplayId);
+  const preferredDisplayId = Number.isInteger(monitorContext.display.macSystemDisplayId)
+    ? monitorContext.display.macSystemDisplayId
+    : monitorContext.display.electronDisplayId;
+
+  if (Number.isInteger(preferredDisplayId)) {
+    env.DISPLAY_ID = String(preferredDisplayId);
   }
 
   return env;
@@ -1027,18 +1065,39 @@ function startWindowsRestoreWatcher() {
     return;
   }
 
-  const scheduleAttempt = () => {
-    void syncMonitorConfigsFromLocalDisplays({ persist: false });
-    void attemptPendingWindowsRestores();
-    scheduleTrayRebuild("display-change");
-  };
-
-  screen.on("display-added", scheduleAttempt);
-  screen.on("display-removed", scheduleAttempt);
-
   windowsRestoreTimer = setInterval(() => {
     void attemptPendingWindowsRestores();
   }, 2500);
+}
+
+function startDisplayChangeWatcher() {
+  const handleDisplayChange = () => {
+    void handleLocalDisplayTopologyChange();
+  };
+
+  screen.on("display-added", handleDisplayChange);
+  screen.on("display-removed", handleDisplayChange);
+  screen.on("display-metrics-changed", handleDisplayChange);
+}
+
+async function handleLocalDisplayTopologyChange() {
+  try {
+    const displaySummaries = await syncMonitorConfigsFromLocalDisplays({
+      persist: true,
+      forceMacDisplayMetadataRefresh: true,
+    });
+
+    if (process.platform === "win32") {
+      await attemptPendingWindowsRestores();
+      scheduleTrayRebuild("display-change");
+      return;
+    }
+
+    const monitorContexts = await buildMonitorContextsWithStatus({ displaySummaries });
+    await refreshMenu({ monitorContexts });
+  } catch (error) {
+    appendDiagnosticLog("Failed to handle local display topology change", error);
+  }
 }
 
 function startWindowsTrayWatcher() {
@@ -1098,8 +1157,8 @@ function isTrayDestroyed() {
   return !tray || (typeof tray.isDestroyed === "function" && tray.isDestroyed());
 }
 
-async function buildMonitorContextsWithStatus() {
-  const monitorContexts = await getConnectedMonitorContexts();
+async function buildMonitorContextsWithStatus(options = {}) {
+  const monitorContexts = await getConnectedMonitorContexts(options);
   return Promise.all(
     monitorContexts.map(async (monitorContext) => ({
       ...monitorContext,
@@ -1136,13 +1195,21 @@ async function getMonitorStatus(monitorContext) {
   };
 }
 
-async function getConnectedMonitorContexts() {
-  const displaySummaries = await syncMonitorConfigsFromLocalDisplays({ persist: true });
+async function getConnectedMonitorContexts({
+  displaySummaries = null,
+  forceMacDisplayMetadataRefresh = false,
+} = {}) {
+  const nextDisplaySummaries = Array.isArray(displaySummaries)
+    ? displaySummaries
+    : await syncMonitorConfigsFromLocalDisplays({
+        persist: true,
+        forceMacDisplayMetadataRefresh,
+      });
   const monitorConfigsById = new Map(
     getStoredMonitorConfigs().map((monitorConfig) => [monitorConfig.id, monitorConfig])
   );
 
-  return displaySummaries
+  return nextDisplaySummaries
     .map((displaySummary) => {
       const monitorConfig = monitorConfigsById.get(displaySummary.id);
       if (!monitorConfig) {
@@ -1163,8 +1230,13 @@ async function getMonitorContextById(monitorId) {
   return monitorContexts.find((monitorContext) => monitorContext.id === normalizeText(monitorId)) || null;
 }
 
-async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
-  const displaySummaries = await getLocalDisplaySummaries();
+async function syncMonitorConfigsFromLocalDisplays({
+  persist = true,
+  forceMacDisplayMetadataRefresh = false,
+} = {}) {
+  const displaySummaries = await getLocalDisplaySummaries({
+    forceMacDisplayMetadataRefresh,
+  });
   const storedMonitorConfigs = getStoredMonitorConfigs();
   const unmatchedStoredMonitorConfigs = storedMonitorConfigs.filter(
     (monitorConfig) => normalizeText(monitorConfig.displayKey)
@@ -1178,6 +1250,7 @@ async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
   const nextMonitorConfigs = [];
 
   for (const displaySummary of displaySummaries) {
+    const macHardwareDisplayKey = buildMacHardwareDisplayKey(displaySummary);
     const matchingMonitorConfig =
       unmatchedStoredMonitorConfigs.find((monitorConfig) => {
         if (usedMonitorIds.has(monitorConfig.id)) {
@@ -1186,6 +1259,10 @@ async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
 
         return (
           normalizeText(monitorConfig.displayKey) === displaySummary.displayKey ||
+          (macHardwareDisplayKey &&
+            buildMacHardwareDisplayKey(monitorConfig) === macHardwareDisplayKey) ||
+          (Number.isInteger(displaySummary.macSystemDisplayId) &&
+            monitorConfig.match?.macSystemDisplayId === displaySummary.macSystemDisplayId) ||
           (displaySummary.gdiDeviceName &&
             normalizeText(monitorConfig.match?.gdiDeviceName) === displaySummary.gdiDeviceName) ||
           (Number.isInteger(displaySummary.electronDisplayId) &&
@@ -1207,6 +1284,10 @@ async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
         displayName: displaySummary.detectedName,
         match: {
           electronDisplayId: displaySummary.electronDisplayId,
+          macSystemDisplayId: displaySummary.macSystemDisplayId,
+          macVendorId: displaySummary.macVendorId,
+          macProductId: displaySummary.macProductId,
+          macSerialNumber: displaySummary.macSerialNumber,
           gdiDeviceName: displaySummary.gdiDeviceName,
           productCode: displaySummary.productCode,
         },
@@ -1218,6 +1299,10 @@ async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
         displayName: displaySummary.detectedName,
         match: {
           electronDisplayId: displaySummary.electronDisplayId,
+          macSystemDisplayId: displaySummary.macSystemDisplayId,
+          macVendorId: displaySummary.macVendorId,
+          macProductId: displaySummary.macProductId,
+          macSerialNumber: displaySummary.macSerialNumber,
           gdiDeviceName: displaySummary.gdiDeviceName,
           productCode: displaySummary.productCode,
         },
@@ -1253,22 +1338,17 @@ async function syncMonitorConfigsFromLocalDisplays({ persist = true } = {}) {
   return displaySummaries;
 }
 
-async function getLocalDisplaySummaries() {
+async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false } = {}) {
   const orderedDisplays = getOrderedLocalDisplays();
   if (process.platform === "win32") {
     const topologyDisplays = await getWindowsTopologyDisplays();
     const attachedTopologyDisplays = topologyDisplays
       .filter((display) => display.attached)
       .sort(compareDisplayLikeObjects);
-    const switchableTopologyDisplays = attachedTopologyDisplays
-      .map((topologyDisplay) => ({
-        topologyDisplay,
-        electronDisplay: matchElectronDisplayToWindowsTopologyDisplay(
-          topologyDisplay,
-          orderedDisplays,
-          attachedTopologyDisplays
-        ),
-      }))
+    const switchableTopologyDisplays = mapWindowsTopologyDisplaysToElectronDisplays(
+      attachedTopologyDisplays,
+      orderedDisplays
+    )
       .filter(({ electronDisplay }) => Boolean(electronDisplay) && !electronDisplay.internal);
     let secondaryIndex = 2;
     const singleDisplayOnly = switchableTopologyDisplays.length <= 1;
@@ -1319,17 +1399,26 @@ async function getLocalDisplaySummaries() {
   }
 
   const externalDisplays = orderedDisplays.filter((display) => !display.internal);
+  const macProfilerDisplays = await getMacSystemProfilerDisplays({
+    forceRefresh: forceMacDisplayMetadataRefresh,
+  });
+  const usedMacProfilerDisplayKeys = new Set();
   let secondaryIndex = 2;
   const singleDisplayOnly = externalDisplays.length <= 1;
 
   return externalDisplays.map((display, index) => {
+    const macProfilerDisplay = matchMacSystemProfilerDisplay(
+      display,
+      macProfilerDisplays,
+      usedMacProfilerDisplayKeys
+    );
     const roleLabel = singleDisplayOnly
       ? "当前机器屏幕"
       : display.primary
         ? "主屏幕"
         : `附屏幕 ${secondaryIndex++}`;
-    const displayKey = buildDisplayKeyForLocalDisplay(display, index + 1, null);
-    const detectedName = normalizeText(display.label || "");
+    const displayKey = buildDisplayKeyForLocalDisplay(display, index + 1, null, macProfilerDisplay);
+    const detectedName = normalizeText(macProfilerDisplay?.name || display.label || "");
 
     return {
       id: createMonitorId(displayKey),
@@ -1341,6 +1430,12 @@ async function getLocalDisplaySummaries() {
       position: `${display.bounds.x}, ${display.bounds.y}`,
       internal: Boolean(display.internal),
       electronDisplayId: Number.isInteger(display.id) ? display.id : null,
+      macSystemDisplayId: Number.isInteger(macProfilerDisplay?.systemDisplayId)
+        ? macProfilerDisplay.systemDisplayId
+        : null,
+      macVendorId: normalizeText(macProfilerDisplay?.vendorId).toLowerCase(),
+      macProductId: normalizeText(macProfilerDisplay?.productId).toLowerCase(),
+      macSerialNumber: normalizeText(macProfilerDisplay?.serialNumber),
       gdiDeviceName: "",
       productCode: "",
       bounds: {
@@ -1355,7 +1450,13 @@ async function getLocalDisplaySummaries() {
 
 function getOrderedLocalDisplays() {
   try {
-    return [...screen.getAllDisplays()].sort(compareDisplayLikeObjects);
+    const primaryDisplayId = screen.getPrimaryDisplay()?.id;
+    return [...screen.getAllDisplays()]
+      .map((display) => ({
+        ...display,
+        primary: Number.isInteger(primaryDisplayId) && display.id === primaryDisplayId,
+      }))
+      .sort(compareDisplayLikeObjects);
   } catch {
     return [];
   }
@@ -1365,7 +1466,12 @@ function getConnectedDisplayCount() {
   return getOrderedLocalDisplays().length;
 }
 
-function buildDisplayKeyForLocalDisplay(display, displayIndex, topologyDisplay = null) {
+function buildDisplayKeyForLocalDisplay(
+  display,
+  displayIndex,
+  topologyDisplay = null,
+  macProfilerDisplay = null
+) {
   if (process.platform === "win32") {
     const gdiDeviceName = normalizeText(topologyDisplay?.deviceName);
     if (gdiDeviceName) {
@@ -1377,8 +1483,20 @@ function buildDisplayKeyForLocalDisplay(display, displayIndex, topologyDisplay =
     }
   }
 
-  if (process.platform === "darwin" && Number.isInteger(display?.id)) {
-    return `mac:${display.id}`;
+  if (process.platform === "darwin") {
+    const hardwareDisplayKey = buildMacHardwareDisplayKey(macProfilerDisplay);
+    if (hardwareDisplayKey) {
+      return hardwareDisplayKey;
+    }
+
+    const systemDisplayId = normalizeDisplayIdentifier(macProfilerDisplay?.systemDisplayId);
+    if (Number.isInteger(systemDisplayId)) {
+      return `mac-system:${systemDisplayId}`;
+    }
+
+    if (Number.isInteger(display?.id)) {
+      return `mac:${display.id}`;
+    }
   }
 
   return `fallback:${displayIndex}:${display?.bounds?.x || 0}:${display?.bounds?.y || 0}:${
@@ -1389,6 +1507,182 @@ function buildDisplayKeyForLocalDisplay(display, displayIndex, topologyDisplay =
 function createMonitorId(displayKey) {
   const normalizedKey = normalizeText(displayKey) || crypto.randomBytes(6).toString("hex");
   return `monitor-${crypto.createHash("sha1").update(normalizedKey).digest("hex").slice(0, 12)}`;
+}
+
+async function getMacSystemProfilerDisplays({ forceRefresh = false } = {}) {
+  if (process.platform !== "darwin") {
+    return [];
+  }
+
+  const cachedDisplays =
+    !forceRefresh &&
+    Array.isArray(macDisplayMetadataCache.displays) &&
+    macDisplayMetadataCache.displays.length > 0 &&
+    Date.now() - macDisplayMetadataCache.fetchedAt < MAC_DISPLAY_METADATA_CACHE_TTL_MS
+      ? macDisplayMetadataCache.displays
+      : null;
+
+  if (cachedDisplays) {
+    return cachedDisplays;
+  }
+
+  try {
+    const output = await runCommand("/usr/sbin/system_profiler", ["SPDisplaysDataType", "-json"]);
+    const parsed = JSON.parse(output);
+    const displays = normalizeMacSystemProfilerDisplays(parsed);
+    macDisplayMetadataCache = {
+      fetchedAt: Date.now(),
+      displays,
+    };
+    return displays;
+  } catch (error) {
+    appendDiagnosticLog("Failed to read macOS display metadata", error);
+    return Array.isArray(macDisplayMetadataCache.displays) ? macDisplayMetadataCache.displays : [];
+  }
+}
+
+function normalizeMacSystemProfilerDisplays(parsed) {
+  const gpuEntries = Array.isArray(parsed?.SPDisplaysDataType) ? parsed.SPDisplaysDataType : [];
+  const displays = [];
+
+  for (const gpuEntry of gpuEntries) {
+    const monitorEntries = Array.isArray(gpuEntry?.spdisplays_ndrvs) ? gpuEntry.spdisplays_ndrvs : [];
+    for (const monitorEntry of monitorEntries) {
+      if (normalizeText(monitorEntry?.spdisplays_online) === "spdisplays_no") {
+        continue;
+      }
+
+      const resolution = parseMacSystemProfilerResolution(
+        monitorEntry?._spdisplays_pixels || monitorEntry?.spdisplays_pixelresolution
+      );
+      displays.push({
+        name: normalizeText(monitorEntry?._name),
+        systemDisplayId: normalizeDisplayIdentifier(monitorEntry?._spdisplays_displayID),
+        vendorId: normalizeText(monitorEntry?._spdisplays_display-vendor-id).toLowerCase(),
+        productId: normalizeText(monitorEntry?._spdisplays_display-product-id).toLowerCase(),
+        serialNumber: normalizeText(monitorEntry?._spdisplays_display-serial-number),
+        width: resolution.width,
+        height: resolution.height,
+      });
+    }
+  }
+
+  return displays;
+}
+
+function parseMacSystemProfilerResolution(value) {
+  const match = /(\d+)\s*x\s*(\d+)/u.exec(normalizeText(value));
+  if (!match) {
+    return {
+      width: 0,
+      height: 0,
+    };
+  }
+
+  return {
+    width: Number.parseInt(match[1], 10),
+    height: Number.parseInt(match[2], 10),
+  };
+}
+
+function matchMacSystemProfilerDisplay(display, profilerDisplays, usedProfilerDisplayKeys) {
+  if (!Array.isArray(profilerDisplays) || profilerDisplays.length === 0) {
+    return null;
+  }
+
+  const availableDisplays = profilerDisplays.filter((candidate) => {
+    const candidateKey = getMacProfilerDisplayMatchKey(candidate);
+    return candidateKey && !usedProfilerDisplayKeys.has(candidateKey);
+  });
+
+  const exactIdMatch =
+    availableDisplays.find(
+      (candidate) =>
+        Number.isInteger(candidate.systemDisplayId) &&
+        Number.isInteger(display?.id) &&
+        candidate.systemDisplayId === display.id
+    ) || null;
+
+  if (exactIdMatch) {
+    usedProfilerDisplayKeys.add(getMacProfilerDisplayMatchKey(exactIdMatch));
+    return exactIdMatch;
+  }
+
+  const displayLabel = normalizeText(display?.label).toLowerCase();
+  const nameAndResolutionMatches = availableDisplays.filter(
+    (candidate) =>
+      normalizeText(candidate.name).toLowerCase() === displayLabel &&
+      isMacProfilerDisplayResolutionMatch(candidate, display)
+  );
+
+  if (nameAndResolutionMatches.length === 1) {
+    usedProfilerDisplayKeys.add(getMacProfilerDisplayMatchKey(nameAndResolutionMatches[0]));
+    return nameAndResolutionMatches[0];
+  }
+
+  return null;
+}
+
+function isMacProfilerDisplayResolutionMatch(candidate, display) {
+  const logicalWidth = Number.isFinite(display?.bounds?.width) ? display.bounds.width : 0;
+  const logicalHeight = Number.isFinite(display?.bounds?.height) ? display.bounds.height : 0;
+  const scaleFactor =
+    Number.isFinite(display?.scaleFactor) && display.scaleFactor > 0 ? display.scaleFactor : 1;
+  const physicalWidth = Math.round(logicalWidth * scaleFactor);
+  const physicalHeight = Math.round(logicalHeight * scaleFactor);
+
+  return (
+    (candidate.width === logicalWidth && candidate.height === logicalHeight) ||
+    (candidate.width === physicalWidth && candidate.height === physicalHeight)
+  );
+}
+
+function getMacProfilerDisplayMatchKey(display) {
+  const hardwareDisplayKey = buildMacHardwareDisplayKey(display);
+  if (hardwareDisplayKey) {
+    return hardwareDisplayKey;
+  }
+
+  if (Number.isInteger(display?.systemDisplayId)) {
+    return `mac-system:${display.systemDisplayId}`;
+  }
+
+  return normalizeText(display?.name)
+    ? `mac-name:${normalizeText(display.name).toLowerCase()}:${display?.width || 0}x${display?.height || 0}`
+    : "";
+}
+
+function buildMacHardwareDisplayKey(monitorContextOrDisplay) {
+  const vendorId = normalizeText(
+    monitorContextOrDisplay?.display?.macVendorId ||
+      monitorContextOrDisplay?.match?.macVendorId ||
+      monitorContextOrDisplay?.macVendorId ||
+      monitorContextOrDisplay?.vendorId
+  ).toLowerCase();
+  const productId = normalizeText(
+    monitorContextOrDisplay?.display?.macProductId ||
+      monitorContextOrDisplay?.match?.macProductId ||
+      monitorContextOrDisplay?.macProductId ||
+      monitorContextOrDisplay?.productId
+  ).toLowerCase();
+  const serialNumber = normalizeText(
+    monitorContextOrDisplay?.display?.macSerialNumber ||
+      monitorContextOrDisplay?.match?.macSerialNumber ||
+      monitorContextOrDisplay?.macSerialNumber ||
+      monitorContextOrDisplay?.serialNumber
+  );
+
+  if (
+    !vendorId ||
+    !productId ||
+    !serialNumber ||
+    /^(0+|1+)$/u.test(serialNumber) ||
+    /^unknown$/iu.test(serialNumber)
+  ) {
+    return "";
+  }
+
+  return `mac-hw:${vendorId}:${productId}:${serialNumber}`;
 }
 
 async function getWindowsTopologyDisplays() {
@@ -1427,45 +1721,94 @@ function normalizeWindowsTopologyDisplay(display) {
   };
 }
 
-function matchElectronDisplayToWindowsTopologyDisplay(
-  topologyDisplay,
-  orderedDisplays,
-  attachedTopologyDisplays
-) {
-  if (!topologyDisplay || !Array.isArray(orderedDisplays) || orderedDisplays.length === 0) {
-    return null;
+function getWindowsElectronDisplayBoundsCandidates(display) {
+  const logicalBounds = {
+    x: Number.isFinite(display?.bounds?.x) ? display.bounds.x : 0,
+    y: Number.isFinite(display?.bounds?.y) ? display.bounds.y : 0,
+    width: Number.isFinite(display?.bounds?.width) ? display.bounds.width : 0,
+    height: Number.isFinite(display?.bounds?.height) ? display.bounds.height : 0,
+  };
+  const scaleFactor =
+    Number.isFinite(display?.scaleFactor) && display.scaleFactor > 0 ? display.scaleFactor : 1;
+  const physicalBounds = {
+    x: Math.round(logicalBounds.x * scaleFactor),
+    y: Math.round(logicalBounds.y * scaleFactor),
+    width: Math.round(logicalBounds.width * scaleFactor),
+    height: Math.round(logicalBounds.height * scaleFactor),
+  };
+  const boundsCandidates = [logicalBounds, physicalBounds];
+  const uniqueBoundsCandidates = [];
+  const seenKeys = new Set();
+
+  for (const candidate of boundsCandidates) {
+    const key = `${candidate.x}:${candidate.y}:${candidate.width}x${candidate.height}`;
+    if (seenKeys.has(key)) {
+      continue;
+    }
+
+    seenKeys.add(key);
+    uniqueBoundsCandidates.push(candidate);
   }
 
-  const exactMatch =
-    orderedDisplays.find(
-      (display) =>
-        topologyDisplay.width === display.bounds.width &&
-        topologyDisplay.height === display.bounds.height &&
-        topologyDisplay.positionX === display.bounds.x &&
-        topologyDisplay.positionY === display.bounds.y
-    ) || null;
+  return uniqueBoundsCandidates;
+}
 
-  if (exactMatch) {
-    return exactMatch;
-  }
-
-  if (
-    !Array.isArray(attachedTopologyDisplays) ||
-    orderedDisplays.length !== attachedTopologyDisplays.length
-  ) {
-    return null;
-  }
-
-  const topologyDisplayIndex = attachedTopologyDisplays.findIndex(
-    (candidateDisplay) =>
-      normalizeText(candidateDisplay.deviceName) &&
-      normalizeText(candidateDisplay.deviceName) === normalizeText(topologyDisplay.deviceName)
+function doesWindowsElectronDisplayExactlyMatchTopology(topologyDisplay, display) {
+  return getWindowsElectronDisplayBoundsCandidates(display).some(
+    (candidate) =>
+      topologyDisplay.positionX === candidate.x &&
+      topologyDisplay.positionY === candidate.y &&
+      topologyDisplay.width === candidate.width &&
+      topologyDisplay.height === candidate.height
   );
-  if (topologyDisplayIndex < 0) {
-    return null;
+}
+
+function doesWindowsElectronDisplaySizeMatchTopology(topologyDisplay, display) {
+  return getWindowsElectronDisplayBoundsCandidates(display).some(
+    (candidate) =>
+      topologyDisplay.width === candidate.width && topologyDisplay.height === candidate.height
+  );
+}
+
+function mapWindowsTopologyDisplaysToElectronDisplays(attachedTopologyDisplays, orderedDisplays) {
+  if (!Array.isArray(attachedTopologyDisplays) || attachedTopologyDisplays.length === 0) {
+    return [];
   }
 
-  return orderedDisplays[topologyDisplayIndex] || null;
+  const matches = attachedTopologyDisplays.map((topologyDisplay) => ({
+    topologyDisplay,
+    electronDisplay: null,
+  }));
+  const usedElectronDisplayIds = new Set();
+
+  for (const match of matches) {
+    const exactCandidates = orderedDisplays.filter(
+      (display) =>
+        !usedElectronDisplayIds.has(display.id) &&
+        doesWindowsElectronDisplayExactlyMatchTopology(match.topologyDisplay, display)
+    );
+
+    if (exactCandidates.length === 1) {
+      match.electronDisplay = exactCandidates[0];
+      usedElectronDisplayIds.add(exactCandidates[0].id);
+    }
+  }
+
+  for (const match of matches.filter((item) => !item.electronDisplay)) {
+    const sizeCandidates = orderedDisplays.filter(
+      (display) =>
+        !usedElectronDisplayIds.has(display.id) &&
+        Boolean(display.primary) === Boolean(match.topologyDisplay.primary) &&
+        doesWindowsElectronDisplaySizeMatchTopology(match.topologyDisplay, display)
+    );
+
+    if (sizeCandidates.length === 1) {
+      match.electronDisplay = sizeCandidates[0];
+      usedElectronDisplayIds.add(sizeCandidates[0].id);
+    }
+  }
+
+  return matches;
 }
 
 function isTopologyDisplayMatchMonitor(topologyDisplay, monitorContextOrConfig) {
@@ -1930,9 +2273,25 @@ function getMonitorSystemIdentityText(monitorContext) {
       : "Windows DeviceName：未知";
   }
 
-  return Number.isInteger(monitorContext.display.electronDisplayId)
-    ? `Display ID：${monitorContext.display.electronDisplayId}`
-    : "Display ID：未知";
+  return buildMacMonitorSystemIdentityText(monitorContext) || "Display ID：未知";
+}
+
+function buildMacMonitorSystemIdentityText(monitorContextOrConfig) {
+  const hardwareDisplayKey = buildMacHardwareDisplayKey(monitorContextOrConfig);
+  const displayId = normalizeDisplayIdentifier(
+    monitorContextOrConfig?.display?.macSystemDisplayId ||
+      monitorContextOrConfig?.match?.macSystemDisplayId ||
+      monitorContextOrConfig?.display?.electronDisplayId ||
+      monitorContextOrConfig?.match?.electronDisplayId
+  );
+
+  if (!hardwareDisplayKey) {
+    return Number.isInteger(displayId) ? `Display ID：${displayId}` : "";
+  }
+
+  const [, vendorId = "", productId = "", serialNumber = ""] = hardwareDisplayKey.split(":");
+  const hardwareText = `Vendor/Product/Serial：${vendorId}/${productId}/${serialNumber}`;
+  return Number.isInteger(displayId) ? `${hardwareText} · Display ID：${displayId}` : hardwareText;
 }
 
 function getMonitorDisplayTitle(monitorContextOrConfig) {
@@ -1989,6 +2348,12 @@ function createDefaultMonitorConfig(partial = {}) {
       electronDisplayId: Number.isInteger(partial.match?.electronDisplayId)
         ? partial.match.electronDisplayId
         : null,
+      macSystemDisplayId: Number.isInteger(partial.match?.macSystemDisplayId)
+        ? partial.match.macSystemDisplayId
+        : null,
+      macVendorId: normalizeText(partial.match?.macVendorId).toLowerCase(),
+      macProductId: normalizeText(partial.match?.macProductId).toLowerCase(),
+      macSerialNumber: normalizeText(partial.match?.macSerialNumber),
       gdiDeviceName: normalizeText(partial.match?.gdiDeviceName),
       productCode: normalizeText(partial.match?.productCode),
     },
@@ -2005,6 +2370,16 @@ function normalizeMonitorConfig(rawMonitorConfig = {}, fallbackMonitorConfig = {
       electronDisplayId: Number.isInteger(rawMonitorConfig.match?.electronDisplayId)
         ? rawMonitorConfig.match.electronDisplayId
         : baseline.match.electronDisplayId,
+      macSystemDisplayId: Number.isInteger(rawMonitorConfig.match?.macSystemDisplayId)
+        ? rawMonitorConfig.match.macSystemDisplayId
+        : baseline.match.macSystemDisplayId,
+      macVendorId:
+        normalizeText(rawMonitorConfig.match?.macVendorId).toLowerCase() || baseline.match.macVendorId,
+      macProductId:
+        normalizeText(rawMonitorConfig.match?.macProductId).toLowerCase() ||
+        baseline.match.macProductId,
+      macSerialNumber:
+        normalizeText(rawMonitorConfig.match?.macSerialNumber) || baseline.match.macSerialNumber,
       gdiDeviceName:
         normalizeText(rawMonitorConfig.match?.gdiDeviceName) || baseline.match.gdiDeviceName,
       productCode:
@@ -2533,6 +2908,11 @@ function normalizeText(value) {
 function normalizePositiveInteger(value, fallbackValue) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallbackValue;
+}
+
+function normalizeDisplayIdentifier(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function parseInputValue(value) {

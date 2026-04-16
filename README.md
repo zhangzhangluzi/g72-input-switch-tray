@@ -34,7 +34,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - Each interface has its own numeric DDC input value
 - Each profile also stores which one of the four interfaces is the local machine's own cable for that screen
 - On Windows, the profile is matched primarily by the screen's Win32 `DeviceName`, so two same-model monitors can still be distinguished
-- On macOS, the profile is matched primarily by the local display ID
+- On macOS, the profile is matched primarily by hardware identity when the monitor reports a usable vendor / product / serial tuple; otherwise it falls back to the local display ID
 - Internal laptop / built-in panels are not exposed as four-interface switch targets
 
 ## Platform notes
@@ -51,6 +51,8 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - Windows monitor matching no longer relies on friendly monitor names as the primary selector, so two same-model monitors do not collapse into one target.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching prefers BetterDisplay command-line control when it is available and targets the specific local display ID when possible.
+- When macOS can read a reliable hardware identity for a screen, that identity is persisted so same-model dual-screen setups are less likely to swap profiles after reconnects.
+- macOS display metadata is cached briefly and force-refreshed when the local display topology changes, so tray refresh stays responsive without using stale topology after a plug / unplug event.
 - If `betterdisplaycli` is not installed but `BetterDisplay.app` is present in `/Applications` or `~/Applications`, the app uses the BetterDisplay bundle binary directly.
 - When BetterDisplay is used for input switching, the app reads the input value back after each write so Samsung / MStar displays can keep falling through to alternate values when the standard MCCS value is acknowledged but does not actually take effect.
 - If BetterDisplay CLI is unavailable, the app falls back to the bundled `ddcctl` binary built during the macOS GitHub Actions release job, and then to `ddcctl` from `PATH`.

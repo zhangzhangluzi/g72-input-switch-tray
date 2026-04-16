@@ -25,11 +25,24 @@ function verifyMainSourceBusinessGuards() {
     mainSource,
     /verificationStatus === "confirmed"[\s\S]*detachWindowsDisplayForMonitor/u
   );
+  assert.match(mainSource, /MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000/u);
+  assert.match(mainSource, /screen\.getPrimaryDisplay\(\)\?\.id/u);
   assert.match(mainSource, /const externalDisplays = orderedDisplays\.filter\(\(display\) => !display\.internal\);/u);
   assert.match(
     mainSource,
     /\.filter\(\(\{ electronDisplay \}\) => Boolean\(electronDisplay\) && !electronDisplay\.internal\);/u
   );
+  assert.match(mainSource, /startDisplayChangeWatcher\(\);/u);
+  assert.match(mainSource, /screen\.on\("display-added", handleDisplayChange\);/u);
+  assert.match(mainSource, /screen\.on\("display-metrics-changed", handleDisplayChange\);/u);
+  assert.match(mainSource, /forceMacDisplayMetadataRefresh/u);
+  assert.match(mainSource, /system_profiler", \["SPDisplaysDataType", "-json"\]/u);
+  assert.match(mainSource, /function isMacProfilerDisplayResolutionMatch/u);
+  assert.match(mainSource, /function doesWindowsElectronDisplayExactlyMatchTopology/u);
+  assert.match(mainSource, /function doesWindowsElectronDisplaySizeMatchTopology/u);
+  assert.doesNotMatch(mainSource, /remainingMatches\.length === remainingDisplays\.length/u);
+  assert.doesNotMatch(mainSource, /remainingMatches\[index\]\.electronDisplay = remainingDisplays\[index\]/u);
+  assert.doesNotMatch(mainSource, /candidate\.width === display\?\.bounds\?\.width/u);
 }
 
 function verifyLocalOnlyDocs() {
@@ -39,6 +52,7 @@ function verifyLocalOnlyDocs() {
   const handoffDoc = fs.readFileSync(handoffDocPath, "utf8");
 
   assert.match(readme, /127\.0\.0\.1/u);
+  assert.match(readme, /hardware identity/u);
   assert.match(handoffDoc, /no LAN peer discovery/u);
   assert.match(
     handoffDoc,
@@ -303,7 +317,47 @@ function verifyMacDdcctlFallbackScript() {
   );
 }
 
-function verifyMacBetterDisplayDisplayIdSafety() {
+function writeFakeBetterDisplayBinary(fakeBinaryPath) {
+  const script = `#!/bin/sh
+set -eu
+
+joined="$*"
+
+case "$joined" in
+  get*" -displayID=777 "*|get*" -displayID=777")
+    echo "display id not found" >&2
+    exit 1
+    ;;
+  set*" -displayID=777 "*|set*" -displayID=777")
+    echo "display id not found" >&2
+    exit 1
+    ;;
+  set*" -nameLike=Fallback Monitor "*" -vcp=inputSelect "*|set*" -nameLike=Fallback Monitor"*" -vcp=inputSelect")
+    echo "OK"
+    exit 0
+    ;;
+  get*" -nameLike=Fallback Monitor "*" -vcp=inputSelect "*|get*" -nameLike=Fallback Monitor"*" -vcp=inputSelect")
+    echo "16"
+    exit 0
+    ;;
+  set*" -nameLike=Fallback Monitor "*" -vcp=0x60 "*|set*" -nameLike=Fallback Monitor"*" -vcp=0x60")
+    echo "OK"
+    exit 0
+    ;;
+  get*" -nameLike=Fallback Monitor "*" -vcp=0x60 "*|get*" -nameLike=Fallback Monitor"*" -vcp=0x60")
+    echo "16"
+    exit 0
+    ;;
+esac
+
+echo "unexpected args: $*" >&2
+exit 1
+`;
+
+  fs.writeFileSync(fakeBinaryPath, script, { mode: 0o755 });
+}
+
+function verifyMacBetterDisplayFallbackScript() {
   const switchScriptPath = path.resolve(
     __dirname,
     "..",
@@ -311,16 +365,32 @@ function verifyMacBetterDisplayDisplayIdSafety() {
     "mac",
     "switch-input.sh"
   );
-  const switchScript = fs.readFileSync(switchScriptPath, "utf8");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "monitor-input-switch-bd-selftest-"));
+  const fakeBinaryPath = path.join(tempDir, "fake-betterdisplay");
+  const baseEnv = {
+    ...process.env,
+    DISPLAY_NAME: "Fallback Monitor",
+    DISPLAY_ID: "777",
+    BETTERDISPLAY_APP_PATH: fakeBinaryPath,
+    BUNDLED_DDCCTL_PATH: path.join(tempDir, "missing-ddcctl"),
+    PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+  };
 
-  assert.match(
-    switchScript,
-    /query_betterdisplay_input\(\)[\s\S]*if \[ -n "\$DISPLAY_ID" \]; then[\s\S]*remember_error "\$output" 2[\s\S]*return 1[\s\S]*\n  fi/u
-  );
-  assert.match(
-    switchScript,
-    /try_betterdisplay\(\)[\s\S]*if \[ -n "\$DISPLAY_ID" \]; then[\s\S]*remember_error "\$output" 2[\s\S]*return 1[\s\S]*\n  fi/u
-  );
+  writeFakeBetterDisplayBinary(fakeBinaryPath);
+
+  execFileSync("/bin/sh", [switchScriptPath, "16"], {
+    env: baseEnv,
+    stdio: "pipe",
+    encoding: "utf8",
+  });
+
+  const queryOutput = execFileSync("/bin/sh", [switchScriptPath, "--query-input"], {
+    env: baseEnv,
+    stdio: "pipe",
+    encoding: "utf8",
+  }).trim();
+
+  assert.equal(queryOutput, "16");
 }
 
 function verifyMacHelperAppsIfAvailable() {
@@ -359,7 +429,7 @@ function main() {
 
   if (process.platform === "darwin") {
     verifyMacDdcctlFallbackScript();
-    verifyMacBetterDisplayDisplayIdSafety();
+    verifyMacBetterDisplayFallbackScript();
     verifyMacHelperAppsIfAvailable();
   }
 
