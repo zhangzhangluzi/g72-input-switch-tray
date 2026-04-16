@@ -1,6 +1,10 @@
 param(
     [string]$MonitorName,
 
+    [Nullable[int]]$PreferredPositionX,
+
+    [Nullable[int]]$PreferredPositionY,
+
     [switch]$PrimaryOnly,
 
     [switch]$ExtendAll,
@@ -321,7 +325,20 @@ public static class NativeDisplayTopology
 
         if (targetDisplay.Primary)
         {
-            throw new InvalidOperationException("Target display " + deviceName + " is currently the primary desktop and cannot be detached directly.");
+            if (activeDisplays.Count < 2)
+            {
+                throw new InvalidOperationException("Target display " + deviceName + " is currently the only active desktop display and cannot be detached.");
+            }
+
+            var replacementPrimary = activeDisplays.Find(
+                display => !string.Equals(display.DeviceName, targetDisplay.DeviceName, StringComparison.OrdinalIgnoreCase)
+            );
+            if (replacementPrimary == null)
+            {
+                throw new InvalidOperationException("No replacement primary display was found before detaching " + deviceName + ".");
+            }
+
+            ApplyPrimaryDisplay(replacementPrimary.DeviceName);
         }
 
         DetachDisplay(targetDisplay.DeviceName);
@@ -371,11 +388,14 @@ public static class NativeDisplayTopology
 
     public static void AttachDisplayByDeviceName(string deviceName)
     {
-        AttachDisplayByDeviceName(deviceName, 0, 0, 0, 0);
+        AttachDisplayByDeviceName(deviceName, 0, 0, false, 0, 0, 0, 0);
     }
 
     public static void AttachDisplayByDeviceName(
         string deviceName,
+        int preferredPositionX,
+        int preferredPositionY,
+        bool usePreferredPosition,
         int preferredWidth,
         int preferredHeight,
         int preferredBitsPerPel,
@@ -407,21 +427,30 @@ public static class NativeDisplayTopology
             return;
         }
 
-        int nextX = 0;
-        foreach (var display in activeDisplays)
+        var primaryDisplay = activeDisplays.Find(display => display.Primary) ?? activeDisplays[0];
+        int positionX = preferredPositionX;
+        int positionY = preferredPositionY;
+
+        if (!usePreferredPosition)
         {
-            int rightEdge = display.PositionX + Math.Max(display.Width, 1);
-            if (rightEdge > nextX)
+            int nextX = 0;
+            foreach (var display in activeDisplays)
             {
-                nextX = rightEdge;
+                int rightEdge = display.PositionX + Math.Max(display.Width, 1);
+                if (rightEdge > nextX)
+                {
+                    nextX = rightEdge;
+                }
             }
+
+            positionX = nextX;
+            positionY = primaryDisplay.PositionY;
         }
 
-        var primaryDisplay = activeDisplays.Find(display => display.Primary) ?? activeDisplays[0];
         AttachDisplay(
             targetDisplay.DeviceName,
-            nextX,
-            primaryDisplay.PositionY,
+            positionX,
+            positionY,
             preferredWidth,
             preferredHeight,
             preferredBitsPerPel,
@@ -1059,8 +1088,14 @@ try {
         }
 
         if ($AttachMonitor) {
+            $usePreferredPosition = $PSBoundParameters.ContainsKey("PreferredPositionX") -and $PSBoundParameters.ContainsKey("PreferredPositionY")
+            $resolvedPreferredPositionX = if ($null -ne $PreferredPositionX) { [int]$PreferredPositionX } else { 0 }
+            $resolvedPreferredPositionY = if ($null -ne $PreferredPositionY) { [int]$PreferredPositionY } else { 0 }
             [NativeDisplayTopology]::AttachDisplayByDeviceName(
                 $targetDisplayEntry.DeviceName,
+                $resolvedPreferredPositionX,
+                $resolvedPreferredPositionY,
+                [bool]$usePreferredPosition,
                 [int]$targetDisplayEntry.Width,
                 [int]$targetDisplayEntry.Height,
                 [int]$targetDisplayEntry.BitsPerPel,

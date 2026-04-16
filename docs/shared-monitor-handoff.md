@@ -44,6 +44,7 @@ This project now uses one rule set only:
 - This is local to Windows only.
 - When Windows switches a screen away from Windows' own cable, the app can remove that screen from the Windows desktop topology.
 - That detach step is allowed only after the switch result has been confirmed, not when the command is merely unconfirmed.
+- If the target Windows screen is still the current primary desktop, another attached Windows screen must become primary first before the target can be detached.
 - When the same screen later returns to the Windows cable, the app can add that screen back into the Windows desktop topology.
 - This is not remote coordination. It is only Windows repairing its own local desktop state.
 

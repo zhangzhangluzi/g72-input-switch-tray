@@ -641,7 +641,10 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
   const switchingToLocalInterface = isLocalInterfaceTarget(targetId, monitorConfig);
   const topologyDisplays = await getWindowsTopologyDisplays();
   const attachedTopologyDisplayCount = topologyDisplays.filter((display) => display.attached).length;
-  if (!isWindowsMonitorAttachedInTopology(topologyDisplays, monitorContext)) {
+  const topologyDisplay = topologyDisplays.find((display) =>
+    isTopologyDisplayMatchMonitor(display, monitorContext)
+  );
+  if (!topologyDisplay?.attached) {
     throw new Error(
       `${getMonitorDisplayTitle(
         monitorContext
@@ -684,8 +687,19 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
     !switchingToLocalInterface &&
     shouldUseWindowsDisplayHandoffForMonitor(monitorConfig, attachedTopologyDisplayCount)
   ) {
-    await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
-    await detachWindowsDisplayForMonitor(monitorConfig, attachedDisplayCountBeforeSwitch);
+    if (topologyDisplay.primary) {
+      clearMonitorPendingRestore(monitorConfig.id);
+      appendDiagnosticLog(
+        `Skipping Windows desktop detach for primary display ${getMonitorDisplayTitle(monitorContext)}`
+      );
+    } else {
+      await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
+      await detachWindowsDisplayForMonitor(
+        monitorConfig,
+        attachedDisplayCountBeforeSwitch,
+        buildWindowsRestoreLayout(topologyDisplay)
+      );
+    }
   } else if (switchingToLocalInterface) {
     clearMonitorPendingRestore(monitorConfig.id);
   }
@@ -920,7 +934,25 @@ function getWindowsTopologySelectorValue(monitorContextOrConfig) {
   return gdiDeviceName || getMonitorDisplayName(monitorContextOrConfig);
 }
 
-async function detachWindowsDisplayForMonitor(monitorConfig, expectedAttachedDisplayCount) {
+function buildWindowsRestoreLayout(topologyDisplay) {
+  const positionX = Number.isFinite(topologyDisplay?.positionX) ? topologyDisplay.positionX : NaN;
+  const positionY = Number.isFinite(topologyDisplay?.positionY) ? topologyDisplay.positionY : NaN;
+
+  if (!Number.isInteger(positionX) || !Number.isInteger(positionY)) {
+    return null;
+  }
+
+  return {
+    positionX,
+    positionY,
+  };
+}
+
+async function detachWindowsDisplayForMonitor(
+  monitorConfig,
+  expectedAttachedDisplayCount,
+  restoreLayout = null
+) {
   await runWindowsTopologyCommand([
     "-MonitorName",
     getWindowsTopologySelectorValue(monitorConfig),
@@ -931,15 +963,30 @@ async function detachWindowsDisplayForMonitor(monitorConfig, expectedAttachedDis
     false,
     "Windows 没有把这块屏从桌面拓扑里移除。"
   );
-  markMonitorPendingRestore(monitorConfig.id, expectedAttachedDisplayCount);
+  markMonitorPendingRestore(monitorConfig.id, expectedAttachedDisplayCount, restoreLayout);
 }
 
-async function attachWindowsDisplayForMonitor(monitorConfig, expectedAttachedDisplayCount) {
-  await runWindowsTopologyCommand([
+async function attachWindowsDisplayForMonitor(
+  monitorConfig,
+  expectedAttachedDisplayCount,
+  restoreLayout = null
+) {
+  const args = [
     "-MonitorName",
     getWindowsTopologySelectorValue(monitorConfig),
     "-AttachMonitor",
-  ]);
+  ];
+
+  if (restoreLayout) {
+    args.push(
+      "-PreferredPositionX",
+      String(restoreLayout.positionX),
+      "-PreferredPositionY",
+      String(restoreLayout.positionY)
+    );
+  }
+
+  await runWindowsTopologyCommand(args);
   await waitForWindowsMonitorAttachmentState(
     monitorConfig,
     true,
@@ -1046,7 +1093,8 @@ async function attemptPendingWindowsRestores({
         try {
           await attachWindowsDisplayForMonitor(
             monitorConfig,
-            runtime.expectedAttachedDisplayCount || null
+            runtime.expectedAttachedDisplayCount || null,
+            runtime.restoreLayout
           );
         } catch (error) {
           appendDiagnosticLog("Failed to attach Windows display back into topology", error);
@@ -1169,18 +1217,25 @@ function isTrayDestroyed() {
 
 async function buildMonitorContextsWithStatus(options = {}) {
   const monitorContexts = await getConnectedMonitorContexts(options);
+  const sharedWindowsTopologyDisplays =
+    process.platform === "win32" ? await getWindowsTopologyDisplays() : null;
   return Promise.all(
     monitorContexts.map(async (monitorContext) => ({
       ...monitorContext,
-      status: await getMonitorStatus(monitorContext),
+      status: await getMonitorStatus(monitorContext, {
+        topologyDisplays: sharedWindowsTopologyDisplays,
+      }),
     }))
   );
 }
 
-async function getMonitorStatus(monitorContext) {
+async function getMonitorStatus(monitorContext, options = {}) {
+  const { topologyDisplays = null } = options;
   if (process.platform === "win32") {
-    const topologyDisplays = await getWindowsTopologyDisplays();
-    const visible = isWindowsMonitorAttachedInTopology(topologyDisplays, monitorContext);
+    const resolvedTopologyDisplays = Array.isArray(topologyDisplays)
+      ? topologyDisplays
+      : await getWindowsTopologyDisplays();
+    const visible = isWindowsMonitorAttachedInTopology(resolvedTopologyDisplays, monitorContext);
     if (!visible) {
       return {
         visible: false,
@@ -1373,47 +1428,50 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
 
     return withDisplayNameUniqueness(
       switchableTopologyDisplays.map(({ topologyDisplay, electronDisplay }, index) => {
-      const roleLabel = singleDisplayOnly
-        ? "当前机器屏幕"
-        : topologyDisplay.primary
-          ? "主屏幕"
-          : `附屏幕 ${secondaryIndex++}`;
-      const displayKey = buildDisplayKeyForLocalDisplay(
-        electronDisplay || {
-          id: null,
+        const roleLabel = singleDisplayOnly
+          ? "当前机器屏幕"
+          : topologyDisplay.primary
+            ? "主屏幕"
+            : `附屏幕 ${secondaryIndex++}`;
+        const displayKey = buildDisplayKeyForLocalDisplay(
+          electronDisplay || {
+            id: null,
+            bounds: {
+              x: topologyDisplay.positionX,
+              y: topologyDisplay.positionY,
+              width: topologyDisplay.width,
+              height: topologyDisplay.height,
+            },
+          },
+          index + 1,
+          topologyDisplay
+        );
+        const detectedName = normalizeText(
+          topologyDisplay.friendlyName ||
+            topologyDisplay.displayName ||
+            topologyDisplay.deviceString ||
+            ""
+        );
+
+        return {
+          id: createMonitorId(displayKey),
+          displayKey,
+          index: index + 1,
+          roleLabel,
+          detectedName,
+          resolution: `${topologyDisplay.width} × ${topologyDisplay.height}`,
+          position: `${topologyDisplay.positionX}, ${topologyDisplay.positionY}`,
+          internal: Boolean(electronDisplay?.internal),
+          electronDisplayId: Number.isInteger(electronDisplay?.id) ? electronDisplay.id : null,
+          gdiDeviceName: normalizeText(topologyDisplay.deviceName),
+          productCode: normalizeText(topologyDisplay.productCode),
           bounds: {
             x: topologyDisplay.positionX,
             y: topologyDisplay.positionY,
             width: topologyDisplay.width,
             height: topologyDisplay.height,
           },
-        },
-        index + 1,
-        topologyDisplay
-      );
-      const detectedName = normalizeText(
-        topologyDisplay.friendlyName || topologyDisplay.displayName || topologyDisplay.deviceString || ""
-      );
-
-      return {
-        id: createMonitorId(displayKey),
-        displayKey,
-        index: index + 1,
-        roleLabel,
-        detectedName,
-        resolution: `${topologyDisplay.width} × ${topologyDisplay.height}`,
-        position: `${topologyDisplay.positionX}, ${topologyDisplay.positionY}`,
-        internal: Boolean(electronDisplay?.internal),
-        electronDisplayId: Number.isInteger(electronDisplay?.id) ? electronDisplay.id : null,
-        gdiDeviceName: normalizeText(topologyDisplay.deviceName),
-        productCode: normalizeText(topologyDisplay.productCode),
-        bounds: {
-          x: topologyDisplay.positionX,
-          y: topologyDisplay.positionY,
-          width: topologyDisplay.width,
-          height: topologyDisplay.height,
-        },
-      };
+        };
       })
     );
   }
@@ -2647,41 +2705,67 @@ function getMonitorDesktopRuntime(monitorId) {
     state.windowsDesktop.byMonitorId[normalizedId] = {
       pendingRestore: false,
       expectedAttachedDisplayCount: 0,
+      restoreLayout: null,
     };
   }
 
   return state.windowsDesktop.byMonitorId[normalizedId];
 }
 
-function markMonitorPendingRestore(monitorId, expectedAttachedDisplayCount = null) {
+function markMonitorPendingRestore(
+  monitorId,
+  expectedAttachedDisplayCount = null,
+  restoreLayout = null
+) {
   const runtime = getMonitorDesktopRuntime(monitorId);
   runtime.pendingRestore = true;
   runtime.expectedAttachedDisplayCount =
     Number.isInteger(expectedAttachedDisplayCount) && expectedAttachedDisplayCount > 1
       ? expectedAttachedDisplayCount
       : 0;
+  runtime.restoreLayout = normalizeWindowsRestoreLayout(restoreLayout);
   saveState(state);
   void refreshMenu();
 }
 
 function clearMonitorPendingRestore(monitorId) {
   const runtime = getMonitorDesktopRuntime(monitorId);
-  if (!runtime.pendingRestore && runtime.expectedAttachedDisplayCount === 0) {
+  if (!runtime.pendingRestore && runtime.expectedAttachedDisplayCount === 0 && !runtime.restoreLayout) {
     return;
   }
 
   runtime.pendingRestore = false;
   runtime.expectedAttachedDisplayCount = 0;
+  runtime.restoreLayout = null;
   saveState(state);
   void refreshMenu();
 }
 
 function loadState() {
-  try {
-    return normalizeState(JSON.parse(fs.readFileSync(getStatePath(), "utf8")));
-  } catch {
-    return createDefaultState();
+  const candidates = [
+    { path: getStatePath(), label: "state" },
+    { path: getStateBackupPath(), label: "backup-state" },
+  ];
+  let sawReadFailure = false;
+
+  for (const candidate of candidates) {
+    try {
+      return normalizeState(JSON.parse(fs.readFileSync(candidate.path, "utf8")));
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        continue;
+      }
+
+      sawReadFailure = true;
+      appendDiagnosticLog(`Failed to read persisted ${candidate.label}`, error);
+    }
   }
+
+  if (sawReadFailure) {
+    appendDiagnosticLog("Falling back to a fresh default state because no readable snapshot remained.");
+  }
+
+  return createDefaultState();
 }
 
 function normalizeState(nextState) {
@@ -2738,10 +2822,29 @@ function normalizeWindowsDesktopRuntime(rawRuntimeMap) {
         runtime?.expectedAttachedDisplayCount,
         0
       ),
+      restoreLayout: normalizeWindowsRestoreLayout(runtime?.restoreLayout),
     };
   }
 
   return nextRuntimeMap;
+}
+
+function normalizeWindowsRestoreLayout(rawLayout) {
+  if (!rawLayout || typeof rawLayout !== "object") {
+    return null;
+  }
+
+  const positionX = Number.parseInt(String(rawLayout.positionX ?? ""), 10);
+  const positionY = Number.parseInt(String(rawLayout.positionY ?? ""), 10);
+
+  if (!Number.isInteger(positionX) || !Number.isInteger(positionY)) {
+    return null;
+  }
+
+  return {
+    positionX,
+    positionY,
+  };
 }
 
 function compareDisplayLikeObjects(left, right) {
@@ -2762,12 +2865,37 @@ function compareDisplayLikeObjects(left, right) {
 
 function saveState(nextState) {
   const normalizedState = normalizeState(nextState);
-  fs.mkdirSync(path.dirname(getStatePath()), { recursive: true });
-  fs.writeFileSync(getStatePath(), JSON.stringify(normalizedState, null, 2));
+  const statePath = getStatePath();
+  const backupPath = getStateBackupPath();
+  const tempPath = `${statePath}.tmp-${process.pid}`;
+
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(tempPath, JSON.stringify(normalizedState, null, 2));
+
+  try {
+    if (fs.existsSync(statePath)) {
+      removeFileIfExists(backupPath);
+      fs.renameSync(statePath, backupPath);
+    }
+
+    fs.renameSync(tempPath, statePath);
+
+    try {
+      fs.copyFileSync(statePath, backupPath);
+    } catch (error) {
+      appendDiagnosticLog("Failed to refresh state backup", error);
+    }
+  } finally {
+    removeFileIfExists(tempPath);
+  }
 }
 
 function getStatePath() {
   return path.join(app.getPath("userData"), "state.json");
+}
+
+function getStateBackupPath() {
+  return `${getStatePath()}.bak`;
 }
 
 function getDiagnosticLogPath() {
@@ -2785,6 +2913,14 @@ function appendDiagnosticLog(message, error = null) {
     fs.appendFileSync(getDiagnosticLogPath(), `${lines.join("\n")}\n`);
   } catch {
     // Ignore logging failures.
+  }
+}
+
+function removeFileIfExists(filePath) {
+  try {
+    fs.rmSync(filePath, { force: true });
+  } catch {
+    // Ignore cleanup failures.
   }
 }
 

@@ -46,6 +46,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
 - On Windows, desktop handoff is per monitor profile:
   - switching away from the local interface can detach that specific screen from the Windows desktop
+  - if that specific screen is still the current Windows primary display, another attached Windows screen is promoted to primary first
   - when that specific screen returns to Windows later, the watcher can re-attach it automatically
 - If `DisplaySwitch.exe` is not enough, the app falls back to a bundled topology helper that directly detaches or re-attaches the targeted Windows monitor.
 - Windows monitor matching no longer relies on friendly monitor names as the primary selector, so two same-model monitors do not collapse into one target.

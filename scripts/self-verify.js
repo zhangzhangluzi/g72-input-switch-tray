@@ -44,6 +44,9 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function isMacProfilerDisplayResolutionMatch/u);
   assert.match(mainSource, /function doesWindowsElectronDisplayExactlyMatchTopology/u);
   assert.match(mainSource, /function doesWindowsElectronDisplaySizeMatchTopology/u);
+  assert.match(mainSource, /function getStateBackupPath/u);
+  assert.match(mainSource, /function normalizeWindowsRestoreLayout/u);
+  assert.match(mainSource, /topologyDisplay\.primary/u);
   assert.doesNotMatch(mainSource, /remainingMatches\.length === remainingDisplays\.length/u);
   assert.doesNotMatch(mainSource, /remainingMatches\[index\]\.electronDisplay = remainingDisplays\[index\]/u);
   assert.doesNotMatch(mainSource, /candidate\.width === display\?\.bounds\?\.width/u);
