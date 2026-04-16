@@ -47,9 +47,14 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function getStateBackupPath/u);
   assert.match(mainSource, /function normalizeWindowsRestoreLayout/u);
   assert.match(mainSource, /topologyDisplay\.primary/u);
+  assert.match(
+    mainSource,
+    /await detachWindowsDisplayForMonitor\(\s*monitorConfig,\s*attachedDisplayCountBeforeSwitch,\s*buildWindowsRestoreLayout\(topologyDisplay\)\s*\)/u
+  );
   assert.doesNotMatch(mainSource, /remainingMatches\.length === remainingDisplays\.length/u);
   assert.doesNotMatch(mainSource, /remainingMatches\[index\]\.electronDisplay = remainingDisplays\[index\]/u);
   assert.doesNotMatch(mainSource, /candidate\.width === display\?\.bounds\?\.width/u);
+  assert.doesNotMatch(mainSource, /Skipping Windows desktop detach for primary display/u);
 }
 
 function verifyLocalOnlyDocs() {

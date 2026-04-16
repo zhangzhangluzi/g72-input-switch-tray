@@ -687,19 +687,12 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
     !switchingToLocalInterface &&
     shouldUseWindowsDisplayHandoffForMonitor(monitorConfig, attachedTopologyDisplayCount)
   ) {
-    if (topologyDisplay.primary) {
-      clearMonitorPendingRestore(monitorConfig.id);
-      appendDiagnosticLog(
-        `Skipping Windows desktop detach for primary display ${getMonitorDisplayTitle(monitorContext)}`
-      );
-    } else {
-      await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
-      await detachWindowsDisplayForMonitor(
-        monitorConfig,
-        attachedDisplayCountBeforeSwitch,
-        buildWindowsRestoreLayout(topologyDisplay)
-      );
-    }
+    await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
+    await detachWindowsDisplayForMonitor(
+      monitorConfig,
+      attachedDisplayCountBeforeSwitch,
+      buildWindowsRestoreLayout(topologyDisplay)
+    );
   } else if (switchingToLocalInterface) {
     clearMonitorPendingRestore(monitorConfig.id);
   }
