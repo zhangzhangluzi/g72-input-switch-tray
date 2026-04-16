@@ -876,6 +876,7 @@ function getMacSwitchScriptEnvForContext(monitorContext) {
   const env = {
     DISPLAY_NAME: getMonitorDisplayName(monitorContext),
     DISPLAY_INDEX: String(monitorContext.display.index),
+    DISPLAY_NAME_FALLBACK_ALLOWED: monitorContext.display.displayNameIsUnique ? "1" : "0",
   };
 
   const preferredDisplayId = Number.isInteger(monitorContext.display.macSystemDisplayId)
@@ -992,7 +993,9 @@ async function refreshWindowsDisplayState({ monitorId = null, notifyOnSuccess = 
     };
   }
 
-  const changed = await attemptPendingWindowsRestores(monitorId);
+  const changed = await attemptPendingWindowsRestores({
+    monitorId,
+  });
   const message = changed ? "Windows 已刷新并处理等待接回的屏幕。" : "Windows 已刷新当前屏幕状态。";
 
   if (notifyOnSuccess) {
@@ -1005,7 +1008,10 @@ async function refreshWindowsDisplayState({ monitorId = null, notifyOnSuccess = 
   };
 }
 
-async function attemptPendingWindowsRestores(targetMonitorId = null) {
+async function attemptPendingWindowsRestores({
+  monitorId: targetMonitorId = null,
+  displaySummaries = null,
+} = {}) {
   if (process.platform !== "win32" || windowsRestoreInFlight) {
     return false;
   }
@@ -1013,7 +1019,9 @@ async function attemptPendingWindowsRestores(targetMonitorId = null) {
   windowsRestoreInFlight = true;
 
   try {
-    await syncMonitorConfigsFromLocalDisplays({ persist: false });
+    if (!Array.isArray(displaySummaries)) {
+      await syncMonitorConfigsFromLocalDisplays({ persist: false });
+    }
     const topologyDisplays = await getWindowsTopologyDisplays();
     let changed = false;
 
@@ -1088,7 +1096,9 @@ async function handleLocalDisplayTopologyChange() {
     });
 
     if (process.platform === "win32") {
-      await attemptPendingWindowsRestores();
+      await attemptPendingWindowsRestores({
+        displaySummaries,
+      });
       scheduleTrayRebuild("display-change");
       return;
     }
@@ -1248,6 +1258,7 @@ async function syncMonitorConfigsFromLocalDisplays({
   let legacyMonitorConfigConsumed = false;
   const usedMonitorIds = new Set();
   const nextMonitorConfigs = [];
+  const resolvedDisplaySummaries = [];
 
   for (const displaySummary of displaySummaries) {
     const macHardwareDisplayKey = buildMacHardwareDisplayKey(displaySummary);
@@ -1275,42 +1286,49 @@ async function syncMonitorConfigsFromLocalDisplays({
       legacyMonitorConfigConsumed = true;
     }
 
+    const resolvedMonitorId = normalizeText(matchingMonitorConfig?.id) || displaySummary.id;
+    const resolvedDisplaySummary = {
+      ...displaySummary,
+      id: resolvedMonitorId,
+    };
+
     const nextMonitorConfig = normalizeMonitorConfig(
       {
         ...matchingMonitorConfig,
-        id: displaySummary.id,
-        displayKey: displaySummary.displayKey,
-        roleLabel: displaySummary.roleLabel,
-        displayName: displaySummary.detectedName,
+        id: resolvedMonitorId,
+        displayKey: resolvedDisplaySummary.displayKey,
+        roleLabel: resolvedDisplaySummary.roleLabel,
+        displayName: resolvedDisplaySummary.detectedName,
         match: {
-          electronDisplayId: displaySummary.electronDisplayId,
-          macSystemDisplayId: displaySummary.macSystemDisplayId,
-          macVendorId: displaySummary.macVendorId,
-          macProductId: displaySummary.macProductId,
-          macSerialNumber: displaySummary.macSerialNumber,
-          gdiDeviceName: displaySummary.gdiDeviceName,
-          productCode: displaySummary.productCode,
+          electronDisplayId: resolvedDisplaySummary.electronDisplayId,
+          macSystemDisplayId: resolvedDisplaySummary.macSystemDisplayId,
+          macVendorId: resolvedDisplaySummary.macVendorId,
+          macProductId: resolvedDisplaySummary.macProductId,
+          macSerialNumber: resolvedDisplaySummary.macSerialNumber,
+          gdiDeviceName: resolvedDisplaySummary.gdiDeviceName,
+          productCode: resolvedDisplaySummary.productCode,
         },
       },
       createDefaultMonitorConfig({
-        id: displaySummary.id,
-        displayKey: displaySummary.displayKey,
-        roleLabel: displaySummary.roleLabel,
-        displayName: displaySummary.detectedName,
+        id: resolvedMonitorId,
+        displayKey: resolvedDisplaySummary.displayKey,
+        roleLabel: resolvedDisplaySummary.roleLabel,
+        displayName: resolvedDisplaySummary.detectedName,
         match: {
-          electronDisplayId: displaySummary.electronDisplayId,
-          macSystemDisplayId: displaySummary.macSystemDisplayId,
-          macVendorId: displaySummary.macVendorId,
-          macProductId: displaySummary.macProductId,
-          macSerialNumber: displaySummary.macSerialNumber,
-          gdiDeviceName: displaySummary.gdiDeviceName,
-          productCode: displaySummary.productCode,
+          electronDisplayId: resolvedDisplaySummary.electronDisplayId,
+          macSystemDisplayId: resolvedDisplaySummary.macSystemDisplayId,
+          macVendorId: resolvedDisplaySummary.macVendorId,
+          macProductId: resolvedDisplaySummary.macProductId,
+          macSerialNumber: resolvedDisplaySummary.macSerialNumber,
+          gdiDeviceName: resolvedDisplaySummary.gdiDeviceName,
+          productCode: resolvedDisplaySummary.productCode,
         },
       })
     );
 
     usedMonitorIds.add(nextMonitorConfig.id);
     nextMonitorConfigs.push(nextMonitorConfig);
+    resolvedDisplaySummaries.push(resolvedDisplaySummary);
   }
 
   for (const storedMonitorConfig of unmatchedStoredMonitorConfigs) {
@@ -1335,7 +1353,7 @@ async function syncMonitorConfigsFromLocalDisplays({
     }
   }
 
-  return displaySummaries;
+  return resolvedDisplaySummaries;
 }
 
 async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false } = {}) {
@@ -1353,7 +1371,8 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
     let secondaryIndex = 2;
     const singleDisplayOnly = switchableTopologyDisplays.length <= 1;
 
-    return switchableTopologyDisplays.map(({ topologyDisplay, electronDisplay }, index) => {
+    return withDisplayNameUniqueness(
+      switchableTopologyDisplays.map(({ topologyDisplay, electronDisplay }, index) => {
       const roleLabel = singleDisplayOnly
         ? "当前机器屏幕"
         : topologyDisplay.primary
@@ -1395,7 +1414,8 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
           height: topologyDisplay.height,
         },
       };
-    });
+      })
+    );
   }
 
   const externalDisplays = orderedDisplays.filter((display) => !display.internal);
@@ -1406,7 +1426,7 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
   let secondaryIndex = 2;
   const singleDisplayOnly = externalDisplays.length <= 1;
 
-  return externalDisplays.map((display, index) => {
+  return withDisplayNameUniqueness(externalDisplays.map((display, index) => {
     const macProfilerDisplay = matchMacSystemProfilerDisplay(
       display,
       macProfilerDisplays,
@@ -1444,6 +1464,27 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
         width: display.bounds.width,
         height: display.bounds.height,
       },
+    };
+  }));
+}
+
+function withDisplayNameUniqueness(displaySummaries) {
+  const displayNameCounts = new Map();
+
+  for (const displaySummary of displaySummaries) {
+    const normalizedName = normalizeText(displaySummary?.detectedName).toLowerCase();
+    if (!normalizedName) {
+      continue;
+    }
+
+    displayNameCounts.set(normalizedName, (displayNameCounts.get(normalizedName) || 0) + 1);
+  }
+
+  return displaySummaries.map((displaySummary) => {
+    const normalizedName = normalizeText(displaySummary?.detectedName).toLowerCase();
+    return {
+      ...displaySummary,
+      displayNameIsUnique: normalizedName ? displayNameCounts.get(normalizedName) === 1 : false,
     };
   });
 }

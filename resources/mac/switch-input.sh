@@ -6,6 +6,7 @@ INPUT_VALUE="$COMMAND"
 DISPLAY_NAME="${DISPLAY_NAME:-}"
 DISPLAY_INDEX="${DISPLAY_INDEX:-1}"
 DISPLAY_ID="${DISPLAY_ID:-}"
+DISPLAY_NAME_FALLBACK_ALLOWED="${DISPLAY_NAME_FALLBACK_ALLOWED:-0}"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BUNDLED_DDCCTL="${BUNDLED_DDCCTL_PATH:-$SCRIPT_DIR/../bin/ddcctl}"
 BETTERDISPLAY_APP_PATH="${BETTERDISPLAY_APP_PATH:-}"
@@ -63,6 +64,17 @@ set_verification_result() {
   LAST_VERIFICATION_RESULT="${1:-}"
 }
 
+can_fallback_to_display_name() {
+  case "$DISPLAY_NAME_FALLBACK_ALLOWED" in
+    1|true|TRUE|yes|YES|on|ON)
+      [ -n "$DISPLAY_NAME" ]
+      return
+      ;;
+  esac
+
+  return 1
+}
+
 extract_external_display_count() {
   printf '%s\n' "${1:-}" | sed -n 's/.*I: found \([0-9][0-9]*\) external display.*/\1/p' | tail -n 1
 }
@@ -110,7 +122,7 @@ query_betterdisplay_input() {
     remember_error "$output" 2
   fi
 
-  [ -n "$DISPLAY_NAME" ] || return 1
+  can_fallback_to_display_name || return 1
   "$betterdisplay_path" get -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value 2>&1
 }
 
@@ -362,7 +374,7 @@ try_betterdisplay() {
     remember_error "$output" 2
   fi
 
-  [ -n "$DISPLAY_NAME" ] || return 1
+  can_fallback_to_display_name || return 1
 
   if output=$("$BETTERDISPLAY_PATH" set -nameLike="$DISPLAY_NAME" -feature=ddc -vcp=inputSelect -value="$INPUT_VALUE" 2>&1); then
     if verify_betterdisplay_switch "$BETTERDISPLAY_PATH" "$BETTERDISPLAY_MODE"; then

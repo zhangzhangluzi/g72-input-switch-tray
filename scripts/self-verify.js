@@ -27,6 +27,10 @@ function verifyMainSourceBusinessGuards() {
   );
   assert.match(mainSource, /MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000/u);
   assert.match(mainSource, /screen\.getPrimaryDisplay\(\)\?\.id/u);
+  assert.match(mainSource, /DISPLAY_NAME_FALLBACK_ALLOWED: monitorContext\.display\.displayNameIsUnique \? "1" : "0"/u);
+  assert.match(mainSource, /const resolvedMonitorId = normalizeText\(matchingMonitorConfig\?\.id\) \|\| displaySummary\.id;/u);
+  assert.match(mainSource, /function withDisplayNameUniqueness/u);
+  assert.match(mainSource, /async function attemptPendingWindowsRestores\(\{\s*monitorId: targetMonitorId = null,\s*displaySummaries = null,/u);
   assert.match(mainSource, /const externalDisplays = orderedDisplays\.filter\(\(display\) => !display\.internal\);/u);
   assert.match(
     mainSource,
@@ -371,6 +375,7 @@ function verifyMacBetterDisplayFallbackScript() {
     ...process.env,
     DISPLAY_NAME: "Fallback Monitor",
     DISPLAY_ID: "777",
+    DISPLAY_NAME_FALLBACK_ALLOWED: "1",
     BETTERDISPLAY_APP_PATH: fakeBinaryPath,
     BUNDLED_DDCCTL_PATH: path.join(tempDir, "missing-ddcctl"),
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -394,6 +399,10 @@ function verifyMacBetterDisplayFallbackScript() {
 }
 
 function verifyMacHelperAppsIfAvailable() {
+  if (process.env.SELF_VERIFY_REQUIRE_MAC_APP_BUNDLE !== "1") {
+    return;
+  }
+
   const builtAppPath = path.resolve(
     __dirname,
     "..",
@@ -412,9 +421,7 @@ function verifyMacHelperAppsIfAvailable() {
     return;
   }
 
-  if (process.env.SELF_VERIFY_REQUIRE_MAC_APP_BUNDLE === "1") {
-    throw new Error("No macOS app bundle was found for self verification.");
-  }
+  throw new Error("No macOS app bundle was found for self verification.");
 }
 
 function main() {
