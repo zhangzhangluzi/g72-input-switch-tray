@@ -7,6 +7,7 @@ DISPLAY_NAME="${DISPLAY_NAME:-}"
 DISPLAY_INDEX="${DISPLAY_INDEX:-1}"
 DISPLAY_ID="${DISPLAY_ID:-}"
 DISPLAY_NAME_FALLBACK_ALLOWED="${DISPLAY_NAME_FALLBACK_ALLOWED:-0}"
+INPUT_EXPECTED_VALUES="${INPUT_EXPECTED_VALUES:-}"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BUNDLED_DDCCTL="${BUNDLED_DDCCTL_PATH:-$SCRIPT_DIR/../bin/ddcctl}"
 BETTERDISPLAY_APP_PATH="${BETTERDISPLAY_APP_PATH:-}"
@@ -18,7 +19,7 @@ BETTERDISPLAY_PATH=""
 BETTERDISPLAY_MODE=""
 LAST_VERIFICATION_RESULT=""
 
-if [ "$COMMAND" != "--query-input" ]; then
+if [ "$COMMAND" != "--query-input" ] && [ "$COMMAND" != "--probe-ddc" ]; then
   case "$INPUT_VALUE" in
     ''|*[!0-9]*)
       echo "用法：$0 <输入值数字>" >&2
@@ -91,6 +92,27 @@ is_ddcctl_usage_output() {
 }
 
 get_expected_input_values() {
+  if [ -n "$INPUT_EXPECTED_VALUES" ]; then
+    normalized_values=""
+    for expected_value in $INPUT_EXPECTED_VALUES; do
+      case "$expected_value" in
+        ''|*[!0-9]*)
+          continue
+          ;;
+      esac
+
+      case " $normalized_values " in
+        *" $expected_value "*) ;;
+        *) normalized_values="$normalized_values $expected_value" ;;
+      esac
+    done
+
+    if [ -n "$normalized_values" ]; then
+      printf '%s\n' "$normalized_values"
+      return
+    fi
+  fi
+
   case "$INPUT_VALUE" in
     17)
       printf '%s\n' "17 6"
@@ -199,6 +221,22 @@ try_betterdisplay_query() {
   return 0
 }
 
+try_betterdisplay_target_probe() {
+  resolve_betterdisplay || return 1
+
+  if [ -n "$DISPLAY_ID" ]; then
+    printf '%s\n' "UNKNOWN"
+    return 0
+  fi
+
+  if can_fallback_to_display_name; then
+    printf '%s\n' "UNKNOWN"
+    return 0
+  fi
+
+  return 1
+}
+
 verify_betterdisplay_switch() {
   betterdisplay_path="$1"
   betterdisplay_mode="$2"
@@ -250,8 +288,8 @@ verify_betterdisplay_switch() {
     fi
 
     remember_error "BetterDisplay 已发送输入切换命令，但当前输入仍是 ${current_value}，未匹配目标值集合：${expected_values}" 3
-    set_verification_result "mismatch"
-    return 1
+    set_verification_result "unknown"
+    return 0
   done
 
   set_verification_result "unknown"
@@ -309,6 +347,33 @@ try_ddcctl_query_binary() {
   done
 
   return 1
+}
+
+try_ddcctl_probe_binary() {
+  binary_path="$1"
+  detected_display_count=""
+
+  [ -x "$binary_path" ] || return 1
+
+  detected_display_count=$(discover_ddcctl_display_count "$binary_path")
+
+  if [ -z "$detected_display_count" ]; then
+    remember_error "ddcctl 没有可靠返回外接屏数量，当前版本不会在屏幕数量未知时盲切。请安装 BetterDisplay / betterdisplaycli 后再控制这块屏。" 3
+    return 1
+  fi
+
+  if [ "$detected_display_count" -eq 0 ]; then
+    remember_error "ddcctl 没有检测到可控制的外接显示器。请确认显示器已连接、当前 Mac 仍然能看到它，并且显示器开启了 DDC/CI。" 2
+    return 1
+  fi
+
+  if [ "$detected_display_count" -gt 1 ]; then
+    remember_error "当前 Mac 检测到多块外接屏，ddcctl 无法稳定锁定指定屏幕。请安装 BetterDisplay / betterdisplaycli 后再控制这块屏。" 3
+    return 1
+  fi
+
+  printf '%s\n' "OK"
+  return 0
 }
 
 discover_ddcctl_display_count() {
@@ -473,8 +538,8 @@ verify_ddcctl_switch_binary() {
   done
 
   remember_error "ddcctl 已发送输入切换命令，但当前输入仍是 ${current_value}，未匹配目标值集合：${expected_values}" 3
-  set_verification_result "mismatch"
-  return 1
+  set_verification_result "unknown"
+  return 0
 }
 
 add_display_index_candidate "$DISPLAY_INDEX"
@@ -482,6 +547,38 @@ add_display_index_candidate 1
 add_display_index_candidate 2
 add_display_index_candidate 3
 add_display_index_candidate 4
+
+if [ "$COMMAND" = "--probe-ddc" ]; then
+  if try_betterdisplay_query >/dev/null 2>&1; then
+    printf '%s\n' "OK"
+    exit 0
+  fi
+
+  if try_betterdisplay_target_probe >/dev/null 2>&1; then
+    printf '%s\n' "UNKNOWN"
+    exit 0
+  fi
+
+  if try_ddcctl_probe_binary "$BUNDLED_DDCCTL" >/dev/null 2>&1; then
+    printf '%s\n' "OK"
+    exit 0
+  fi
+
+  if command -v ddcctl >/dev/null 2>&1; then
+    if try_ddcctl_probe_binary "$(command -v ddcctl)" >/dev/null 2>&1; then
+      printf '%s\n' "OK"
+      exit 0
+    fi
+  fi
+
+  if [ -n "$LAST_ERROR" ]; then
+    echo "$LAST_ERROR" >&2
+  else
+    echo "没有可用的 macOS DDC 辅助程序。请安装 BetterDisplay CLI，或检查打包的 ddcctl 是否存在。" >&2
+  fi
+
+  exit 1
+fi
 
 if [ "$COMMAND" = "--query-input" ]; then
   if try_betterdisplay_query; then

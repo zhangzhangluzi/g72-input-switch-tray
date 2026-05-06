@@ -1,6 +1,5 @@
 "use strict";
 
-const fs = require("fs/promises");
 const path = require("path");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
@@ -8,19 +7,15 @@ const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 
 async function setFinderInvisible(appPath) {
-  const setFilePath = "/usr/bin/SetFile";
+  await execFileAsync("/usr/bin/chflags", ["hidden", appPath]);
 
   try {
-    await fs.access(setFilePath);
-    await execFileAsync(setFilePath, ["-a", "V", appPath]);
-    return;
+    await execFileAsync("/usr/bin/xattr", ["-d", "com.apple.FinderInfo", appPath]);
   } catch (error) {
-    if (error.code !== "ENOENT") {
+    if (error.code !== 1) {
       throw error;
     }
   }
-
-  await execFileAsync("/usr/bin/chflags", ["hidden", appPath]);
 }
 
 exports.default = async function hideMacHelperApps(context) {

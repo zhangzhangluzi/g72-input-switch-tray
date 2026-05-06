@@ -10,12 +10,14 @@ param(
 
     [switch]$ReadInputValue,
 
-    [switch]$ReadCapabilities
+    [switch]$ReadCapabilities,
+
+    [switch]$ProbeDdc
 )
 
 $ErrorActionPreference = "Stop"
 
-if (-not $ListOnly -and -not $ReadInputValue -and -not $ReadCapabilities) {
+if (-not $ListOnly -and -not $ReadInputValue -and -not $ReadCapabilities -and -not $ProbeDdc) {
     if ([string]::IsNullOrWhiteSpace($MonitorName) -and [string]::IsNullOrWhiteSpace($GdiDeviceName)) {
         throw "MonitorName or GdiDeviceName was not provided."
     }
@@ -530,6 +532,20 @@ try {
         }
 
         throw "Reading capabilities failed for '$targetDisplayName'."
+    }
+
+    if ($ProbeDdc) {
+        $physicalMonitorCount = [int]$physicalMonitors.Length
+        [NativeDisplayMapper]::ReleasePhysicalMonitors($physicalMonitors)
+
+        Write-Output (@{
+            ok = $true
+            monitor = $targetDisplayName
+            gdiDeviceName = $targetMonitorEntry.GdiDeviceName
+            physicalMonitorCount = $physicalMonitorCount
+            probeScope = "physicalMonitorHandle"
+        } | ConvertTo-Json -Compress)
+        exit 0
     }
 
     $switchSucceeded = $false

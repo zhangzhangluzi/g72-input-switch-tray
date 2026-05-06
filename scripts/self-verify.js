@@ -27,7 +27,7 @@ function verifyMainSourceBusinessGuards() {
   );
   assert.match(mainSource, /MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000/u);
   assert.match(mainSource, /screen\.getPrimaryDisplay\(\)\?\.id/u);
-  assert.match(mainSource, /DISPLAY_NAME_FALLBACK_ALLOWED: monitorContext\.display\.displayNameIsUnique \? "1" : "0"/u);
+  assert.match(mainSource, /DISPLAY_NAME_FALLBACK_ALLOWED: displaySummary\.displayNameIsUnique \? "1" : "0"/u);
   assert.match(mainSource, /const resolvedMonitorId = normalizeText\(matchingMonitorConfig\?\.id\) \|\| displaySummary\.id;/u);
   assert.match(mainSource, /function withDisplayNameUniqueness/u);
   assert.match(mainSource, /async function attemptPendingWindowsRestores\(\{\s*monitorId: targetMonitorId = null,\s*displaySummaries = null,/u);
@@ -55,6 +55,23 @@ function verifyMainSourceBusinessGuards() {
   assert.doesNotMatch(mainSource, /remainingMatches\[index\]\.electronDisplay = remainingDisplays\[index\]/u);
   assert.doesNotMatch(mainSource, /candidate\.width === display\?\.bounds\?\.width/u);
   assert.doesNotMatch(mainSource, /Skipping Windows desktop detach for primary display/u);
+  assert.match(mainSource, /promoteWindowsPrimaryAwayBeforeSwitch/u);
+  assert.match(mainSource, /-PromotePrimaryAwayFromMonitor/u);
+  assert.match(mainSource, /getWindowsDdcCapableTopologyDisplays/u);
+  assert.match(mainSource, /getMacDdcCapableDisplaySummaries/u);
+  assert.match(mainSource, /statusText = "当前输入未知"/u);
+  assert.doesNotMatch(mainSource, /statusText = "读取失败"/u);
+  assert.doesNotMatch(mainSource, /没有真正切到/u);
+  assert.match(mainSource, /timeout: HELPER_COMMAND_TIMEOUT_MS/u);
+  assert.match(mainSource, /SYSTEM_PROFILER_COMMAND_TIMEOUT_MS = 45000/u);
+  assert.match(mainSource, /LOCAL_REQUEST_BODY_LIMIT_BYTES = 64 \* 1024/u);
+  assert.match(mainSource, /switchInFlightByMonitorId/u);
+  assert.match(mainSource, /async function switchMonitorUnlocked/u);
+  assert.match(mainSource, /outcomeMessage: successMessages\.outcomeMessage/u);
+  assert.match(mainSource, /createHttpError\(413, "请求内容过大。"\)/u);
+  assert.match(mainSource, /function hasMacPhysicalIdentity/u);
+  assert.match(mainSource, /function runSwitchCandidateSequence/u);
+  assert.match(mainSource, /getExpectedProbeInputValues\(target\.inputValue, monitorContext\.monitor\)/u);
 }
 
 function verifyLocalOnlyDocs() {
@@ -73,6 +90,8 @@ function verifyLocalOnlyDocs() {
   assert.doesNotMatch(handoffDoc, /includes a first peer-confirmation layer/u);
   assert.doesNotMatch(handoffDoc, /ownership endpoint on the LAN/u);
   assert.doesNotMatch(handoffDoc, /discovered Windows peer/u);
+  assert.doesNotMatch(handoffDoc, /confirmed mismatch after readback is a real switch failure/u);
+  assert.doesNotMatch(handoffDoc, /readback still stays on the old input, the failure means/u);
 }
 
 function verifyPinnedMacDdcctlBuildScript() {
@@ -83,7 +102,53 @@ function verifyPinnedMacDdcctlBuildScript() {
   assert.match(buildScript, /git -C "\$WORK_DIR" fetch --depth 1 origin "\$DDCCTL_COMMIT"/u);
 }
 
-function verifyWindowsScriptSyntax() {
+function verifyWindowsHelperSourceGuards() {
+  const topologyScript = fs.readFileSync(
+    path.resolve(__dirname, "..", "resources", "windows", "display-topology.ps1"),
+    "utf8"
+  );
+  const setInputScript = fs.readFileSync(
+    path.resolve(__dirname, "..", "resources", "windows", "set-input.ps1"),
+    "utf8"
+  );
+
+  assert.match(topologyScript, /PromotePrimaryAwayFromDisplay/u);
+  assert.match(topologyScript, /ApplyPrimaryDisplayWithStableLayout/u);
+  assert.match(topologyScript, /display\.PositionX - offsetX/u);
+  assert.match(topologyScript, /display\.PositionY - offsetY/u);
+  assert.match(topologyScript, /RollbackDisplayModes/u);
+  assert.match(setInputScript, /\[switch\]\$ProbeDdc/u);
+  assert.match(setInputScript, /physicalMonitorCount/u);
+  assert.match(setInputScript, /probeScope = "physicalMonitorHandle"/u);
+  assert.doesNotMatch(setInputScript, /capabilitiesAvailable/u);
+}
+
+function verifyCiWorkflowTriggers() {
+  const workflowPath = path.resolve(__dirname, "..", ".github", "workflows", "release.yml");
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+
+  assert.match(workflow, /pull_request:/u);
+  assert.match(workflow, /branches:\s*\n\s*- main/u);
+  assert.match(workflow, /tags:\s*\n\s*- "v\*"/u);
+}
+
+function findPowerShellCommand() {
+  for (const command of ["pwsh", "powershell.exe"]) {
+    try {
+      execFileSync(command, ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], {
+        stdio: "pipe",
+        encoding: "utf8",
+      });
+      return command;
+    } catch {
+      // Try the next PowerShell executable.
+    }
+  }
+
+  return null;
+}
+
+function verifyWindowsScriptSyntax(powerShellCommand) {
   const topologyScriptPath = path.resolve(
     __dirname,
     "..",
@@ -114,7 +179,7 @@ foreach ($script in $scripts) {
 }
 `;
 
-  execFileSync("powershell.exe", ["-NoProfile", "-Command", syntaxCheckCommand], {
+  execFileSync(powerShellCommand, ["-NoProfile", "-Command", syntaxCheckCommand], {
     stdio: "pipe",
     encoding: "utf8",
   });
@@ -126,7 +191,9 @@ function readPlistJson(plistPath) {
 
 function isMacPathHidden(appPath) {
   try {
-    return run("/usr/bin/mdls", ["-name", "kMDItemFSInvisible", "-raw", appPath]) === "1";
+    if (run("/usr/bin/mdls", ["-name", "kMDItemFSInvisible", "-raw", appPath]) === "1") {
+      return true;
+    }
   } catch {
     // Fall through to filesystem flags below.
   }
@@ -268,22 +335,19 @@ function verifyMacDdcctlFallbackScript() {
   });
 
   writeFakeDdcctlBinary(fakeBinaryPath, "unchanged");
-  let failure = null;
-  try {
-    execFileSync("/bin/sh", [switchScriptPath, "16"], {
-      env: baseEnv,
-      stdio: "pipe",
-      encoding: "utf8",
-    });
-  } catch (error) {
-    failure = error;
-  }
+  const mismatchOutput = execFileSync("/bin/sh", [switchScriptPath, "16"], {
+    env: baseEnv,
+    stdio: "pipe",
+    encoding: "utf8",
+  });
+  assert.match(mismatchOutput, /UNCONFIRMED/u);
 
-  assert.ok(failure, "ddcctl fallback should fail when readback stays on the old input");
-  assert.match(
-    `${failure.stderr || failure.message}`,
-    /ddcctl 已发送输入切换命令，但当前输入仍是 6，未匹配目标值集合：16 9 7/
-  );
+  const probeOutput = execFileSync("/bin/sh", [switchScriptPath, "--probe-ddc"], {
+    env: baseEnv,
+    stdio: "pipe",
+    encoding: "utf8",
+  }).trim();
+  assert.equal(probeOutput, "OK");
 
   writeFakeDdcctlBinary(fakeBinaryPath, "query-fails");
   const unconfirmedOutput = execFileSync("/bin/sh", [switchScriptPath, "16"], {
@@ -329,7 +393,7 @@ function verifyMacDdcctlFallbackScript() {
   );
 }
 
-function writeFakeBetterDisplayBinary(fakeBinaryPath) {
+function writeFakeBetterDisplayBinary(fakeBinaryPath, mode = "normal") {
   const script = `#!/bin/sh
 set -eu
 
@@ -349,6 +413,10 @@ case "$joined" in
     exit 0
     ;;
   get*" -nameLike=Fallback Monitor "*" -vcp=inputSelect "*|get*" -nameLike=Fallback Monitor"*" -vcp=inputSelect")
+    if [ "${mode}" = "write-only" ]; then
+      echo "readback unavailable" >&2
+      exit 1
+    fi
     echo "16"
     exit 0
     ;;
@@ -357,6 +425,10 @@ case "$joined" in
     exit 0
     ;;
   get*" -nameLike=Fallback Monitor "*" -vcp=0x60 "*|get*" -nameLike=Fallback Monitor"*" -vcp=0x60")
+    if [ "${mode}" = "write-only" ]; then
+      echo "readback unavailable" >&2
+      exit 1
+    fi
     echo "16"
     exit 0
     ;;
@@ -406,6 +478,43 @@ function verifyMacBetterDisplayFallbackScript() {
   assert.equal(queryOutput, "16");
 }
 
+function verifyMacBetterDisplayWriteOnlyProbeScript() {
+  const switchScriptPath = path.resolve(
+    __dirname,
+    "..",
+    "resources",
+    "mac",
+    "switch-input.sh"
+  );
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "monitor-input-switch-bd-writeonly-selftest-"));
+  const fakeBinaryPath = path.join(tempDir, "fake-betterdisplay");
+  const baseEnv = {
+    ...process.env,
+    DISPLAY_NAME: "Fallback Monitor",
+    DISPLAY_ID: "777",
+    DISPLAY_NAME_FALLBACK_ALLOWED: "1",
+    BETTERDISPLAY_APP_PATH: fakeBinaryPath,
+    BUNDLED_DDCCTL_PATH: path.join(tempDir, "missing-ddcctl"),
+    PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+  };
+
+  writeFakeBetterDisplayBinary(fakeBinaryPath, "write-only");
+
+  const probeOutput = execFileSync("/bin/sh", [switchScriptPath, "--probe-ddc"], {
+    env: baseEnv,
+    stdio: "pipe",
+    encoding: "utf8",
+  }).trim();
+  assert.equal(probeOutput, "UNKNOWN");
+
+  const switchOutput = execFileSync("/bin/sh", [switchScriptPath, "16"], {
+    env: baseEnv,
+    stdio: "pipe",
+    encoding: "utf8",
+  });
+  assert.match(switchOutput, /UNCONFIRMED/u);
+}
+
 function verifyMacHelperAppsIfAvailable() {
   if (process.env.SELF_VERIFY_REQUIRE_MAC_APP_BUNDLE !== "1") {
     return;
@@ -437,14 +546,18 @@ function main() {
   verifyMainSourceBusinessGuards();
   verifyLocalOnlyDocs();
   verifyPinnedMacDdcctlBuildScript();
+  verifyWindowsHelperSourceGuards();
+  verifyCiWorkflowTriggers();
 
-  if (process.platform === "win32") {
-    verifyWindowsScriptSyntax();
+  const powerShellCommand = findPowerShellCommand();
+  if (powerShellCommand) {
+    verifyWindowsScriptSyntax(powerShellCommand);
   }
 
   if (process.platform === "darwin") {
     verifyMacDdcctlFallbackScript();
     verifyMacBetterDisplayFallbackScript();
+    verifyMacBetterDisplayWriteOnlyProbeScript();
     verifyMacHelperAppsIfAvailable();
   }
 

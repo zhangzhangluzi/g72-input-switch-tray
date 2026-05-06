@@ -53,7 +53,7 @@ This project now uses one rule set only:
 - If the monitor reports its current input reliably, the app shows it.
 - If the monitor does not report it reliably, the UI must say that the state is unknown.
 - The app must not claim that an inactive interface definitely has or does not have a connected machine behind it.
-- A confirmed mismatch after readback is a real switch failure; missing readback support is not.
+- A write helper failure is a switch failure; a readback mismatch or missing readback is diagnostic-only and must be shown as unknown / unconfirmed.
 - On Windows, only displays that can be stably mapped to a local external screen are allowed into the switchable list.
 - On macOS, if `ddcctl` cannot reliably report the external-display count, the fallback path must stop instead of scanning candidate indices blindly.
 - On macOS, topology refresh must reuse a short-lived cached `system_profiler` result during steady state and force-refresh it only on real display add / remove events.
@@ -62,10 +62,8 @@ This project now uses one rule set only:
 
 ### macOS side
 
-- If macOS writes the input value and readback still stays on the old input, the failure means:
-  - wrong input value, or
-  - target interface has no stable signal, or
-  - the monitor acknowledged the write but did not actually switch
+- If macOS writes the input value and readback stays on the old input, the UI records the command as unconfirmed.
+- The raw helper output may still be useful for diagnostics, but the app must not turn unreliable readback into a hard failure.
 
 ### Windows side
 

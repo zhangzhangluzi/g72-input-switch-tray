@@ -15,6 +15,10 @@ const TRAY_REBUILD_DELAY_MS = 1200;
 const TRAY_HEALTHCHECK_INTERVAL_MS = 5000;
 const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
 const MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000;
+const DDC_PROBE_CACHE_TTL_MS = 10000;
+const HELPER_COMMAND_TIMEOUT_MS = 15000;
+const SYSTEM_PROFILER_COMMAND_TIMEOUT_MS = 45000;
+const LOCAL_REQUEST_BODY_LIMIT_BYTES = 64 * 1024;
 const TARGET_SLOTS = [
   { id: "dp1", title: "DP1", defaultInputValue: 15 },
   { id: "dp2", title: "DP2", defaultInputValue: 16 },
@@ -46,10 +50,14 @@ let explorerSignature = null;
 let refreshMenuInFlight = false;
 let refreshMenuQueued = false;
 let windowsRestoreInFlight = false;
+let windowsTopologyOperationQueue = Promise.resolve();
+const switchInFlightByMonitorId = new Map();
 let macDisplayMetadataCache = {
   fetchedAt: 0,
   displays: [],
 };
+let windowsDdcProbeCache = new Map();
+let macDdcProbeCache = new Map();
 let state = createDefaultState();
 
 app.commandLine.appendSwitch("log-level", "3");
@@ -108,14 +116,33 @@ app.whenReady().then(async () => {
     app.dock.hide();
   }
 
-  state = loadState();
-  saveState(state);
-  await syncMonitorConfigsFromLocalDisplays({ persist: true });
+  try {
+    state = loadState();
+  } catch (error) {
+    appendDiagnosticLog("Failed to load state during startup", error);
+    state = createDefaultState();
+  }
+
   startControlServer();
   startDisplayChangeWatcher();
   startWindowsRestoreWatcher();
   startWindowsTrayWatcher();
   createTray();
+  void refreshMenu();
+
+  try {
+    saveState(state);
+  } catch (error) {
+    appendDiagnosticLog("Failed to persist initial state during startup", error);
+  }
+
+  try {
+    await syncMonitorConfigsFromLocalDisplays({ persist: true });
+  } catch (error) {
+    appendDiagnosticLog("Failed to synchronize displays during startup", error);
+    notify("显示器列表初始化失败，可打开设置页或稍后重试。");
+  }
+
   void refreshMenu();
 });
 
@@ -368,7 +395,8 @@ function startControlServer() {
         return;
       }
 
-      response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+      response.writeHead(statusCode, { "Content-Type": "text/plain; charset=utf-8" });
       response.end(`请求失败：${normalizeText(error.message) || "未知错误"}`);
     });
   });
@@ -497,13 +525,13 @@ async function handleControlRequest(request, response) {
 
 async function handleSwitchRequest(response, requestUrl, monitorId, targetId) {
   try {
-    await switchMonitor(monitorId, targetId, {
+    const result = await switchMonitor(monitorId, targetId, {
       notifyOnSuccess: true,
       showErrorDialog: false,
     });
     redirectToSettingsPage(response, requestUrl, {
       status: "success",
-      message: "切换命令已发送。",
+      message: result?.outcomeMessage || "切换命令已发送，结果待确认。",
     });
   } catch (error) {
     redirectToSettingsPage(response, requestUrl, {
@@ -514,6 +542,7 @@ async function handleSwitchRequest(response, requestUrl, monitorId, targetId) {
 }
 
 async function handleConfigSave(request, response, requestUrl, monitorId) {
+  assertFormUrlEncodedRequest(request);
   const body = await readRequestBody(request);
   const form = new URLSearchParams(body);
   const existingMonitorConfig = getStoredMonitorConfigs().find(
@@ -568,11 +597,37 @@ async function handleWindowsRefreshRequest(response, requestUrl, monitorId = nul
 }
 
 async function switchMonitor(monitorId, targetId, options = {}) {
+  const normalizedMonitorId = normalizeText(monitorId);
+  const parsedTargetId = parseTargetId(targetId);
+  const lockKey = normalizedMonitorId || `raw:${normalizeText(monitorId)}`;
+  if (lockKey && switchInFlightByMonitorId.has(lockKey)) {
+    throw new Error("这块屏幕正在执行切换，请等待当前命令完成。");
+  }
+
+  const switchTask = switchMonitorUnlocked(normalizedMonitorId, parsedTargetId, options);
+  if (lockKey) {
+    switchInFlightByMonitorId.set(lockKey, switchTask);
+  }
+
+  try {
+    return await switchTask;
+  } finally {
+    if (lockKey && switchInFlightByMonitorId.get(lockKey) === switchTask) {
+      switchInFlightByMonitorId.delete(lockKey);
+    }
+  }
+}
+
+async function switchMonitorUnlocked(monitorId, targetId, options = {}) {
   const { notifyOnSuccess = true, showErrorDialog = false } = options;
   const monitorContext = await getMonitorContextById(monitorId);
 
   if (!monitorContext) {
     throw new Error("当前没有找到这块本机屏幕，可能它已经不在当前主机上。");
+  }
+
+  if (!targetId) {
+    throw new Error("目标接口无效。");
   }
 
   const monitorConfig = monitorContext.monitor;
@@ -622,6 +677,14 @@ async function switchMonitor(monitorId, targetId, options = {}) {
     if (notifyOnSuccess) {
       notify(successMessages.notificationMessage);
     }
+
+    return {
+      monitorId: monitorContext.id,
+      targetId,
+      verificationStatus: switchResult?.verificationStatus || "unconfirmed",
+      outcomeMessage: successMessages.outcomeMessage,
+      notificationMessage: successMessages.notificationMessage,
+    };
   } catch (error) {
     const userFacingError = formatMonitorSwitchError(monitorContext, targetId, error);
     recordSwitchOutcome("error", monitorId, targetId, userFacingError.message);
@@ -641,7 +704,7 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
   const switchingToLocalInterface = isLocalInterfaceTarget(targetId, monitorConfig);
   const topologyDisplays = await getWindowsTopologyDisplays();
   const attachedTopologyDisplayCount = topologyDisplays.filter((display) => display.attached).length;
-  const topologyDisplay = topologyDisplays.find((display) =>
+  let topologyDisplay = topologyDisplays.find((display) =>
     isTopologyDisplayMatchMonitor(display, monitorContext)
   );
   if (!topologyDisplay?.attached) {
@@ -652,14 +715,21 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
     );
   }
 
+  if (!switchingToLocalInterface && topologyDisplay.primary) {
+    topologyDisplay = await promoteWindowsPrimaryAwayBeforeSwitch(
+      monitorContext,
+      topologyDisplay,
+      attachedTopologyDisplayCount
+    );
+  }
+
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
   const selectorArgs = getWindowsMonitorSelectorArgs(monitorContext);
   const candidates = getInputCandidates(target, monitorConfig);
-  const expectedValues = getExpectedProbeInputValues(target.inputValue);
-  const attachedDisplayCountBeforeSwitch = await getCurrentWindowsAttachedDisplayCount();
-  let verificationStatus = "unconfirmed";
+  const expectedValues = getExpectedProbeInputValues(target.inputValue, monitorConfig);
+  const attachedDisplayCountBeforeSwitch = attachedTopologyDisplayCount;
 
-  await runCandidateSequence(candidates, async (candidate) => {
+  const switchResult = await runSwitchCandidateSequence(candidates, async (candidate) => {
     await runCommand("powershell.exe", [
       "-NoProfile",
       "-ExecutionPolicy",
@@ -670,20 +740,21 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
       "-InputValue",
       String(candidate),
     ]);
+
     const verificationResult = await verifyWindowsSwitchOutcomeForContext(
       monitorContext,
       target,
       expectedValues
     );
-    if (verificationResult.status === "mismatch") {
-      throw new Error(verificationResult.message);
-    }
 
-    verificationStatus = verificationResult.status;
+    return {
+      verificationStatus: verificationResult.status,
+      message: verificationResult.message,
+    };
   });
 
   if (
-    verificationStatus === "confirmed" &&
+    switchResult.verificationStatus === "confirmed" &&
     !switchingToLocalInterface &&
     shouldUseWindowsDisplayHandoffForMonitor(monitorConfig, attachedTopologyDisplayCount)
   ) {
@@ -698,24 +769,32 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
   }
 
   return {
-    verificationStatus,
+    verificationStatus: switchResult.verificationStatus,
+    message: switchResult.message,
   };
 }
 
 async function switchOnMacForContext(monitorContext, targetId, target) {
   const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
   const candidates = getInputCandidates(target, monitorContext.monitor);
-  let verificationStatus = "confirmed";
+  const expectedValues = getExpectedProbeInputValues(target.inputValue, monitorContext.monitor);
 
-  await runCandidateSequence(candidates, async (candidate) => {
+  const switchResult = await runSwitchCandidateSequence(candidates, async (candidate) => {
     const output = await runCommand("/bin/sh", [scriptPath, String(candidate)], {
-      env: getMacSwitchScriptEnvForContext(monitorContext),
+      env: {
+        ...getMacSwitchScriptEnvForContext(monitorContext),
+        INPUT_EXPECTED_VALUES: expectedValues.join(" "),
+      },
     });
-    verificationStatus = /\bUNCONFIRMED\b/u.test(output) ? "unconfirmed" : "confirmed";
+    return {
+      verificationStatus: /\bUNCONFIRMED\b/u.test(output) ? "unconfirmed" : "confirmed",
+      message: "",
+    };
   });
 
   return {
-    verificationStatus,
+    verificationStatus: switchResult.verificationStatus,
+    message: switchResult.message,
   };
 }
 
@@ -750,7 +829,7 @@ function formatMonitorSwitchError(monitorContext, targetId, error) {
     return new Error(
       `${getMonitorDisplayTitle(
         monitorContext
-      )} 没有真正切到 ${target.label}。通常是输入值填错，或者目标接口当前没有稳定信号。`
+      )} 已发送切换命令到 ${target.label}，但当前显示器没有提供可靠回读，结果待人工确认。`
     );
   }
 
@@ -787,10 +866,10 @@ async function verifyWindowsSwitchOutcomeForContext(monitorContext, target, expe
 
   if (Number.isInteger(lastObservedValue)) {
     return {
-      status: "mismatch",
+      status: "unconfirmed",
       message: `${getMonitorDisplayTitle(
         monitorContext
-      )} 当前输入仍是 ${lastObservedValue}，未匹配目标值集合：${expectedValues.join(" ")}`,
+      )} 已发送切换命令，但当前输入回读仍是 ${lastObservedValue}，结果待人工确认。`,
     };
   }
 
@@ -880,21 +959,97 @@ async function getMacCurrentInputResultForContext(monitorContext) {
 }
 
 function getMacSwitchScriptEnvForContext(monitorContext) {
+  return getMacSwitchScriptEnvForDisplay(monitorContext.display);
+}
+
+function getMacSwitchScriptEnvForDisplay(displaySummary) {
   const env = {
-    DISPLAY_NAME: getMonitorDisplayName(monitorContext),
-    DISPLAY_INDEX: String(monitorContext.display.index),
-    DISPLAY_NAME_FALLBACK_ALLOWED: monitorContext.display.displayNameIsUnique ? "1" : "0",
+    DISPLAY_NAME: getMonitorDisplayName({ display: displaySummary }),
+    DISPLAY_INDEX: String(Number.isInteger(displaySummary.index) ? displaySummary.index : 1),
+    DISPLAY_NAME_FALLBACK_ALLOWED: displaySummary.displayNameIsUnique ? "1" : "0",
   };
 
-  const preferredDisplayId = Number.isInteger(monitorContext.display.macSystemDisplayId)
-    ? monitorContext.display.macSystemDisplayId
-    : monitorContext.display.electronDisplayId;
+  const preferredDisplayId = Number.isInteger(displaySummary.macSystemDisplayId)
+    ? displaySummary.macSystemDisplayId
+    : displaySummary.electronDisplayId;
 
   if (Number.isInteger(preferredDisplayId)) {
     env.DISPLAY_ID = String(preferredDisplayId);
   }
 
   return env;
+}
+
+async function getMacDdcCapableDisplaySummaries(displaySummaries) {
+  if (process.platform !== "darwin" || !Array.isArray(displaySummaries)) {
+    return displaySummaries;
+  }
+
+  const probeResults = await Promise.all(
+    displaySummaries.map(async (displaySummary) => ({
+      displaySummary,
+      probeResult: await getMacDdcProbeResult(displaySummary),
+    }))
+  );
+
+  return probeResults
+    .filter(({ probeResult }) => probeResult.ok)
+    .map(({ displaySummary }) => displaySummary);
+}
+
+async function getMacDdcProbeResult(displaySummary) {
+  const cacheKey =
+    normalizeText(displaySummary?.displayKey) ||
+    `mac-display:${displaySummary?.electronDisplayId || ""}:${displaySummary?.index || ""}`;
+  const cachedResult = macDdcProbeCache.get(cacheKey);
+  if (cachedResult && Date.now() - cachedResult.checkedAt < DDC_PROBE_CACHE_TTL_MS) {
+    return cachedResult;
+  }
+
+  const scriptPath = getBundledResourcePath("mac", "switch-input.sh");
+  try {
+    const output = await runCommand("/bin/sh", [scriptPath, "--probe-ddc"], {
+      env: getMacSwitchScriptEnvForDisplay(displaySummary),
+    });
+    const probeStatus = parseMacDdcProbeOutput(output);
+    const nextResult = {
+      ok: probeStatus === "ok" || (probeStatus === "unknown" && hasMacPhysicalIdentity(displaySummary)),
+      status: probeStatus,
+      checkedAt: Date.now(),
+      error: "",
+    };
+    macDdcProbeCache.set(cacheKey, nextResult);
+    return nextResult;
+  } catch (error) {
+    const nextResult = {
+      ok: false,
+      status: "failed",
+      checkedAt: Date.now(),
+      error: normalizeText(error.message),
+    };
+    macDdcProbeCache.set(cacheKey, nextResult);
+    appendDiagnosticLog(`macOS DDC probe failed for ${getMonitorDisplayName({ display: displaySummary })}`, error);
+    return nextResult;
+  }
+}
+
+function parseMacDdcProbeOutput(output) {
+  const normalized = normalizeText(output).toUpperCase();
+  if (/\bOK\b/u.test(normalized)) {
+    return "ok";
+  }
+
+  if (/\bUNKNOWN\b/u.test(normalized)) {
+    return "unknown";
+  }
+
+  return "unknown";
+}
+
+function hasMacPhysicalIdentity(displaySummary) {
+  const vendorId = normalizeText(displaySummary?.macVendorId).toLowerCase();
+  const productId = normalizeText(displaySummary?.macProductId).toLowerCase();
+  return Boolean(vendorId && productId && !/^(0x)?0+$/u.test(vendorId) && !/^(0x)?0+$/u.test(productId));
 }
 
 function parseMacInputValueOutput(output) {
@@ -939,6 +1094,35 @@ function buildWindowsRestoreLayout(topologyDisplay) {
     positionX,
     positionY,
   };
+}
+
+async function promoteWindowsPrimaryAwayBeforeSwitch(
+  monitorContext,
+  topologyDisplay,
+  attachedDisplayCount
+) {
+  if (!topologyDisplay?.primary) {
+    return topologyDisplay;
+  }
+
+  if (!Number.isInteger(attachedDisplayCount) || attachedDisplayCount < 2) {
+    throw new Error(
+      `${getMonitorDisplayTitle(
+        monitorContext
+      )} 是 Windows 当前唯一主屏，切走前没有另一块已连接屏可升为主屏。`
+    );
+  }
+
+  await runWindowsTopologyCommand([
+    "-MonitorName",
+    getWindowsTopologySelectorValue(monitorContext),
+    "-PromotePrimaryAwayFromMonitor",
+  ]);
+
+  return waitForWindowsMonitorNoLongerPrimary(
+    monitorContext,
+    "Windows 没有在切走前把另一块已连接屏升为主屏。"
+  );
 }
 
 async function detachWindowsDisplayForMonitor(
@@ -997,6 +1181,23 @@ async function waitForWindowsMonitorAttachmentState(monitorConfig, expectedAttac
     const topologyDisplays = await getWindowsTopologyDisplays();
     if (isWindowsMonitorAttachedInTopology(topologyDisplays, monitorConfig) === expectedAttached) {
       return;
+    }
+
+    await delay(250);
+  }
+
+  throw new Error(errorMessage);
+}
+
+async function waitForWindowsMonitorNoLongerPrimary(monitorConfig, errorMessage) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 8000) {
+    const topologyDisplays = await getWindowsTopologyDisplays();
+    const topologyDisplay = topologyDisplays.find((display) =>
+      isTopologyDisplayMatchMonitor(display, monitorConfig)
+    );
+    if (topologyDisplay?.attached && !topologyDisplay.primary) {
+      return topologyDisplay;
     }
 
     await delay(250);
@@ -1131,6 +1332,8 @@ function startDisplayChangeWatcher() {
 
 async function handleLocalDisplayTopologyChange() {
   try {
+    windowsDdcProbeCache.clear();
+    macDdcProbeCache.clear();
     const displaySummaries = await syncMonitorConfigsFromLocalDisplays({
       persist: true,
       forceMacDisplayMetadataRefresh: true,
@@ -1411,8 +1614,11 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
     const attachedTopologyDisplays = topologyDisplays
       .filter((display) => display.attached)
       .sort(compareDisplayLikeObjects);
+    const ddcCapableTopologyDisplays = await getWindowsDdcCapableTopologyDisplays(
+      attachedTopologyDisplays
+    );
     const switchableTopologyDisplays = mapWindowsTopologyDisplaysToElectronDisplays(
-      attachedTopologyDisplays,
+      ddcCapableTopologyDisplays,
       orderedDisplays
     )
       .filter(({ electronDisplay }) => Boolean(electronDisplay) && !electronDisplay.internal);
@@ -1477,46 +1683,50 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
   let secondaryIndex = 2;
   const singleDisplayOnly = externalDisplays.length <= 1;
 
-  return withDisplayNameUniqueness(externalDisplays.map((display, index) => {
-    const macProfilerDisplay = matchMacSystemProfilerDisplay(
-      display,
-      macProfilerDisplays,
-      usedMacProfilerDisplayKeys
-    );
-    const roleLabel = singleDisplayOnly
-      ? "当前机器屏幕"
-      : display.primary
-        ? "主屏幕"
-        : `附屏幕 ${secondaryIndex++}`;
-    const displayKey = buildDisplayKeyForLocalDisplay(display, index + 1, null, macProfilerDisplay);
-    const detectedName = normalizeText(macProfilerDisplay?.name || display.label || "");
+  const externalDisplaySummaries = withDisplayNameUniqueness(
+    externalDisplays.map((display, index) => {
+      const macProfilerDisplay = matchMacSystemProfilerDisplay(
+        display,
+        macProfilerDisplays,
+        usedMacProfilerDisplayKeys
+      );
+      const roleLabel = singleDisplayOnly
+        ? "当前机器屏幕"
+        : display.primary
+          ? "主屏幕"
+          : `附屏幕 ${secondaryIndex++}`;
+      const displayKey = buildDisplayKeyForLocalDisplay(display, index + 1, null, macProfilerDisplay);
+      const detectedName = normalizeText(macProfilerDisplay?.name || display.label || "");
 
-    return {
-      id: createMonitorId(displayKey),
-      displayKey,
-      index: index + 1,
-      roleLabel,
-      detectedName,
-      resolution: `${display.bounds.width} × ${display.bounds.height}`,
-      position: `${display.bounds.x}, ${display.bounds.y}`,
-      internal: Boolean(display.internal),
-      electronDisplayId: Number.isInteger(display.id) ? display.id : null,
-      macSystemDisplayId: Number.isInteger(macProfilerDisplay?.systemDisplayId)
-        ? macProfilerDisplay.systemDisplayId
-        : null,
-      macVendorId: normalizeText(macProfilerDisplay?.vendorId).toLowerCase(),
-      macProductId: normalizeText(macProfilerDisplay?.productId).toLowerCase(),
-      macSerialNumber: normalizeText(macProfilerDisplay?.serialNumber),
-      gdiDeviceName: "",
-      productCode: "",
-      bounds: {
-        x: display.bounds.x,
-        y: display.bounds.y,
-        width: display.bounds.width,
-        height: display.bounds.height,
-      },
-    };
-  }));
+      return {
+        id: createMonitorId(displayKey),
+        displayKey,
+        index: index + 1,
+        roleLabel,
+        detectedName,
+        resolution: `${display.bounds.width} × ${display.bounds.height}`,
+        position: `${display.bounds.x}, ${display.bounds.y}`,
+        internal: Boolean(display.internal),
+        electronDisplayId: Number.isInteger(display.id) ? display.id : null,
+        macSystemDisplayId: Number.isInteger(macProfilerDisplay?.systemDisplayId)
+          ? macProfilerDisplay.systemDisplayId
+          : null,
+        macVendorId: normalizeText(macProfilerDisplay?.vendorId).toLowerCase(),
+        macProductId: normalizeText(macProfilerDisplay?.productId).toLowerCase(),
+        macSerialNumber: normalizeText(macProfilerDisplay?.serialNumber),
+        gdiDeviceName: "",
+        productCode: "",
+        bounds: {
+          x: display.bounds.x,
+          y: display.bounds.y,
+          width: display.bounds.width,
+          height: display.bounds.height,
+        },
+      };
+    })
+  );
+
+  return getMacDdcCapableDisplaySummaries(externalDisplaySummaries);
 }
 
 function withDisplayNameUniqueness(displaySummaries) {
@@ -1619,7 +1829,9 @@ async function getMacSystemProfilerDisplays({ forceRefresh = false } = {}) {
   }
 
   try {
-    const output = await runCommand("/usr/sbin/system_profiler", ["SPDisplaysDataType", "-json"]);
+    const output = await runCommand("/usr/sbin/system_profiler", ["SPDisplaysDataType", "-json"], {
+      timeout: SYSTEM_PROFILER_COMMAND_TIMEOUT_MS,
+    });
     const parsed = JSON.parse(output);
     const displays = normalizeMacSystemProfilerDisplays(parsed);
     macDisplayMetadataCache = {
@@ -1813,6 +2025,70 @@ function normalizeWindowsTopologyDisplay(display) {
   };
 }
 
+async function getWindowsDdcCapableTopologyDisplays(attachedTopologyDisplays) {
+  if (!Array.isArray(attachedTopologyDisplays) || attachedTopologyDisplays.length === 0) {
+    return [];
+  }
+
+  const probeResults = await Promise.all(
+    attachedTopologyDisplays.map(async (topologyDisplay) => ({
+      topologyDisplay,
+      probeResult: await getWindowsDdcProbeResult(topologyDisplay),
+    }))
+  );
+
+  return probeResults
+    .filter(({ probeResult }) => probeResult.ok)
+    .map(({ topologyDisplay }) => topologyDisplay);
+}
+
+async function getWindowsDdcProbeResult(topologyDisplay) {
+  const deviceName = normalizeText(topologyDisplay?.deviceName);
+  if (!deviceName) {
+    return {
+      ok: false,
+      error: "Windows topology display did not include a GDI device name.",
+    };
+  }
+
+  const cacheKey = deviceName.toLowerCase();
+  const cachedResult = windowsDdcProbeCache.get(cacheKey);
+  if (cachedResult && Date.now() - cachedResult.checkedAt < DDC_PROBE_CACHE_TTL_MS) {
+    return cachedResult;
+  }
+
+  const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
+  try {
+    const output = await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-GdiDeviceName",
+      deviceName,
+      "-ProbeDdc",
+    ]);
+    const parsed = JSON.parse(output);
+    const nextResult = {
+      ok: Boolean(parsed?.ok) && Number(parsed?.physicalMonitorCount || 0) > 0,
+      checkedAt: Date.now(),
+      error: "",
+    };
+    windowsDdcProbeCache.set(cacheKey, nextResult);
+    return nextResult;
+  } catch (error) {
+    const nextResult = {
+      ok: false,
+      checkedAt: Date.now(),
+      error: normalizeText(error.message),
+    };
+    windowsDdcProbeCache.set(cacheKey, nextResult);
+    appendDiagnosticLog(`Windows DDC probe failed for ${deviceName}`, error);
+    return nextResult;
+  }
+}
+
 function getWindowsElectronDisplayBoundsCandidates(display) {
   const logicalBounds = {
     x: Number.isFinite(display?.bounds?.x) ? display.bounds.x : 0,
@@ -1929,14 +2205,19 @@ function isWindowsMonitorAttachedInTopology(topologyDisplays, monitorContextOrCo
 
 async function runWindowsTopologyCommand(args) {
   const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
-  return runCommand("powershell.exe", [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    topologyScriptPath,
-    ...args,
-  ]);
+  const commandTask = () =>
+    runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      topologyScriptPath,
+      ...args,
+    ]);
+
+  const nextOperation = windowsTopologyOperationQueue.then(commandTask, commandTask);
+  windowsTopologyOperationQueue = nextOperation.catch(() => {});
+  return nextOperation;
 }
 
 async function getCurrentWindowsAttachedDisplayCount() {
@@ -2130,7 +2411,7 @@ function renderInterfaceStatusCard(monitorContext, targetId) {
     ? monitorContext.status.currentInputValue
     : null;
   const isCurrent = Number.isInteger(currentInputValue)
-    ? getExpectedProbeInputValues(target.inputValue).includes(currentInputValue)
+    ? getExpectedProbeInputValues(target.inputValue, monitorContext.monitor).includes(currentInputValue)
     : false;
   const directSwitchEnabled = monitorContext.status.visible !== false;
 
@@ -2146,8 +2427,8 @@ function renderInterfaceStatusCard(monitorContext, targetId) {
     statusText = "当前未显示";
     detailText = `当前输入回报：${describeInputValue(currentInputValue)}。`;
   } else if (monitorContext.status.currentInputError) {
-    statusText = "读取失败";
-    detailText = monitorContext.status.currentInputError;
+    statusText = "当前输入未知";
+    detailText = "当前显示器没有提供可靠回读，结果不能自动确认。";
   }
 
   return `<div class="interface-card${isCurrent ? " current" : ""}">
@@ -2593,8 +2874,12 @@ function getInputCandidates(target, monitorConfig) {
   return candidates;
 }
 
-function getExpectedProbeInputValues(inputValue) {
+function getExpectedProbeInputValues(inputValue, monitorConfig = null) {
   const candidates = [inputValue];
+  if (!shouldUseSamsungMstarCompat(monitorConfig)) {
+    return candidates;
+  }
+
   for (const candidate of getSamsungMstarCandidates(inputValue)) {
     if (!candidates.includes(candidate)) {
       candidates.push(candidate);
@@ -2981,22 +3266,60 @@ function writeJson(response, statusCode, payload) {
   response.end(JSON.stringify(payload));
 }
 
-function readRequestBody(request) {
+function createHttpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function assertFormUrlEncodedRequest(request) {
+  const contentType = normalizeText(request.headers["content-type"]).split(";")[0].toLowerCase();
+  if (contentType && contentType !== "application/x-www-form-urlencoded") {
+    throw createHttpError(415, "仅支持 application/x-www-form-urlencoded 表单提交。");
+  }
+}
+
+function readRequestBody(request, maxBytes = LOCAL_REQUEST_BODY_LIMIT_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+
+    const fail = (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(error);
+    };
+
     request.on("data", (chunk) => {
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) {
+        fail(createHttpError(413, "请求内容过大。"));
+        request.destroy();
+        return;
+      }
+
       chunks.push(chunk);
     });
     request.on("end", () => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
       resolve(Buffer.concat(chunks).toString("utf8"));
     });
-    request.on("error", reject);
+    request.on("error", fail);
   });
 }
 
 function runCommand(file, args, options = {}) {
   const execOptions = {
     windowsHide: true,
+    timeout: HELPER_COMMAND_TIMEOUT_MS,
     ...options,
   };
 
@@ -3011,6 +3334,11 @@ function runCommand(file, args, options = {}) {
     execFile(file, args, execOptions, (error, stdout, stderr) => {
       const combinedOutput = [stdout, stderr].filter(Boolean).join("\n").trim();
       if (error) {
+        if (error.killed && execOptions.timeout) {
+          reject(new Error(`底层 helper 超时（${execOptions.timeout}ms）：${file}`));
+          return;
+        }
+
         reject(new Error(combinedOutput || error.message));
         return;
       }
@@ -3034,13 +3362,21 @@ function delay(ms) {
   });
 }
 
-async function runCandidateSequence(candidates, runCandidate) {
+async function runSwitchCandidateSequence(candidates, runCandidate) {
   let lastError = null;
+  let lastUnconfirmedResult = null;
 
   for (let index = 0; index < candidates.length; index += 1) {
     try {
-      await runCandidate(candidates[index]);
-      return;
+      const result = await runCandidate(candidates[index]);
+      if (result?.verificationStatus === "confirmed") {
+        return result;
+      }
+
+      lastUnconfirmedResult = {
+        verificationStatus: "unconfirmed",
+        message: normalizeText(result?.message),
+      };
     } catch (error) {
       lastError = error;
     }
@@ -3050,9 +3386,18 @@ async function runCandidateSequence(candidates, runCandidate) {
     }
   }
 
+  if (lastUnconfirmedResult) {
+    return lastUnconfirmedResult;
+  }
+
   if (lastError) {
     throw lastError;
   }
+
+  return {
+    verificationStatus: "unconfirmed",
+    message: "",
+  };
 }
 
 function describeInputValue(value) {

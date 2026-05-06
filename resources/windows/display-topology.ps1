@@ -13,6 +13,8 @@ param(
 
     [switch]$AttachMonitor,
 
+    [switch]$PromotePrimaryAwayFromMonitor,
+
     [switch]$Summary
 )
 
@@ -127,6 +129,13 @@ public static class NativeDisplayTopology
         public string GdiDeviceName;
         public string DisplayDeviceId;
         public string DisplayProductCode;
+    }
+
+    private class DisplayModeChange
+    {
+        public string DeviceName;
+        public DEVMODE Mode;
+        public bool Primary;
     }
 
     private const int DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001;
@@ -338,10 +347,59 @@ public static class NativeDisplayTopology
                 throw new InvalidOperationException("No replacement primary display was found before detaching " + deviceName + ".");
             }
 
-            ApplyPrimaryDisplay(replacementPrimary.DeviceName);
+            ApplyPrimaryDisplayWithStableLayout(replacementPrimary.DeviceName, activeDisplays);
         }
 
         DetachDisplay(targetDisplay.DeviceName);
+
+        var finalResult = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+        if (finalResult != DISP_CHANGE_SUCCESSFUL)
+        {
+            throw new InvalidOperationException("Final display topology apply failed with code " + finalResult + ".");
+        }
+    }
+
+    public static void PromotePrimaryAwayFromDisplay(string deviceName)
+    {
+        if (string.IsNullOrWhiteSpace(deviceName))
+        {
+            throw new InvalidOperationException("Target display device name was empty.");
+        }
+
+        var displays = GetDisplays();
+        var activeDisplays = displays.FindAll(display => display.Attached);
+        if (activeDisplays.Count == 0)
+        {
+            throw new InvalidOperationException("No active desktop displays were found.");
+        }
+
+        var targetDisplay = activeDisplays.Find(
+            display => string.Equals(display.DeviceName, deviceName, StringComparison.OrdinalIgnoreCase)
+        );
+        if (targetDisplay == null)
+        {
+            throw new InvalidOperationException("Target display " + deviceName + " is not currently attached.");
+        }
+
+        if (!targetDisplay.Primary)
+        {
+            return;
+        }
+
+        if (activeDisplays.Count < 2)
+        {
+            throw new InvalidOperationException("Target display " + deviceName + " is currently the only active desktop display and cannot stop being primary.");
+        }
+
+        var replacementPrimary = activeDisplays.Find(
+            display => !string.Equals(display.DeviceName, targetDisplay.DeviceName, StringComparison.OrdinalIgnoreCase)
+        );
+        if (replacementPrimary == null)
+        {
+            throw new InvalidOperationException("No replacement primary display was found before promoting away from " + deviceName + ".");
+        }
+
+        ApplyPrimaryDisplayWithStableLayout(replacementPrimary.DeviceName, activeDisplays);
 
         var finalResult = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
         if (finalResult != DISP_CHANGE_SUCCESSFUL)
@@ -488,6 +546,112 @@ public static class NativeDisplayTopology
         {
             throw new InvalidOperationException("Failed to set primary display " + deviceName + " with code " + result + ".");
         }
+    }
+
+    private static void ApplyPrimaryDisplayWithStableLayout(string deviceName, List<DisplayInfo> activeDisplays)
+    {
+        if (activeDisplays == null || activeDisplays.Count == 0)
+        {
+            throw new InvalidOperationException("No active desktop displays were provided for primary promotion.");
+        }
+
+        var replacementPrimary = activeDisplays.Find(
+            display => string.Equals(display.DeviceName, deviceName, StringComparison.OrdinalIgnoreCase)
+        );
+        if (replacementPrimary == null)
+        {
+            throw new InvalidOperationException("Replacement primary display " + deviceName + " was not active.");
+        }
+
+        int offsetX = replacementPrimary.PositionX;
+        int offsetY = replacementPrimary.PositionY;
+        var originalModes = new List<DisplayModeChange>();
+        var targetModes = new List<DisplayModeChange>();
+
+        foreach (var display in activeDisplays)
+        {
+            var mode = CreateDevMode();
+            if (!EnumDisplaySettingsEx(display.DeviceName, ENUM_CURRENT_SETTINGS, ref mode, 0))
+            {
+                throw new InvalidOperationException("Failed to read current mode for display " + display.DeviceName + ".");
+            }
+
+            originalModes.Add(new DisplayModeChange {
+                DeviceName = display.DeviceName,
+                Mode = mode,
+                Primary = display.Primary
+            });
+
+            var targetMode = mode;
+            targetMode.dmFields |= DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+            targetMode.dmPosition.x = display.PositionX - offsetX;
+            targetMode.dmPosition.y = display.PositionY - offsetY;
+
+            targetModes.Add(new DisplayModeChange {
+                DeviceName = display.DeviceName,
+                Mode = targetMode,
+                Primary = string.Equals(display.DeviceName, deviceName, StringComparison.OrdinalIgnoreCase)
+            });
+        }
+
+        try
+        {
+            foreach (var targetMode in targetModes)
+            {
+                var mode = targetMode.Mode;
+                uint flags = (uint)(CDS_UPDATEREGISTRY | CDS_NORESET);
+                if (targetMode.Primary)
+                {
+                    flags |= (uint)CDS_SET_PRIMARY;
+                }
+
+                var result = ChangeDisplaySettingsEx(
+                    targetMode.DeviceName,
+                    ref mode,
+                    IntPtr.Zero,
+                    flags,
+                    IntPtr.Zero
+                );
+
+                if (result != DISP_CHANGE_SUCCESSFUL)
+                {
+                    throw new InvalidOperationException("Failed to rebase display " + targetMode.DeviceName + " while setting primary " + deviceName + " with code " + result + ".");
+                }
+            }
+        }
+        catch
+        {
+            RollbackDisplayModes(originalModes);
+            throw;
+        }
+    }
+
+    private static void RollbackDisplayModes(List<DisplayModeChange> originalModes)
+    {
+        if (originalModes == null)
+        {
+            return;
+        }
+
+        foreach (var originalMode in originalModes)
+        {
+            var mode = originalMode.Mode;
+            uint flags = (uint)(CDS_UPDATEREGISTRY | CDS_NORESET);
+            if (originalMode.Primary)
+            {
+                flags |= (uint)CDS_SET_PRIMARY;
+            }
+
+            ChangeDisplaySettingsEx(
+                originalMode.DeviceName,
+                ref mode,
+                IntPtr.Zero,
+                flags,
+                IntPtr.Zero
+            );
+        }
+
+        ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
     }
 
     private static void DetachDisplay(string deviceName)
@@ -1064,7 +1228,7 @@ try {
         exit 0
     }
 
-    if ($DetachMonitor -or $AttachMonitor) {
+    if ($DetachMonitor -or $AttachMonitor -or $PromotePrimaryAwayFromMonitor) {
         $targetDisplayEntry = Select-TargetDisplayEntry -DisplayEntries $displayEntries -MonitorName $MonitorName
         if ($null -eq $targetDisplayEntry) {
             $availableText = if ($availableMonitors.Count -gt 0) {
@@ -1074,6 +1238,17 @@ try {
             }
 
             throw "No monitor matched '$MonitorName'. Available monitors: $availableText"
+        }
+
+        if ($PromotePrimaryAwayFromMonitor) {
+            [NativeDisplayTopology]::PromotePrimaryAwayFromDisplay($targetDisplayEntry.DeviceName)
+            Write-Output (@{
+                ok = $true
+                mode = "promote-primary-away"
+                monitor = $targetDisplayEntry.DisplayName
+                deviceName = $targetDisplayEntry.DeviceName
+            } | ConvertTo-Json -Compress)
+            exit 0
         }
 
         if ($DetachMonitor) {
