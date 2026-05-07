@@ -51,6 +51,7 @@ let refreshMenuInFlight = false;
 let refreshMenuQueued = false;
 let windowsRestoreInFlight = false;
 let windowsTopologyOperationQueue = Promise.resolve();
+let switchOperationQueue = Promise.resolve();
 const switchInFlightByMonitorId = new Map();
 let macDisplayMetadataCache = {
   fetchedAt: 0,
@@ -604,7 +605,11 @@ async function switchMonitor(monitorId, targetId, options = {}) {
     throw new Error("这块屏幕正在执行切换，请等待当前命令完成。");
   }
 
-  const switchTask = switchMonitorUnlocked(normalizedMonitorId, parsedTargetId, options);
+  const switchTask = switchOperationQueue.then(
+    () => switchMonitorUnlocked(normalizedMonitorId, parsedTargetId, options),
+    () => switchMonitorUnlocked(normalizedMonitorId, parsedTargetId, options)
+  );
+  switchOperationQueue = switchTask.catch(() => {});
   if (lockKey) {
     switchInFlightByMonitorId.set(lockKey, switchTask);
   }
@@ -969,12 +974,8 @@ function getMacSwitchScriptEnvForDisplay(displaySummary) {
     DISPLAY_NAME_FALLBACK_ALLOWED: displaySummary.displayNameIsUnique ? "1" : "0",
   };
 
-  const preferredDisplayId = Number.isInteger(displaySummary.macSystemDisplayId)
-    ? displaySummary.macSystemDisplayId
-    : displaySummary.electronDisplayId;
-
-  if (Number.isInteger(preferredDisplayId)) {
-    env.DISPLAY_ID = String(preferredDisplayId);
+  if (Number.isInteger(displaySummary.macSystemDisplayId)) {
+    env.DISPLAY_ID = String(displaySummary.macSystemDisplayId);
   }
 
   return env;
@@ -993,8 +994,25 @@ async function getMacDdcCapableDisplaySummaries(displaySummaries) {
   );
 
   return probeResults
-    .filter(({ probeResult }) => probeResult.ok)
+    .filter(
+      ({ displaySummary, probeResult }) =>
+        probeResult.ok && hasMacSafeDdcTargetIdentity(displaySummary)
+    )
     .map(({ displaySummary }) => displaySummary);
+}
+
+function hasMacSafeDdcTargetIdentity(displaySummary) {
+  if (Number.isInteger(displaySummary?.macSystemDisplayId)) {
+    return true;
+  }
+
+  if (buildMacHardwareDisplayKey(displaySummary)) {
+    return true;
+  }
+
+  return Boolean(
+    displaySummary?.displayNameIsUnique && normalizeText(displaySummary?.detectedName)
+  );
 }
 
 async function getMacDdcProbeResult(displaySummary) {
@@ -1587,12 +1605,16 @@ async function syncMonitorConfigsFromLocalDisplays({
       continue;
     }
 
-    nextMonitorConfigs.push(normalizeMonitorConfig(storedMonitorConfig));
+    if (shouldPreserveDisconnectedMonitorConfig(storedMonitorConfig)) {
+      nextMonitorConfigs.push(normalizeMonitorConfig(storedMonitorConfig));
+    }
   }
 
+  const knownMonitorIds = new Set(nextMonitorConfigs.map((monitorConfig) => monitorConfig.id));
+  const prunedRuntimeState = pruneStateForKnownMonitorIds(knownMonitorIds);
   const nextSerialized = JSON.stringify(nextMonitorConfigs);
   const previousSerialized = JSON.stringify(storedMonitorConfigs);
-  if (nextSerialized !== previousSerialized) {
+  if (nextSerialized !== previousSerialized || prunedRuntimeState) {
     state.config.monitors = nextMonitorConfigs;
     if (persist) {
       saveState(state);
@@ -1605,6 +1627,54 @@ async function syncMonitorConfigsFromLocalDisplays({
   }
 
   return resolvedDisplaySummaries;
+}
+
+function shouldPreserveDisconnectedMonitorConfig(monitorConfig) {
+  if (process.platform !== "win32") {
+    return false;
+  }
+
+  return Boolean(getExistingMonitorDesktopRuntime(monitorConfig.id)?.pendingRestore);
+}
+
+function getExistingMonitorDesktopRuntime(monitorId) {
+  const normalizedId = normalizeText(monitorId);
+  if (!normalizedId) {
+    return null;
+  }
+
+  return state.windowsDesktop?.byMonitorId?.[normalizedId] || null;
+}
+
+function pruneStateForKnownMonitorIds(knownMonitorIds) {
+  if (!(knownMonitorIds instanceof Set)) {
+    return false;
+  }
+
+  let changed = false;
+  const lastTargetMonitorId = normalizeText(state.lastTarget).split(":")[0];
+  if (lastTargetMonitorId && !knownMonitorIds.has(lastTargetMonitorId)) {
+    state.lastTarget = "";
+    changed = true;
+  }
+
+  const lastSwitchOutcome = createSwitchOutcome(state.lastSwitchOutcome);
+  if (lastSwitchOutcome.monitorId && !knownMonitorIds.has(lastSwitchOutcome.monitorId)) {
+    state.lastSwitchOutcome = createSwitchOutcome();
+    changed = true;
+  }
+
+  const runtimeMap = state.windowsDesktop?.byMonitorId;
+  if (runtimeMap && typeof runtimeMap === "object") {
+    for (const monitorId of Object.keys(runtimeMap)) {
+      if (!knownMonitorIds.has(monitorId)) {
+        delete runtimeMap[monitorId];
+        changed = true;
+      }
+    }
+  }
+
+  return changed;
 }
 
 async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false } = {}) {

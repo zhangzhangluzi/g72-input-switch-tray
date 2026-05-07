@@ -71,11 +71,17 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /timeout: HELPER_COMMAND_TIMEOUT_MS/u);
   assert.match(mainSource, /SYSTEM_PROFILER_COMMAND_TIMEOUT_MS = 45000/u);
   assert.match(mainSource, /LOCAL_REQUEST_BODY_LIMIT_BYTES = 64 \* 1024/u);
+  assert.match(mainSource, /switchOperationQueue = Promise\.resolve\(\)/u);
   assert.match(mainSource, /switchInFlightByMonitorId/u);
   assert.match(mainSource, /async function switchMonitorUnlocked/u);
+  assert.match(mainSource, /switchOperationQueue = switchTask\.catch\(\(\) => \{\}\)/u);
+  assert.match(mainSource, /function shouldPreserveDisconnectedMonitorConfig/u);
+  assert.match(mainSource, /function pruneStateForKnownMonitorIds/u);
   assert.match(mainSource, /outcomeMessage: successMessages\.outcomeMessage/u);
   assert.match(mainSource, /createHttpError\(413, "请求内容过大。"\)/u);
   assert.match(mainSource, /function hasMacPhysicalIdentity/u);
+  assert.match(mainSource, /function hasMacSafeDdcTargetIdentity/u);
+  assert.doesNotMatch(mainSource, /:\s*displaySummary\.electronDisplayId/u);
   assert.match(mainSource, /function runSwitchCandidateSequence/u);
   assert.match(mainSource, /getExpectedProbeInputValues\(target\.inputValue, monitorContext\.monitor\)/u);
 }
