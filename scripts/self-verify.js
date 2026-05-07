@@ -41,6 +41,12 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /screen\.on\("display-metrics-changed", handleDisplayChange\);/u);
   assert.match(mainSource, /forceMacDisplayMetadataRefresh/u);
   assert.match(mainSource, /system_profiler", \["SPDisplaysDataType", "-json"\]/u);
+  assert.match(mainSource, /monitorEntry\?\.\["_spdisplays_display-vendor-id"\]/u);
+  assert.match(mainSource, /monitorEntry\?\.\["_spdisplays_display-product-id"\]/u);
+  assert.match(mainSource, /monitorEntry\?\.\["_spdisplays_display-serial-number"\]/u);
+  assert.doesNotMatch(mainSource, /monitorEntry\?\._spdisplays_display-vendor-id/u);
+  assert.doesNotMatch(mainSource, /monitorEntry\?\._spdisplays_display-product-id/u);
+  assert.doesNotMatch(mainSource, /monitorEntry\?\._spdisplays_display-serial-number/u);
   assert.match(mainSource, /function isMacProfilerDisplayResolutionMatch/u);
   assert.match(mainSource, /function doesWindowsElectronDisplayExactlyMatchTopology/u);
   assert.match(mainSource, /function doesWindowsElectronDisplaySizeMatchTopology/u);

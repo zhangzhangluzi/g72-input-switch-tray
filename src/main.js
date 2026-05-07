@@ -1862,9 +1862,9 @@ function normalizeMacSystemProfilerDisplays(parsed) {
       displays.push({
         name: normalizeText(monitorEntry?._name),
         systemDisplayId: normalizeDisplayIdentifier(monitorEntry?._spdisplays_displayID),
-        vendorId: normalizeText(monitorEntry?._spdisplays_display-vendor-id).toLowerCase(),
-        productId: normalizeText(monitorEntry?._spdisplays_display-product-id).toLowerCase(),
-        serialNumber: normalizeText(monitorEntry?._spdisplays_display-serial-number),
+        vendorId: normalizeText(monitorEntry?.["_spdisplays_display-vendor-id"]).toLowerCase(),
+        productId: normalizeText(monitorEntry?.["_spdisplays_display-product-id"]).toLowerCase(),
+        serialNumber: normalizeText(monitorEntry?.["_spdisplays_display-serial-number"]),
         width: resolution.width,
         height: resolution.height,
       });
