@@ -429,8 +429,13 @@ function startControlServer() {
 }
 
 async function handleControlRequest(request, response) {
-  const baseUrl = `http://${request.headers.host || "127.0.0.1"}`;
-  const requestUrl = new URL(request.url || "/", baseUrl);
+  if (!isLoopbackRequest(request)) {
+    response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("仅允许本机访问设置与控制接口。");
+    return;
+  }
+
+  const requestUrl = parseLocalRequestUrl(request);
   const switchPathMatch = new RegExp(`^/api/${state.controlToken}/switch/([^/]+)/([^/]+)$`).exec(
     requestUrl.pathname
   );
@@ -440,12 +445,6 @@ async function handleControlRequest(request, response) {
   const windowsRefreshPathMatch = new RegExp(
     `^/api/${state.controlToken}/windows/refresh(?:/([^/]+))?$`
   ).exec(requestUrl.pathname);
-
-  if (!isLoopbackRequest(request)) {
-    response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
-    response.end("仅允许本机访问设置与控制接口。");
-    return;
-  }
 
   if (requestUrl.pathname === "/health") {
     const monitorContexts = await getConnectedMonitorContexts();
@@ -485,13 +484,13 @@ async function handleControlRequest(request, response) {
       request,
       response,
       requestUrl,
-      decodeURIComponent(configPathMatch[1])
+      decodePathSegment(configPathMatch[1])
     );
   }
 
   if (switchPathMatch && request.method === "POST") {
-    const monitorId = decodeURIComponent(switchPathMatch[1]);
-    const targetId = parseTargetId(decodeURIComponent(switchPathMatch[2]));
+    const monitorId = decodePathSegment(switchPathMatch[1]);
+    const targetId = parseTargetId(decodePathSegment(switchPathMatch[2]));
     if (!targetId) {
       response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       response.end("未找到对应接口。");
@@ -505,7 +504,7 @@ async function handleControlRequest(request, response) {
     return handleWindowsRefreshRequest(
       response,
       requestUrl,
-      windowsRefreshPathMatch[1] ? decodeURIComponent(windowsRefreshPathMatch[1]) : null
+      windowsRefreshPathMatch[1] ? decodePathSegment(windowsRefreshPathMatch[1]) : null
     );
   }
 
@@ -522,6 +521,22 @@ async function handleControlRequest(request, response) {
 
   response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
   response.end("未找到对应页面。");
+}
+
+function parseLocalRequestUrl(request) {
+  try {
+    return new URL(request.url || "/", `http://${LOOPBACK_HOST}:${getListeningPort()}`);
+  } catch {
+    throw createHttpError(400, "请求路径无效。");
+  }
+}
+
+function decodePathSegment(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw createHttpError(400, "请求路径编码无效。");
+  }
 }
 
 async function handleSwitchRequest(response, requestUrl, monitorId, targetId) {

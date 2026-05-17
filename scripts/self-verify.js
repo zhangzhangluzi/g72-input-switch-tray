@@ -79,6 +79,11 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function pruneStateForKnownMonitorIds/u);
   assert.match(mainSource, /outcomeMessage: successMessages\.outcomeMessage/u);
   assert.match(mainSource, /createHttpError\(413, "请求内容过大。"\)/u);
+  assert.match(mainSource, /function parseLocalRequestUrl\(request\)/u);
+  assert.match(mainSource, /`http:\/\/\$\{LOOPBACK_HOST\}:\$\{getListeningPort\(\)\}`/u);
+  assert.match(mainSource, /function decodePathSegment\(value\)/u);
+  assert.match(mainSource, /createHttpError\(400, "请求路径编码无效。"\)/u);
+  assert.doesNotMatch(mainSource, /request\.headers\.host/u);
   assert.match(mainSource, /function hasMacPhysicalIdentity/u);
   assert.match(mainSource, /function hasMacSafeDdcTargetIdentity/u);
   assert.doesNotMatch(mainSource, /:\s*displaySummary\.electronDisplayId/u);
