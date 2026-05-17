@@ -77,6 +77,9 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /switchOperationQueue = switchTask\.catch\(\(\) => \{\}\)/u);
   assert.match(mainSource, /function shouldPreserveDisconnectedMonitorConfig/u);
   assert.match(mainSource, /function pruneStateForKnownMonitorIds/u);
+  assert.match(mainSource, /function normalizePersistedSwitchOutcome/u);
+  assert.match(mainSource, /function shouldClearPersistedSwitchOutcome/u);
+  assert.match(mainSource, /lastSwitchOutcome: normalizePersistedSwitchOutcome/u);
   assert.match(mainSource, /outcomeMessage: successMessages\.outcomeMessage/u);
   assert.match(mainSource, /createHttpError\(413, "请求内容过大。"\)/u);
   assert.match(mainSource, /function parseLocalRequestUrl\(request\)/u);

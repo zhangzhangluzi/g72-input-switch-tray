@@ -1674,7 +1674,10 @@ function pruneStateForKnownMonitorIds(knownMonitorIds) {
   }
 
   const lastSwitchOutcome = createSwitchOutcome(state.lastSwitchOutcome);
-  if (lastSwitchOutcome.monitorId && !knownMonitorIds.has(lastSwitchOutcome.monitorId)) {
+  if (
+    shouldClearPersistedSwitchOutcome(lastSwitchOutcome) ||
+    (lastSwitchOutcome.monitorId && !knownMonitorIds.has(lastSwitchOutcome.monitorId))
+  ) {
     state.lastSwitchOutcome = createSwitchOutcome();
     changed = true;
   }
@@ -3018,6 +3021,19 @@ function createSwitchOutcome({
   };
 }
 
+function normalizePersistedSwitchOutcome(rawOutcome) {
+  const outcome = createSwitchOutcome(rawOutcome);
+  return shouldClearPersistedSwitchOutcome(outcome) ? createSwitchOutcome() : outcome;
+}
+
+function shouldClearPersistedSwitchOutcome(outcome) {
+  const normalizedOutcome = createSwitchOutcome(outcome);
+  return (
+    normalizedOutcome.status !== "idle" &&
+    (!normalizedOutcome.monitorId || !normalizedOutcome.targetId)
+  );
+}
+
 function recordSwitchOutcome(status, monitorId, targetId, message = "") {
   state.lastSwitchOutcome = createSwitchOutcome({
     status,
@@ -3160,7 +3176,7 @@ function normalizeState(nextState) {
     windowsDesktop: {
       byMonitorId: normalizeWindowsDesktopRuntime(nextState.windowsDesktop?.byMonitorId),
     },
-    lastSwitchOutcome: createSwitchOutcome(nextState.lastSwitchOutcome),
+    lastSwitchOutcome: normalizePersistedSwitchOutcome(nextState.lastSwitchOutcome),
     config: {
       monitors: normalizedMonitorConfigs,
     },
