@@ -87,6 +87,9 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function decodePathSegment\(value\)/u);
   assert.match(mainSource, /createHttpError\(400, "请求路径编码无效。"\)/u);
   assert.doesNotMatch(mainSource, /request\.headers\.host/u);
+  assert.match(mainSource, /async function mapSequential\(items, mapper\)/u);
+  assert.match(mainSource, /const probeResults = await mapSequential\(/u);
+  assert.doesNotMatch(mainSource, /request\.destroy\(\)/u);
   assert.match(mainSource, /function hasMacPhysicalIdentity/u);
   assert.match(mainSource, /function hasMacSafeDdcTargetIdentity/u);
   assert.doesNotMatch(mainSource, /:\s*displaySummary\.electronDisplayId/u);
@@ -150,6 +153,10 @@ function verifyCiWorkflowTriggers() {
   assert.match(workflow, /pull_request:/u);
   assert.match(workflow, /branches:\s*\n\s*- main/u);
   assert.match(workflow, /tags:\s*\n\s*- "v\*"/u);
+  assert.match(workflow, /permissions:\s*\n\s*contents: read/u);
+  assert.match(workflow, /release-windows:/u);
+  assert.match(workflow, /release-macos:/u);
+  assert.match(workflow, /contents: write/u);
 }
 
 function findPowerShellCommand() {

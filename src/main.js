@@ -1001,11 +1001,12 @@ async function getMacDdcCapableDisplaySummaries(displaySummaries) {
     return displaySummaries;
   }
 
-  const probeResults = await Promise.all(
-    displaySummaries.map(async (displaySummary) => ({
+  const probeResults = await mapSequential(
+    displaySummaries,
+    async (displaySummary) => ({
       displaySummary,
       probeResult: await getMacDdcProbeResult(displaySummary),
-    }))
+    })
   );
 
   return probeResults
@@ -2118,11 +2119,12 @@ async function getWindowsDdcCapableTopologyDisplays(attachedTopologyDisplays) {
     return [];
   }
 
-  const probeResults = await Promise.all(
-    attachedTopologyDisplays.map(async (topologyDisplay) => ({
+  const probeResults = await mapSequential(
+    attachedTopologyDisplays,
+    async (topologyDisplay) => ({
       topologyDisplay,
       probeResult: await getWindowsDdcProbeResult(topologyDisplay),
-    }))
+    })
   );
 
   return probeResults
@@ -3399,7 +3401,6 @@ function readRequestBody(request, maxBytes = LOCAL_REQUEST_BODY_LIMIT_BYTES) {
       totalBytes += chunk.length;
       if (totalBytes > maxBytes) {
         fail(createHttpError(413, "请求内容过大。"));
-        request.destroy();
         return;
       }
 
@@ -3461,6 +3462,14 @@ function delay(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+async function mapSequential(items, mapper) {
+  const results = [];
+  for (const item of items) {
+    results.push(await mapper(item));
+  }
+  return results;
 }
 
 async function runSwitchCandidateSequence(candidates, runCandidate) {
