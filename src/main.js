@@ -17,6 +17,7 @@ const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
 const MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000;
 const DDC_PROBE_CACHE_TTL_MS = 10000;
 const HELPER_COMMAND_TIMEOUT_MS = 15000;
+const CURRENT_INPUT_COMMAND_TIMEOUT_MS = 5000;
 const SYSTEM_PROFILER_COMMAND_TIMEOUT_MS = 45000;
 const LOCAL_REQUEST_BODY_LIMIT_BYTES = 64 * 1024;
 const TARGET_SLOTS = [
@@ -307,6 +308,10 @@ function buildTrayMonitorItem(monitorContext) {
       : "当前不在本机";
   const runtime = getMonitorDesktopRuntime(monitorContext.id);
   const directSwitchEnabled = isMonitorDirectSwitchEnabled(monitorContext);
+  const ddcProbeNotice =
+    monitorContext.status.ddcProbeStatus === "targetable-unconfirmed"
+      ? "DDC 状态：目标可定位，结果需人工确认"
+      : "";
 
   return {
     label: getMonitorDisplayTitle(monitorContext),
@@ -322,6 +327,14 @@ function buildTrayMonitorItem(monitorContext) {
         label: `当前输入：${currentInputLabel}`,
         enabled: false,
       },
+      ...(ddcProbeNotice
+        ? [
+            {
+              label: ddcProbeNotice,
+              enabled: false,
+            },
+          ]
+        : []),
       ...(runtime.pendingRestore
         ? [
             {
@@ -457,15 +470,11 @@ async function handleControlRequest(request, response) {
   ).exec(requestUrl.pathname);
 
   if (requestUrl.pathname === "/health") {
-    const monitorContexts = await getConnectedMonitorContexts();
     return writeJson(response, 200, {
       ok: true,
       appName: APP_NAME,
       version: app.getVersion(),
-      connectedMonitors: monitorContexts.map((monitorContext) => ({
-        id: monitorContext.id,
-        title: getMonitorDisplayTitle(monitorContext),
-      })),
+      connectedMonitors: getHealthConnectedMonitorSummaries(),
       lastSwitchOutcome: state.lastSwitchOutcome,
       controlPort: getListeningPort(),
     });
@@ -945,7 +954,9 @@ async function getWindowsCurrentInputResultForContext(monitorContext) {
       scriptPath,
       ...getWindowsMonitorSelectorArgs(monitorContext),
       "-ReadInputValue",
-    ]);
+    ], {
+      timeout: CURRENT_INPUT_COMMAND_TIMEOUT_MS,
+    });
     const parsed = JSON.parse(output);
     const currentInputValue = Number.isInteger(parsed?.currentInputValue)
       ? parsed.currentInputValue
@@ -982,6 +993,7 @@ async function getMacCurrentInputResultForContext(monitorContext) {
   try {
     const output = await runCommand("/bin/sh", [scriptPath, "--query-input"], {
       env: getMacSwitchScriptEnvForContext(monitorContext),
+      timeout: CURRENT_INPUT_COMMAND_TIMEOUT_MS,
     });
     const parsedValue = parseMacInputValueOutput(output);
 
@@ -1051,9 +1063,11 @@ async function attachMacDdcProbeResults(displaySummaries) {
 
 function createDdcProbeSummary(probeResult, fallbackError = "") {
   const ok = Boolean(probeResult?.ok);
+  const status = normalizeText(probeResult?.status) || (ok ? "ok" : "failed");
   return {
     ok,
-    status: normalizeText(probeResult?.status) || (ok ? "ok" : "failed"),
+    status,
+    confirmed: ok && status === "ok",
     error: ok ? "" : normalizeText(probeResult?.error) || normalizeText(fallbackError),
   };
 }
@@ -1088,7 +1102,9 @@ async function getMacDdcProbeResult(displaySummary) {
     });
     const probeStatus = parseMacDdcProbeOutput(output);
     const nextResult = {
-      ok: probeStatus === "ok" || (probeStatus === "unknown" && hasMacPhysicalIdentity(displaySummary)),
+      ok:
+        probeStatus === "ok" ||
+        (probeStatus === "targetable-unconfirmed" && hasMacPhysicalIdentity(displaySummary)),
       status: probeStatus,
       checkedAt: Date.now(),
       error: "",
@@ -1115,10 +1131,10 @@ function parseMacDdcProbeOutput(output) {
   }
 
   if (/\bUNKNOWN\b/u.test(normalized)) {
-    return "unknown";
+    return "targetable-unconfirmed";
   }
 
-  return "unknown";
+  return "targetable-unconfirmed";
 }
 
 function hasMacPhysicalIdentity(displaySummary) {
@@ -1506,6 +1522,7 @@ async function getMonitorStatus(monitorContext, options = {}) {
     return {
       visible: true,
       ddcAvailable: false,
+      ddcProbeStatus: monitorContext.display.ddcProbe.status,
       ddcUnavailableReason: getDisplayDdcUnavailableReason(monitorContext.display),
       currentInputValue: null,
       currentInputError: getDisplayDdcUnavailableReason(monitorContext.display),
@@ -1521,6 +1538,7 @@ async function getMonitorStatus(monitorContext, options = {}) {
       return {
         visible: false,
         ddcAvailable: false,
+        ddcProbeStatus: monitorContext.display?.ddcProbe?.status || "",
         ddcUnavailableReason: "",
         currentInputValue: null,
         currentInputError: null,
@@ -1531,6 +1549,7 @@ async function getMonitorStatus(monitorContext, options = {}) {
     return {
       visible: true,
       ddcAvailable: true,
+      ddcProbeStatus: monitorContext.display?.ddcProbe?.status || "ok",
       ddcUnavailableReason: "",
       currentInputValue: currentInputResult.ok ? currentInputResult.value : null,
       currentInputError: currentInputResult.ok ? null : currentInputResult.error,
@@ -1541,6 +1560,7 @@ async function getMonitorStatus(monitorContext, options = {}) {
   return {
     visible: true,
     ddcAvailable: true,
+    ddcProbeStatus: monitorContext.display?.ddcProbe?.status || "ok",
     ddcUnavailableReason: "",
     currentInputValue: currentInputResult.ok ? currentInputResult.value : null,
     currentInputError: currentInputResult.ok ? null : currentInputResult.error,
@@ -1938,6 +1958,41 @@ function getConnectedDisplayCount() {
   return getOrderedLocalDisplays().length;
 }
 
+function getHealthConnectedMonitorSummaries() {
+  const externalDisplays = getOrderedLocalDisplays().filter((display) => !display.internal);
+  const storedMonitorConfigs = getStoredMonitorConfigs();
+  const singleDisplayOnly = externalDisplays.length <= 1;
+  let secondaryIndex = 2;
+
+  return externalDisplays.map((display, index) => {
+    const matchedMonitorConfig = storedMonitorConfigs.find(
+      (monitorConfig) => monitorConfig.match?.electronDisplayId === display.id
+    );
+    const roleLabel = matchedMonitorConfig
+      ? matchedMonitorConfig.roleLabel
+      : singleDisplayOnly
+        ? "当前机器屏幕"
+        : display.primary
+          ? "主屏幕"
+          : `附屏幕 ${secondaryIndex++}`;
+    const displayName =
+      normalizeText(display.label) || getMonitorDisplayName(matchedMonitorConfig) || "本机屏幕";
+
+    return {
+      id:
+        normalizeText(matchedMonitorConfig?.id) ||
+        createMonitorId(
+          `health:${Number.isInteger(display.id) ? display.id : index + 1}:${
+            display.bounds?.x || 0
+          }:${display.bounds?.y || 0}:${display.bounds?.width || 0}x${
+            display.bounds?.height || 0
+          }`
+        ),
+      title: displayName ? `${roleLabel} · ${displayName}` : roleLabel || "本机屏幕",
+    };
+  });
+}
+
 function buildDisplayKeyForLocalDisplay(
   display,
   displayIndex,
@@ -2011,6 +2066,14 @@ async function getMacSystemProfilerDisplays({ forceRefresh = false } = {}) {
     return displays;
   } catch (error) {
     appendDiagnosticLog("Failed to read macOS display metadata", error);
+    if (forceRefresh) {
+      macDisplayMetadataCache = {
+        fetchedAt: 0,
+        displays: [],
+      };
+      return [];
+    }
+
     return Array.isArray(macDisplayMetadataCache.displays) ? macDisplayMetadataCache.displays : [];
   }
 }
@@ -2653,7 +2716,10 @@ function renderInterfaceStatusCard(monitorContext, targetId) {
     detailText = `当前输入回报：${describeInputValue(currentInputValue)}。`;
   } else if (monitorContext.status.currentInputError) {
     statusText = "当前输入未知";
-    detailText = "当前显示器没有提供可靠回读，结果不能自动确认。";
+    detailText =
+      monitorContext.status.ddcProbeStatus === "targetable-unconfirmed"
+        ? "DDC 目标可定位但未确认可回读或写入；切换命令可发送，结果需人工确认。"
+        : "当前显示器没有提供可靠回读，结果不能自动确认。";
   }
 
   return `<div class="interface-card${isCurrent ? " current" : ""}">

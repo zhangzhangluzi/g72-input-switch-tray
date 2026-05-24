@@ -4,6 +4,7 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 WORK_DIR="$ROOT_DIR/.cache/ddcctl-src"
 OUTPUT_DIR="$ROOT_DIR/resources/bin"
+OUTPUT_STAMP="$OUTPUT_DIR/ddcctl.commit"
 DDCCTL_REPO_URL="https://github.com/kfix/ddcctl.git"
 DDCCTL_COMMIT="06c7ab6eba5b1c903678f8113a92cef990acaf90"
 
@@ -17,3 +18,4 @@ git -C "$WORK_DIR" checkout --detach FETCH_HEAD
 make -C "$WORK_DIR"
 cp "$WORK_DIR/bin/release/ddcctl" "$OUTPUT_DIR/ddcctl"
 chmod +x "$OUTPUT_DIR/ddcctl"
+printf '%s\n' "$DDCCTL_COMMIT" > "$OUTPUT_STAMP"

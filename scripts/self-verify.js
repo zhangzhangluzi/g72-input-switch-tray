@@ -79,6 +79,8 @@ function verifyMainSourceBusinessGuards() {
   assert.doesNotMatch(mainSource, /statusText = "读取失败"/u);
   assert.doesNotMatch(mainSource, /没有真正切到/u);
   assert.match(mainSource, /timeout: HELPER_COMMAND_TIMEOUT_MS/u);
+  assert.match(mainSource, /CURRENT_INPUT_COMMAND_TIMEOUT_MS = 5000/u);
+  assert.match(mainSource, /timeout: CURRENT_INPUT_COMMAND_TIMEOUT_MS/u);
   assert.match(mainSource, /SYSTEM_PROFILER_COMMAND_TIMEOUT_MS = 45000/u);
   assert.match(mainSource, /LOCAL_REQUEST_BODY_LIMIT_BYTES = 64 \* 1024/u);
   assert.match(mainSource, /switchOperationQueue = Promise\.resolve\(\)/u);
@@ -92,6 +94,12 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /lastSwitchOutcome: normalizePersistedSwitchOutcome/u);
   assert.match(mainSource, /outcomeMessage: successMessages\.outcomeMessage/u);
   assert.match(mainSource, /createHttpError\(413, "请求内容过大。"\)/u);
+  assert.match(mainSource, /function getHealthConnectedMonitorSummaries/u);
+  assert.match(mainSource, /connectedMonitors: getHealthConnectedMonitorSummaries\(\)/u);
+  assert.doesNotMatch(
+    mainSource,
+    /requestUrl\.pathname === "\/health"[\s\S]{0,300}getConnectedMonitorContexts/u
+  );
   assert.match(mainSource, /function parseLocalRequestUrl\(request\)/u);
   assert.match(mainSource, /`http:\/\/\$\{LOOPBACK_HOST\}:\$\{getListeningPort\(\)\}`/u);
   assert.match(mainSource, /function decodePathSegment\(value\)/u);
@@ -104,6 +112,9 @@ function verifyMainSourceBusinessGuards() {
   assert.doesNotMatch(mainSource, /request\.destroy\(\)/u);
   assert.match(mainSource, /function hasMacPhysicalIdentity/u);
   assert.match(mainSource, /function hasMacSafeDdcTargetIdentity/u);
+  assert.match(mainSource, /targetable-unconfirmed/u);
+  assert.match(mainSource, /confirmed: ok && status === "ok"/u);
+  assert.match(mainSource, /if \(forceRefresh\) \{\s*macDisplayMetadataCache = \{\s*fetchedAt: 0,\s*displays: \[\],\s*\};\s*return \[\];\s*\}/u);
   assert.doesNotMatch(mainSource, /:\s*displaySummary\.electronDisplayId/u);
   assert.match(mainSource, /function runSwitchCandidateSequence/u);
   assert.match(mainSource, /getExpectedProbeInputValues\(target\.inputValue, monitorContext\.monitor\)/u);
@@ -131,10 +142,18 @@ function verifyLocalOnlyDocs() {
 
 function verifyPinnedMacDdcctlBuildScript() {
   const buildScriptPath = path.resolve(__dirname, "..", "scripts", "build-macos-ddcctl.sh");
+  const ensureScriptPath = path.resolve(__dirname, "..", "scripts", "ensure-macos-ddcctl.sh");
   const buildScript = fs.readFileSync(buildScriptPath, "utf8");
+  const ensureScript = fs.readFileSync(ensureScriptPath, "utf8");
+  const gitignore = fs.readFileSync(path.resolve(__dirname, "..", ".gitignore"), "utf8");
 
   assert.match(buildScript, /DDCCTL_COMMIT="([0-9a-f]{40})"/u);
   assert.match(buildScript, /git -C "\$WORK_DIR" fetch --depth 1 origin "\$DDCCTL_COMMIT"/u);
+  assert.match(buildScript, /printf '%s\\n' "\$DDCCTL_COMMIT" > "\$OUTPUT_STAMP"/u);
+  assert.match(ensureScript, /EXPECTED_COMMIT=\$\(awk -F'"'/u);
+  assert.match(ensureScript, /rev-parse HEAD/u);
+  assert.match(ensureScript, /"\$OUTPUT_STAMP"/u);
+  assert.match(gitignore, /resources\/bin\/ddcctl\.commit/u);
 }
 
 function verifyWindowsHelperSourceGuards() {

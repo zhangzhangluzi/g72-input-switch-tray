@@ -64,6 +64,7 @@ This project now uses one rule set only:
 
 - If macOS writes the input value and readback stays on the old input, the UI records the command as unconfirmed.
 - The raw helper output may still be useful for diagnostics, but the app must not turn unreliable readback into a hard failure.
+- A local health check must not trigger DDC probing, current-input readback, or persisted monitor-configuration rewrites.
 
 ### Windows side
 
