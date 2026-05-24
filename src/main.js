@@ -390,7 +390,9 @@ function startControlServer() {
   activeControlPort = PREFERRED_CONTROL_PORT;
   controlServer = http.createServer((request, response) => {
     handleControlRequest(request, response).catch((error) => {
-      appendDiagnosticLog("Control request failed", error);
+      if (shouldLogControlRequestError(error)) {
+        appendDiagnosticLog("Control request failed", error);
+      }
       if (response.headersSent) {
         response.end();
         return;
@@ -426,6 +428,11 @@ function startControlServer() {
     controlServerError = null;
     void refreshMenu();
   });
+}
+
+function shouldLogControlRequestError(error) {
+  const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+  return statusCode >= 500;
 }
 
 async function handleControlRequest(request, response) {
@@ -1540,6 +1547,10 @@ async function syncMonitorConfigsFromLocalDisplays({
     storedMonitorConfigs.length === 1 && !normalizeText(storedMonitorConfigs[0].displayKey)
       ? storedMonitorConfigs[0]
       : null;
+  const singleMacSoftMatchAllowed = shouldAllowSingleMacSoftDisplayMatch(
+    displaySummaries,
+    unmatchedStoredMonitorConfigs
+  );
   let legacyMonitorConfigConsumed = false;
   const usedMonitorIds = new Set();
   const nextMonitorConfigs = [];
@@ -1557,6 +1568,8 @@ async function syncMonitorConfigsFromLocalDisplays({
           normalizeText(monitorConfig.displayKey) === displaySummary.displayKey ||
           (macHardwareDisplayKey &&
             buildMacHardwareDisplayKey(monitorConfig) === macHardwareDisplayKey) ||
+          (singleMacSoftMatchAllowed &&
+            isSingleMacSoftDisplayMatch(monitorConfig, displaySummary)) ||
           (Number.isInteger(displaySummary.macSystemDisplayId) &&
             monitorConfig.match?.macSystemDisplayId === displaySummary.macSystemDisplayId) ||
           (displaySummary.gdiDeviceName &&
@@ -2076,6 +2089,50 @@ function buildMacHardwareDisplayKey(monitorContextOrDisplay) {
   }
 
   return `mac-hw:${vendorId}:${productId}:${serialNumber}`;
+}
+
+function shouldAllowSingleMacSoftDisplayMatch(displaySummaries, unmatchedStoredMonitorConfigs) {
+  return (
+    process.platform === "darwin" &&
+    Array.isArray(displaySummaries) &&
+    displaySummaries.length === 1 &&
+    Array.isArray(unmatchedStoredMonitorConfigs) &&
+    unmatchedStoredMonitorConfigs.length === 1
+  );
+}
+
+function isSingleMacSoftDisplayMatch(monitorConfig, displaySummary) {
+  const storedSoftKey = buildMacSoftDisplayKey(monitorConfig);
+  const displaySoftKey = buildMacSoftDisplayKey(displaySummary);
+  return Boolean(storedSoftKey && displaySoftKey && storedSoftKey === displaySoftKey);
+}
+
+function buildMacSoftDisplayKey(monitorContextOrDisplay) {
+  const vendorId = normalizeText(
+    monitorContextOrDisplay?.display?.macVendorId ||
+      monitorContextOrDisplay?.match?.macVendorId ||
+      monitorContextOrDisplay?.macVendorId ||
+      monitorContextOrDisplay?.vendorId
+  ).toLowerCase();
+  const productId = normalizeText(
+    monitorContextOrDisplay?.display?.macProductId ||
+      monitorContextOrDisplay?.match?.macProductId ||
+      monitorContextOrDisplay?.macProductId ||
+      monitorContextOrDisplay?.productId
+  ).toLowerCase();
+  const displayName = normalizeText(
+    monitorContextOrDisplay?.display?.detectedName ||
+      monitorContextOrDisplay?.display?.displayName ||
+      monitorContextOrDisplay?.detectedName ||
+      monitorContextOrDisplay?.displayName ||
+      monitorContextOrDisplay?.name
+  ).toLowerCase();
+
+  if (!vendorId || !productId || !displayName) {
+    return "";
+  }
+
+  return `mac-soft:${vendorId}:${productId}:${displayName}`;
 }
 
 async function getWindowsTopologyDisplays() {

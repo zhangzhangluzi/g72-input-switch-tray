@@ -29,6 +29,10 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /screen\.getPrimaryDisplay\(\)\?\.id/u);
   assert.match(mainSource, /DISPLAY_NAME_FALLBACK_ALLOWED: displaySummary\.displayNameIsUnique \? "1" : "0"/u);
   assert.match(mainSource, /const resolvedMonitorId = normalizeText\(matchingMonitorConfig\?\.id\) \|\| displaySummary\.id;/u);
+  assert.match(mainSource, /singleMacSoftMatchAllowed/u);
+  assert.match(mainSource, /function shouldAllowSingleMacSoftDisplayMatch/u);
+  assert.match(mainSource, /function isSingleMacSoftDisplayMatch/u);
+  assert.match(mainSource, /function buildMacSoftDisplayKey/u);
   assert.match(mainSource, /function withDisplayNameUniqueness/u);
   assert.match(mainSource, /async function attemptPendingWindowsRestores\(\{\s*monitorId: targetMonitorId = null,\s*displaySummaries = null,/u);
   assert.match(mainSource, /const externalDisplays = orderedDisplays\.filter\(\(display\) => !display\.internal\);/u);
@@ -87,6 +91,8 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function decodePathSegment\(value\)/u);
   assert.match(mainSource, /createHttpError\(400, "请求路径编码无效。"\)/u);
   assert.doesNotMatch(mainSource, /request\.headers\.host/u);
+  assert.match(mainSource, /function shouldLogControlRequestError\(error\)/u);
+  assert.match(mainSource, /if \(shouldLogControlRequestError\(error\)\) \{\s*appendDiagnosticLog\("Control request failed", error\);/u);
   assert.match(mainSource, /async function mapSequential\(items, mapper\)/u);
   assert.match(mainSource, /const probeResults = await mapSequential\(/u);
   assert.doesNotMatch(mainSource, /request\.destroy\(\)/u);
