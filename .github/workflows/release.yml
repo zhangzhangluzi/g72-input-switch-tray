@@ -131,7 +131,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $assets = Get-ChildItem -Path release -File | ForEach-Object { $_.FullName }
+          $assets = @()
+          $assets += Get-ChildItem -Path release -File -Filter "g72-input-switch-tray-setup-*.exe"
+          $assets += Get-ChildItem -Path release -File -Filter "g72-input-switch-tray-setup-*.exe.blockmap"
+          $assets += Get-ChildItem -Path release -File -Filter "latest.yml"
+          if ($assets.Count -lt 3) {
+            throw "Windows release assets are incomplete."
+          }
           gh release upload $env:GITHUB_REF_NAME $assets --clobber
 
   release-macos:
@@ -169,8 +175,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          assets=()
-          while IFS= read -r -d '' file; do
-            assets+=("$file")
-          done < <(find release -maxdepth 1 -type f -print0)
+          assets=(
+            release/g72-input-switch-tray-*-arm64.dmg
+            release/g72-input-switch-tray-*-arm64.dmg.blockmap
+            release/g72-input-switch-tray-*-arm64.zip
+            release/g72-input-switch-tray-*-arm64.zip.blockmap
+            release/latest-mac.yml
+          )
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+          done
           gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
