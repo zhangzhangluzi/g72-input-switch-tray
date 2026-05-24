@@ -301,9 +301,12 @@ function buildTrayMonitorItem(monitorContext) {
   const currentInputLabel = Number.isInteger(monitorContext.status.currentInputValue)
     ? describeInputValue(monitorContext.status.currentInputValue)
     : monitorContext.status.visible
-      ? "未知"
+      ? monitorContext.status.ddcAvailable === false
+        ? "不可控"
+        : "未知"
       : "当前不在本机";
   const runtime = getMonitorDesktopRuntime(monitorContext.id);
+  const directSwitchEnabled = isMonitorDirectSwitchEnabled(monitorContext);
 
   return {
     label: getMonitorDisplayTitle(monitorContext),
@@ -330,7 +333,7 @@ function buildTrayMonitorItem(monitorContext) {
       { type: "separator" },
       ...TARGET_IDS.map((targetId) => ({
         label: `直接切到 ${getSwitchActionLabel(targetId, monitorContext.monitor)}`,
-        enabled: monitorContext.status.visible !== false,
+        enabled: directSwitchEnabled,
         click: () => handleTrayDirectSwitch(monitorContext.id, targetId),
       })),
       ...(process.platform === "win32"
@@ -689,6 +692,21 @@ async function switchMonitorUnlocked(monitorId, targetId, options = {}) {
     throw error;
   }
 
+  if (runtimeStatus.ddcAvailable === false) {
+    const error = new Error(
+      `${getMonitorDisplayTitle(monitorContext)} 当前没有可用的 DDC/CI 控制通道，不能从这台机器直接切换。`
+    );
+    recordSwitchOutcome("error", monitorId, targetId, error.message);
+    saveState(state);
+    void refreshMenu();
+
+    if (showErrorDialog) {
+      dialog.showErrorBox(APP_NAME, error.message);
+    }
+
+    throw error;
+  }
+
   try {
     let switchResult = null;
     if (process.platform === "win32") {
@@ -1003,7 +1021,7 @@ function getMacSwitchScriptEnvForDisplay(displaySummary) {
   return env;
 }
 
-async function getMacDdcCapableDisplaySummaries(displaySummaries) {
+async function attachMacDdcProbeResults(displaySummaries) {
   if (process.platform !== "darwin" || !Array.isArray(displaySummaries)) {
     return displaySummaries;
   }
@@ -1016,12 +1034,28 @@ async function getMacDdcCapableDisplaySummaries(displaySummaries) {
     })
   );
 
-  return probeResults
-    .filter(
-      ({ displaySummary, probeResult }) =>
-        probeResult.ok && hasMacSafeDdcTargetIdentity(displaySummary)
-    )
-    .map(({ displaySummary }) => displaySummary);
+  return probeResults.map(({ displaySummary, probeResult }) => {
+    const safeIdentity = hasMacSafeDdcTargetIdentity(displaySummary);
+    return {
+      ...displaySummary,
+      ddcProbe: createDdcProbeSummary(
+        {
+          ...probeResult,
+          ok: Boolean(probeResult.ok && safeIdentity),
+        },
+        safeIdentity ? "" : "当前 macOS 屏幕缺少可安全定位的 DDC 目标身份。"
+      ),
+    };
+  });
+}
+
+function createDdcProbeSummary(probeResult, fallbackError = "") {
+  const ok = Boolean(probeResult?.ok);
+  return {
+    ok,
+    status: normalizeText(probeResult?.status) || (ok ? "ok" : "failed"),
+    error: ok ? "" : normalizeText(probeResult?.error) || normalizeText(fallbackError),
+  };
 }
 
 function hasMacSafeDdcTargetIdentity(displaySummary) {
@@ -1468,6 +1502,16 @@ async function buildMonitorContextsWithStatus(options = {}) {
 
 async function getMonitorStatus(monitorContext, options = {}) {
   const { topologyDisplays = null } = options;
+  if (monitorContext.display?.ddcProbe?.ok === false) {
+    return {
+      visible: true,
+      ddcAvailable: false,
+      ddcUnavailableReason: getDisplayDdcUnavailableReason(monitorContext.display),
+      currentInputValue: null,
+      currentInputError: getDisplayDdcUnavailableReason(monitorContext.display),
+    };
+  }
+
   if (process.platform === "win32") {
     const resolvedTopologyDisplays = Array.isArray(topologyDisplays)
       ? topologyDisplays
@@ -1476,6 +1520,8 @@ async function getMonitorStatus(monitorContext, options = {}) {
     if (!visible) {
       return {
         visible: false,
+        ddcAvailable: false,
+        ddcUnavailableReason: "",
         currentInputValue: null,
         currentInputError: null,
       };
@@ -1484,6 +1530,8 @@ async function getMonitorStatus(monitorContext, options = {}) {
     const currentInputResult = await getWindowsCurrentInputResultForContext(monitorContext);
     return {
       visible: true,
+      ddcAvailable: true,
+      ddcUnavailableReason: "",
       currentInputValue: currentInputResult.ok ? currentInputResult.value : null,
       currentInputError: currentInputResult.ok ? null : currentInputResult.error,
     };
@@ -1492,9 +1540,25 @@ async function getMonitorStatus(monitorContext, options = {}) {
   const currentInputResult = await getMacCurrentInputResultForContext(monitorContext);
   return {
     visible: true,
+    ddcAvailable: true,
+    ddcUnavailableReason: "",
     currentInputValue: currentInputResult.ok ? currentInputResult.value : null,
     currentInputError: currentInputResult.ok ? null : currentInputResult.error,
   };
+}
+
+function isMonitorDirectSwitchEnabled(monitorContext) {
+  return (
+    monitorContext?.status?.visible !== false &&
+    monitorContext?.status?.ddcAvailable !== false
+  );
+}
+
+function getDisplayDdcUnavailableReason(displaySummary) {
+  return (
+    normalizeText(displaySummary?.ddcProbe?.error) ||
+    "当前显示器没有可用的 DDC/CI 控制通道。"
+  );
 }
 
 async function getConnectedMonitorContexts({
@@ -1716,11 +1780,11 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
     const attachedTopologyDisplays = topologyDisplays
       .filter((display) => display.attached)
       .sort(compareDisplayLikeObjects);
-    const ddcCapableTopologyDisplays = await getWindowsDdcCapableTopologyDisplays(
+    const ddcProbeResultsByDeviceName = await getWindowsDdcProbeResultsByDeviceName(
       attachedTopologyDisplays
     );
     const switchableTopologyDisplays = mapWindowsTopologyDisplaysToElectronDisplays(
-      ddcCapableTopologyDisplays,
+      attachedTopologyDisplays,
       orderedDisplays
     )
       .filter(({ electronDisplay }) => Boolean(electronDisplay) && !electronDisplay.internal);
@@ -1753,6 +1817,9 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
             topologyDisplay.deviceString ||
             ""
         );
+        const ddcProbe = ddcProbeResultsByDeviceName.get(
+          normalizeText(topologyDisplay.deviceName).toLowerCase()
+        );
 
         return {
           id: createMonitorId(displayKey),
@@ -1766,6 +1833,7 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
           electronDisplayId: Number.isInteger(electronDisplay?.id) ? electronDisplay.id : null,
           gdiDeviceName: normalizeText(topologyDisplay.deviceName),
           productCode: normalizeText(topologyDisplay.productCode),
+          ddcProbe: createDdcProbeSummary(ddcProbe, "Windows 没有找到可用的物理显示器 DDC/CI 句柄。"),
           bounds: {
             x: topologyDisplay.positionX,
             y: topologyDisplay.positionY,
@@ -1828,7 +1896,7 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
     })
   );
 
-  return getMacDdcCapableDisplaySummaries(externalDisplaySummaries);
+  return attachMacDdcProbeResults(externalDisplaySummaries);
 }
 
 function withDisplayNameUniqueness(displaySummaries) {
@@ -2171,9 +2239,9 @@ function normalizeWindowsTopologyDisplay(display) {
   };
 }
 
-async function getWindowsDdcCapableTopologyDisplays(attachedTopologyDisplays) {
+async function getWindowsDdcProbeResultsByDeviceName(attachedTopologyDisplays) {
   if (!Array.isArray(attachedTopologyDisplays) || attachedTopologyDisplays.length === 0) {
-    return [];
+    return new Map();
   }
 
   const probeResults = await mapSequential(
@@ -2184,9 +2252,14 @@ async function getWindowsDdcCapableTopologyDisplays(attachedTopologyDisplays) {
     })
   );
 
-  return probeResults
-    .filter(({ probeResult }) => probeResult.ok)
-    .map(({ topologyDisplay }) => topologyDisplay);
+  return new Map(
+    probeResults
+      .map(({ topologyDisplay, probeResult }) => [
+        normalizeText(topologyDisplay?.deviceName).toLowerCase(),
+        probeResult,
+      ])
+      .filter(([deviceName]) => Boolean(deviceName))
+  );
 }
 
 async function getWindowsDdcProbeResult(topologyDisplay) {
@@ -2219,6 +2292,7 @@ async function getWindowsDdcProbeResult(topologyDisplay) {
     const parsed = JSON.parse(output);
     const nextResult = {
       ok: Boolean(parsed?.ok) && Number(parsed?.physicalMonitorCount || 0) > 0,
+      status: Boolean(parsed?.ok) ? "ok" : "failed",
       checkedAt: Date.now(),
       error: "",
     };
@@ -2227,6 +2301,7 @@ async function getWindowsDdcProbeResult(topologyDisplay) {
   } catch (error) {
     const nextResult = {
       ok: false,
+      status: "failed",
       checkedAt: Date.now(),
       error: normalizeText(error.message),
     };
@@ -2560,13 +2635,16 @@ function renderInterfaceStatusCard(monitorContext, targetId) {
   const isCurrent = Number.isInteger(currentInputValue)
     ? getExpectedProbeInputValues(target.inputValue, monitorContext.monitor).includes(currentInputValue)
     : false;
-  const directSwitchEnabled = monitorContext.status.visible !== false;
+  const directSwitchEnabled = isMonitorDirectSwitchEnabled(monitorContext);
 
   let statusText = "连接状态未知";
   let detailText = "未激活接口是否真的接了机器，DDC/CI 不能无损读出来。";
   if (!monitorContext.status.visible) {
     statusText = "当前不在本机";
     detailText = "这块屏当前不在本机桌面里，所以本机无法直接读取它的当前输入。";
+  } else if (monitorContext.status.ddcAvailable === false) {
+    statusText = "当前不可控";
+    detailText = monitorContext.status.ddcUnavailableReason;
   } else if (isCurrent) {
     statusText = "当前正在显示";
     detailText = `当前输入回报：${describeInputValue(currentInputValue)}。`;

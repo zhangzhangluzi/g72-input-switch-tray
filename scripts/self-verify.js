@@ -67,8 +67,14 @@ function verifyMainSourceBusinessGuards() {
   assert.doesNotMatch(mainSource, /Skipping Windows desktop detach for primary display/u);
   assert.match(mainSource, /promoteWindowsPrimaryAwayBeforeSwitch/u);
   assert.match(mainSource, /-PromotePrimaryAwayFromMonitor/u);
-  assert.match(mainSource, /getWindowsDdcCapableTopologyDisplays/u);
-  assert.match(mainSource, /getMacDdcCapableDisplaySummaries/u);
+  assert.match(mainSource, /getWindowsDdcProbeResultsByDeviceName/u);
+  assert.match(mainSource, /attachMacDdcProbeResults/u);
+  assert.match(mainSource, /function createDdcProbeSummary/u);
+  assert.match(mainSource, /function isMonitorDirectSwitchEnabled/u);
+  assert.match(mainSource, /ddcProbe: createDdcProbeSummary/u);
+  assert.match(mainSource, /runtimeStatus\.ddcAvailable === false/u);
+  assert.match(mainSource, /statusText = "当前不可控"/u);
+  assert.doesNotMatch(mainSource, /return getMacDdcCapableDisplaySummaries\(externalDisplaySummaries\)/u);
   assert.match(mainSource, /statusText = "当前输入未知"/u);
   assert.doesNotMatch(mainSource, /statusText = "读取失败"/u);
   assert.doesNotMatch(mainSource, /没有真正切到/u);
@@ -160,9 +166,14 @@ function verifyCiWorkflowTriggers() {
   assert.match(workflow, /branches:\s*\n\s*- main/u);
   assert.match(workflow, /tags:\s*\n\s*- "v\*"/u);
   assert.match(workflow, /permissions:\s*\n\s*contents: read/u);
+  assert.match(workflow, /create-release:/u);
   assert.match(workflow, /release-windows:/u);
   assert.match(workflow, /release-macos:/u);
   assert.match(workflow, /contents: write/u);
+  assert.match(workflow, /gh release upload/u);
+  assert.match(workflow, /npm run dist:win/u);
+  assert.match(workflow, /npm run dist:mac/u);
+  assert.doesNotMatch(workflow, /npm run release/u);
 }
 
 function findPowerShellCommand() {
@@ -560,12 +571,16 @@ function verifyMacHelperAppsIfAvailable() {
     "mac-arm64",
     "显示器输入切换.app"
   );
-  const installedAppPath = "/Applications/显示器输入切换.app";
   if (fs.existsSync(builtAppPath)) {
     verifyMacHelperApps(builtAppPath);
     return;
   }
 
+  if (process.env.SELF_VERIFY_ALLOW_INSTALLED_MAC_APP_BUNDLE !== "1") {
+    throw new Error(`No built macOS app bundle was found: ${builtAppPath}`);
+  }
+
+  const installedAppPath = "/Applications/显示器输入切换.app";
   if (fs.existsSync(installedAppPath)) {
     verifyMacHelperApps(installedAppPath);
     return;
