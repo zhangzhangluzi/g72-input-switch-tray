@@ -1266,15 +1266,43 @@ try {
             $usePreferredPosition = $PSBoundParameters.ContainsKey("PreferredPositionX") -and $PSBoundParameters.ContainsKey("PreferredPositionY")
             $resolvedPreferredPositionX = if ($null -ne $PreferredPositionX) { [int]$PreferredPositionX } else { 0 }
             $resolvedPreferredPositionY = if ($null -ne $PreferredPositionY) { [int]$PreferredPositionY } else { 0 }
+            $preferredModeDisplayEntry = @(
+                $displayEntries |
+                    Where-Object { $_.Attached -and $_.Width -gt 0 -and $_.Height -gt 0 } |
+                    Sort-Object @{ Expression = { -not $_.Primary } }, DeviceName
+            ) | Select-Object -First 1
+            $resolvedPreferredWidth = [int]$targetDisplayEntry.Width
+            $resolvedPreferredHeight = [int]$targetDisplayEntry.Height
+            $resolvedPreferredBitsPerPel = [int]$targetDisplayEntry.BitsPerPel
+            $resolvedPreferredDisplayFrequency = [int]$targetDisplayEntry.DisplayFrequency
+
+            if ($null -ne $preferredModeDisplayEntry) {
+                if ($resolvedPreferredWidth -le 0) {
+                    $resolvedPreferredWidth = [int]$preferredModeDisplayEntry.Width
+                }
+
+                if ($resolvedPreferredHeight -le 0) {
+                    $resolvedPreferredHeight = [int]$preferredModeDisplayEntry.Height
+                }
+
+                if ($resolvedPreferredBitsPerPel -le 0) {
+                    $resolvedPreferredBitsPerPel = [int]$preferredModeDisplayEntry.BitsPerPel
+                }
+
+                if ($resolvedPreferredDisplayFrequency -le 0) {
+                    $resolvedPreferredDisplayFrequency = [int]$preferredModeDisplayEntry.DisplayFrequency
+                }
+            }
+
             [NativeDisplayTopology]::AttachDisplayByDeviceName(
                 $targetDisplayEntry.DeviceName,
                 $resolvedPreferredPositionX,
                 $resolvedPreferredPositionY,
                 [bool]$usePreferredPosition,
-                [int]$targetDisplayEntry.Width,
-                [int]$targetDisplayEntry.Height,
-                [int]$targetDisplayEntry.BitsPerPel,
-                [int]$targetDisplayEntry.DisplayFrequency
+                $resolvedPreferredWidth,
+                $resolvedPreferredHeight,
+                $resolvedPreferredBitsPerPel,
+                $resolvedPreferredDisplayFrequency
             )
             Write-Output (@{
                 ok = $true

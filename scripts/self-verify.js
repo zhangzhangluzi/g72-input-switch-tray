@@ -50,7 +50,11 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function renderWindowsTakeoverSection/u);
   assert.match(mainSource, /\/windows\/takeover\//u);
   assert.match(mainSource, /await attachWindowsDisplayForMonitor\(/u);
-  assert.match(mainSource, /await switchMonitor\(monitorConfig\.id, localTargetId/u);
+  assert.match(mainSource, /async function switchWindowsDisplayForMonitorConfig/u);
+  assert.match(mainSource, /await switchWindowsDisplayForMonitorConfig\(monitorConfig, localTarget\)/u);
+  assert.match(mainSource, /function formatWindowsTakeoverError/u);
+  assert.match(mainSource, /不向 Windows 暴露控制句柄/u);
+  assert.match(mainSource, /"-GdiDeviceName",\s*deviceName/u);
   assert.match(mainSource, /normalizeText\(monitorConfig\?\.match\?\.gdiDeviceName\)/u);
   assert.match(mainSource, /const externalDisplays = orderedDisplays\.filter\(\(display\) => !display\.internal\);/u);
   assert.match(
@@ -148,6 +152,7 @@ function verifyLocalOnlyDocs() {
   assert.match(handoffDoc, /no LAN peer discovery/u);
   assert.match(handoffDoc, /does not blindly re-add a detached waiting screen/u);
   assert.match(handoffDoc, /takeover path first attaches the detached Windows display device/u);
+  assert.match(handoffDoc, /hardware-bound/u);
   assert.match(handoffDoc, /same-model duplicate attached to Windows while its input is not that screen's configured local interface/u);
   assert.match(
     handoffDoc,
@@ -190,6 +195,8 @@ function verifyWindowsHelperSourceGuards() {
   assert.match(topologyScript, /ApplyPrimaryDisplayWithStableLayout/u);
   assert.match(topologyScript, /display\.PositionX - offsetX/u);
   assert.match(topologyScript, /display\.PositionY - offsetY/u);
+  assert.match(topologyScript, /preferredModeDisplayEntry/u);
+  assert.match(topologyScript, /resolvedPreferredWidth/u);
   assert.match(topologyScript, /RollbackDisplayModes/u);
   assert.match(setInputScript, /\[switch\]\$ProbeDdc/u);
   assert.match(setInputScript, /physicalMonitorCount/u);

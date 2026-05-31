@@ -391,7 +391,7 @@ function buildTrayWindowsTakeoverMenuItems(windowsTakeoverContexts) {
   if (!Array.isArray(windowsTakeoverContexts) || windowsTakeoverContexts.length === 0) {
     return [
       {
-        label: "主动接管断开的 Windows 屏幕：当前没有候选",
+        label: "尝试主动接管断开的 Windows 屏幕：当前没有候选",
         enabled: false,
       },
     ];
@@ -399,11 +399,11 @@ function buildTrayWindowsTakeoverMenuItems(windowsTakeoverContexts) {
 
   return [
     {
-      label: "主动接管断开的 Windows 屏幕",
+      label: "尝试主动接管断开的 Windows 屏幕",
       submenu: windowsTakeoverContexts.map((monitorContext) => {
         const localTarget = getTarget(getLocalInterfaceId(monitorContext.monitor), monitorContext.monitor);
         return {
-          label: `接管 ${getMonitorDisplayTitle(monitorContext)} -> ${localTarget.label}`,
+          label: `尝试接管 ${getMonitorDisplayTitle(monitorContext)} -> ${localTarget.label}`,
           click: () => handleTrayWindowsTakeover(monitorContext.id),
         };
       }),
@@ -1494,10 +1494,7 @@ async function takeoverWindowsDetachedMonitor(
       await syncMonitorConfigsFromLocalDisplays({ persist: true });
     }
 
-    const switchResult = await switchMonitor(monitorConfig.id, localTargetId, {
-      notifyOnSuccess: false,
-      showErrorDialog: false,
-    });
+    const switchResult = await switchWindowsDisplayForMonitorConfig(monitorConfig, localTarget);
     clearMonitorPendingRestore(monitorConfig.id);
     await syncMonitorConfigsFromLocalDisplays({ persist: true });
     void refreshMenu();
@@ -1506,6 +1503,8 @@ async function takeoverWindowsDetachedMonitor(
       switchResult?.verificationStatus === "unconfirmed"
         ? `${getMonitorDisplayTitle(monitorConfig)} 已接回 Windows 桌面，并已发送切到 ${localTarget.label} 的命令，结果待人工确认。`
         : `${getMonitorDisplayTitle(monitorConfig)} 已主动接管到 ${localTarget.label}。`;
+    recordSwitchOutcome("success", monitorConfig.id, localTargetId, message);
+    saveState(state);
 
     if (notifyOnSuccess) {
       notify(message);
@@ -1524,7 +1523,7 @@ async function takeoverWindowsDetachedMonitor(
       }
     }
 
-    const message = normalizeText(error.message) || "Windows 主动接管失败。";
+    const message = formatWindowsTakeoverError(monitorConfig, localTarget, error);
     recordSwitchOutcome("error", monitorConfig.id, localTargetId, message);
     saveState(state);
     void refreshMenu();
@@ -1535,6 +1534,68 @@ async function takeoverWindowsDetachedMonitor(
 
     throw new Error(message);
   }
+}
+
+function formatWindowsTakeoverError(monitorConfig, localTarget, error) {
+  const rawMessage = normalizeText(error?.message || error);
+  const monitorTitle = getMonitorDisplayTitle(monitorConfig);
+  const targetLabel = normalizeText(localTarget?.label) || "当前机器接口";
+
+  if (
+    /No monitor matched GDI device|No physical monitor handles|DDC\/CI 控制通道|physical monitor/i.test(
+      rawMessage
+    )
+  ) {
+    return `${monitorTitle} 已尝试接回 Windows，但 Windows 没有拿到这块屏的 DDC/CI 控制通道。通常表示显示器当前停在另一台机器的输入源时，不向 Windows 暴露控制句柄；这台机器不能主动把它抢回 ${targetLabel}。请先用显示器菜单切回 Windows 输入，或让当前画面所在机器切走。`;
+  }
+
+  if (/Failed to attach display|重新加回桌面拓扑|bad mode|code -2/i.test(rawMessage)) {
+    return `${monitorTitle} 无法加回 Windows 桌面拓扑。Windows 没有接受这块断开屏的显示模式，接管没有生效。原始错误：${rawMessage}`;
+  }
+
+  return rawMessage || "Windows 主动接管失败。";
+}
+
+async function switchWindowsDisplayForMonitorConfig(monitorConfig, target) {
+  const deviceName = normalizeText(monitorConfig?.match?.gdiDeviceName);
+  if (!deviceName) {
+    throw new Error("Windows 当前没有这块屏幕的可用设备标识。");
+  }
+
+  const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
+  const candidates = getInputCandidates(target, monitorConfig);
+  const expectedValues = getExpectedProbeInputValues(target.inputValue, monitorConfig);
+
+  return runSwitchCandidateSequence(candidates, async (candidate) => {
+    await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-GdiDeviceName",
+      deviceName,
+      "-InputValue",
+      String(candidate),
+    ]);
+
+    const currentInputResult = await getWindowsCurrentInputResultForTopologyDisplay({
+      deviceName,
+    });
+    if (currentInputResult.ok && expectedValues.includes(currentInputResult.value)) {
+      return {
+        verificationStatus: "confirmed",
+        message: `当前输入已确认：${describeInputValue(currentInputResult.value)}。`,
+      };
+    }
+
+    return {
+      verificationStatus: "unconfirmed",
+      message: currentInputResult.ok
+        ? `当前输入仍为 ${describeInputValue(currentInputResult.value)}。`
+        : currentInputResult.error,
+    };
+  });
 }
 
 async function attemptPendingWindowsRestores({
@@ -3434,7 +3495,7 @@ function renderWindowsTakeoverSection(windowsTakeoverContexts) {
 
   return `<div class="card soft">
     <div class="section-title">Windows 主动接管</div>
-    <div class="help" style="margin-top: 12px;">用于“共享屏现在显示 Mac，但我要从 Windows 把它接回来”。接管会先把这块屏加回 Windows 桌面，再切到配置的当前机器接口。</div>
+    <div class="help" style="margin-top: 12px;">用于“共享屏现在显示 Mac，但我要从 Windows 把它接回来”。接管会先把这块屏加回 Windows 桌面，再切到配置的当前机器接口。是否能成功取决于显示器是否在非当前输入源下仍向 Windows 暴露 DDC/CI 控制通道。</div>
     <div class="stack" style="margin-top: 16px;">
       ${contentHtml}
     </div>
@@ -3461,7 +3522,7 @@ function renderWindowsTakeoverCard(monitorContext) {
     <form method="post" action="/api/${encodeURIComponent(
       state.controlToken
     )}/windows/takeover/${encodeURIComponent(monitorContext.id)}" style="margin-top: 14px;">
-      <button type="submit">主动接管到 ${escapeHtml(localTarget.label)}</button>
+      <button type="submit">尝试接管到 ${escapeHtml(localTarget.label)}</button>
     </form>
     ${renderMonitorConfigForm(monitorContext)}
   </div>`;

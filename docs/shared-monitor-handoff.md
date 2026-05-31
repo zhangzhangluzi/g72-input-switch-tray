@@ -47,6 +47,7 @@ This project now uses one rule set only:
 - If the target Windows screen is still the current primary desktop, another attached Windows screen must become primary first before the target can be detached.
 - The background watcher does not blindly re-add a detached waiting screen. A user-triggered takeover / refresh action is the path that may add that screen back into the Windows desktop topology.
 - The takeover path first attaches the detached Windows display device, then switches that screen to the configured local interface.
+- The takeover path is hardware-bound: if the monitor does not expose a DDC/CI physical monitor handle to Windows while it is displaying another input, Windows cannot actively pull that screen back.
 - If a same-model duplicate attached to Windows while its input is not that screen's configured local interface, the app can remove that duplicate from the Windows desktop topology.
 - This is not remote coordination. It is only Windows repairing its own local desktop state.
 
