@@ -146,6 +146,8 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /async function switchMonitorUnlocked/u);
   assert.match(mainSource, /switchOperationQueue = switchTask\.catch\(\(\) => \{\}\)/u);
   assert.match(mainSource, /function shouldPreserveDisconnectedMonitorConfig/u);
+  assert.match(mainSource, /process\.platform === "darwin"[\s\S]{0,120}hasMacPersistableMonitorIdentity/u);
+  assert.match(mainSource, /function hasMacPersistableMonitorIdentity/u);
   assert.match(mainSource, /function pruneStateForKnownMonitorIds/u);
   assert.match(mainSource, /function normalizePersistedSwitchOutcome/u);
   assert.match(mainSource, /function shouldClearPersistedSwitchOutcome/u);

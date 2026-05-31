@@ -2699,6 +2699,10 @@ async function syncMonitorConfigsFromLocalDisplays({
 }
 
 function shouldPreserveDisconnectedMonitorConfig(monitorConfig) {
+  if (process.platform === "darwin") {
+    return hasMacPersistableMonitorIdentity(monitorConfig);
+  }
+
   if (process.platform !== "win32") {
     return false;
   }
@@ -2706,6 +2710,18 @@ function shouldPreserveDisconnectedMonitorConfig(monitorConfig) {
   return Boolean(
     normalizeText(monitorConfig?.match?.gdiDeviceName) ||
       getExistingMonitorDesktopRuntime(monitorConfig.id)?.pendingRestore
+  );
+}
+
+function hasMacPersistableMonitorIdentity(monitorConfig) {
+  if (!monitorConfig || typeof monitorConfig !== "object") {
+    return false;
+  }
+
+  return Boolean(
+    buildMacHardwareDisplayKey(monitorConfig) ||
+      buildMacSoftDisplayKey(monitorConfig) ||
+      normalizeText(monitorConfig.displayKey)
   );
 }
 
