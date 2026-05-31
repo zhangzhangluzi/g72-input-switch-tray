@@ -265,7 +265,7 @@ async function refreshMenu({ monitorContexts = null } = {}) {
             { type: "separator" },
             ...windowsTakeoverMenuItems,
             {
-              label: "主动刷新全部等待接回的 Windows 屏幕",
+              label: "高级：修复 Windows 屏幕状态",
               click: () => {
                 void refreshWindowsDisplayState({
                   notifyOnSuccess: true,
@@ -276,7 +276,7 @@ async function refreshMenu({ monitorContexts = null } = {}) {
         : []),
       { type: "separator" },
       {
-        label: "打开设置页",
+        label: "打开完整设置页",
         click: () => {
           shell.openExternal(`http://127.0.0.1:${getListeningPort()}${getSettingsPath()}`);
         },
@@ -329,6 +329,8 @@ function buildTrayMonitorItem(monitorContext) {
       : "当前不在本机";
   const runtime = getMonitorDesktopRuntime(monitorContext.id);
   const directSwitchEnabled = isMonitorDirectSwitchEnabled(monitorContext);
+  const peerTargetId = getPreferredPeerTargetId(monitorContext.monitor);
+  const peerTarget = peerTargetId ? getTarget(peerTargetId, monitorContext.monitor) : null;
   const ddcProbeNotice =
     monitorContext.status.ddcProbeStatus === "targetable-unconfirmed"
       ? "DDC 状态：目标可定位，结果需人工确认"
@@ -365,6 +367,20 @@ function buildTrayMonitorItem(monitorContext) {
           ]
         : []),
       { type: "separator" },
+      ...(peerTarget
+        ? [
+            {
+              label: `交给${getPeerMachineLabel(peerTargetId)}（${peerTarget.label}）`,
+              enabled: directSwitchEnabled,
+              click: () => handleTrayDirectSwitch(monitorContext.id, peerTargetId),
+            },
+            { type: "separator" },
+            {
+              label: "高级：单独切换输入源",
+              enabled: false,
+            },
+          ]
+        : []),
       ...TARGET_IDS.map((targetId) => ({
         label: `直接切到 ${getSwitchActionLabel(targetId, monitorContext.monitor)}`,
         enabled: directSwitchEnabled,
@@ -374,7 +390,7 @@ function buildTrayMonitorItem(monitorContext) {
         ? [
             { type: "separator" },
             {
-              label: "主动刷新这块 Windows 屏幕",
+              label: "高级：修复这块 Windows 屏幕状态",
               click: () => {
                 void refreshWindowsDisplayState({
                   monitorId: monitorContext.id,
@@ -396,7 +412,7 @@ function buildTrayWindowsTakeoverMenuItems(windowsTakeoverContexts) {
   if (!Array.isArray(windowsTakeoverContexts) || windowsTakeoverContexts.length === 0) {
     return [
       {
-        label: "尝试主动接管断开的 Windows 屏幕：当前没有候选",
+        label: "接回 Windows 的共享屏：当前没有可接回项",
         enabled: false,
       },
     ];
@@ -404,11 +420,11 @@ function buildTrayWindowsTakeoverMenuItems(windowsTakeoverContexts) {
 
   return [
     {
-      label: "尝试主动接管断开的 Windows 屏幕",
+      label: "接回 Windows 的共享屏",
       submenu: windowsTakeoverContexts.map((monitorContext) => {
         const localTarget = getTarget(getLocalInterfaceId(monitorContext.monitor), monitorContext.monitor);
         return {
-          label: `尝试接管 ${getMonitorDisplayTitle(monitorContext)} -> ${localTarget.label}`,
+          label: `接回 ${getMonitorDisplayTitle(monitorContext)}（${localTarget.label}）`,
           click: () => handleTrayWindowsTakeover(monitorContext.id),
         };
       }),
@@ -3484,6 +3500,81 @@ async function waitForDisplayCount(expectedCount, errorMessage) {
   throw new Error(errorMessage);
 }
 
+function getUsageIntroText() {
+  if (process.platform === "win32") {
+    return "把共享屏当成一块可以交接的屏幕：Windows 有画面时用“交给 Mac mini / 对方机器”，共享屏在对方机器时用“接回 Windows 的共享屏”。DP/HDMI 数值只是高级校准。";
+  }
+
+  if (process.platform === "darwin") {
+    return "把共享屏当成一块可以交接的屏幕：这台 Mac 有画面时用“交给 Windows / 对方机器”。屏幕已经切走后，Mac 不负责远程抢回，由 Windows 接回或用显示器菜单。";
+  }
+
+  return "把共享屏当成一块可以交接的屏幕：当前机器有画面时交给对方，屏幕在对方机器时由能看见/能控制它的机器接回。";
+}
+
+function renderUsageGuide() {
+  const items =
+    process.platform === "win32"
+      ? [
+          {
+            title: "交给对方",
+            body: "共享屏现在显示 Windows 画面时，点“交给 Mac mini / 对方机器”。软件会切到 HDMI1，并把这块屏从 Windows 桌面移除。",
+          },
+          {
+            title: "接回 Windows",
+            body: "共享屏现在在 Mac mini 上时，点“接回 Windows 的共享屏”。软件会先把屏幕加回 Windows 桌面，再切回 Windows 接口。",
+          },
+          {
+            title: "灰色第二屏",
+            body: "Windows 设置里还能看到灰色第二屏，通常只是拓扑残留或等待接回，不等于 Windows 已经真正拿到画面。卡住时再用高级修复。",
+          },
+        ]
+      : process.platform === "darwin"
+        ? [
+            {
+              title: "交给 Windows",
+              body: "共享屏现在显示 Mac 画面时，点“交给 Windows / 对方机器”。这只是把当前可见屏幕切到 Windows 输入。",
+            },
+            {
+              title: "不远程抢回",
+              body: "屏幕已经切走后，Mac 可能看不到菜单栏，也不会假装能远程抢回；请从 Windows 接回，或用显示器实体菜单。",
+            },
+            {
+              title: "只校准数值",
+              body: "DP/HDMI 的 DDC 数值只在高级配置里调整。显示器菜单名和 DDC 数值不一致时，只改数值，不改日常按钮含义。",
+            },
+          ]
+        : [
+            {
+              title: "交给对方",
+              body: "共享屏在当前机器上时，从当前机器把它切到对方输入。",
+            },
+            {
+              title: "本机接回",
+              body: "共享屏在对方机器上时，由能看见或能控制这块屏的机器把它接回。",
+            },
+            {
+              title: "高级配置",
+              body: "DP/HDMI 数值、单独输入源、状态修复只用于校准和异常处理。",
+            },
+          ];
+
+  return `<div class="card soft">
+    <div class="section-title">日常逻辑</div>
+    <div class="help" style="margin-top: 10px;">这不是两台电脑互相联网控制，而是“当前能控制这块屏的机器”对显示器发送 DDC/CI 切换命令。</div>
+    <div class="usage-grid">
+      ${items
+        .map(
+          (item) => `<div class="usage-step">
+            <div class="usage-kicker">${escapeHtml(item.title)}</div>
+            <div class="help">${escapeHtml(item.body)}</div>
+          </div>`
+        )
+        .join("")}
+    </div>
+  </div>`;
+}
+
 function renderSettingsPage(requestUrl, monitorContexts, windowsTakeoverContexts = []) {
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
@@ -3494,15 +3585,15 @@ function renderSettingsPage(requestUrl, monitorContexts, windowsTakeoverContexts
       : "";
   const globalRefreshHtml =
     process.platform === "win32"
-      ? `<div class="card soft">
-          <div class="section-title">Windows 主动刷新</div>
-          <div class="help" style="margin-top: 12px;">如果某块屏已经切回 Windows，但系统还没把它重新加回桌面，可以手动触发一次全局刷新。</div>
+      ? `<details class="advanced">
+          <summary>高级：修复 Windows 屏幕状态</summary>
+          <div class="help" style="margin-top: 12px;">只有在显卡状态卡住、共享屏已经回到 Windows 但系统没自动加回桌面，或者 Windows 设置里残留了灰色第二屏时才需要点。</div>
           <form method="post" action="/api/${encodeURIComponent(
             state.controlToken
           )}/windows/refresh" style="margin-top: 16px;">
-            <button type="submit" class="secondary">主动刷新全部等待接回的 Windows 屏幕</button>
+            <button type="submit" class="secondary">手动修复 Windows 屏幕状态</button>
           </form>
-        </div>`
+        </details>`
       : "";
   const contentHtml =
     monitorContexts.length === 0
@@ -3510,10 +3601,13 @@ function renderSettingsPage(requestUrl, monitorContexts, windowsTakeoverContexts
           <div class="section-title">当前没有本机已连接屏幕</div>
           <div class="help" style="margin-top: 12px;">识别到几块本机屏幕就显示几块。当前这台机器没有读到可展示的本机屏幕。</div>
         </div>`
-      : monitorContexts.map(renderMonitorSection).join("");
+      : `<section class="stack">
+          <div class="section-heading">当前在 ${escapeHtml(getLocalMachineLabel())} 上的屏幕</div>
+          ${monitorContexts.map(renderMonitorSection).join("")}
+        </section>`;
 
   return `<!doctype html>
-<html lang="zh-Hant">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3549,6 +3643,33 @@ function renderSettingsPage(requestUrl, monitorContexts, windowsTakeoverContexts
       margin: 4px 0 0;
       font-size: 20px;
     }
+    .section-heading {
+      font-size: 15px;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent-strong);
+    }
+    .usage-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .usage-step {
+      padding: 15px;
+      border-radius: 18px;
+      border: 1px solid rgba(13, 107, 98, 0.16);
+      background: rgba(255, 255, 255, 0.58);
+    }
+    .usage-kicker {
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent-strong);
+      margin-bottom: 8px;
+    }
     .interface-grid {
       display: grid;
       gap: 12px;
@@ -3564,6 +3685,33 @@ function renderSettingsPage(requestUrl, monitorContexts, windowsTakeoverContexts
     .interface-card.current {
       border-color: rgba(13, 107, 98, 0.42);
       box-shadow: inset 0 0 0 1px rgba(13, 107, 98, 0.12);
+    }
+    .daily-actions {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.95fr);
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .daily-card {
+      padding: 16px;
+      border-radius: 20px;
+      border: 1px solid rgba(13, 107, 98, 0.18);
+      background: rgba(231, 245, 237, 0.72);
+    }
+    .daily-card.muted {
+      border-color: var(--border);
+      background: rgba(255, 255, 255, 0.52);
+    }
+    .advanced {
+      padding: 14px;
+      border-radius: 18px;
+      border: 1px dashed rgba(31, 42, 44, 0.2);
+      background: rgba(255, 255, 255, 0.36);
+    }
+    .advanced summary {
+      cursor: pointer;
+      font-weight: 800;
+      color: var(--accent-strong);
     }
     .display-meta {
       margin-top: 6px;
@@ -3600,16 +3748,21 @@ function renderSettingsPage(requestUrl, monitorContexts, windowsTakeoverContexts
       .interface-grid {
         grid-template-columns: 1fr;
       }
+      .usage-grid,
+      .daily-actions {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
   <main>
-    <div class="eyebrow">Local Setup · v${escapeHtml(app.getVersion())}</div>
+    <div class="eyebrow">本机控制 · v${escapeHtml(app.getVersion())}</div>
     <h1>${escapeHtml(APP_NAME)} 设置</h1>
-    <p>这里只按“当前主机直接控制当前主机已连接的物理屏”工作。识别到几块本机屏幕，就展示几块。</p>
+    <p>${escapeHtml(getUsageIntroText())}</p>
     <div class="stack">
       ${statusHtml}
+      ${renderUsageGuide()}
       ${windowsTakeoverHtml}
       ${globalRefreshHtml}
       ${contentHtml}
@@ -3623,12 +3776,16 @@ function renderWindowsTakeoverSection(windowsTakeoverContexts) {
   const contexts = Array.isArray(windowsTakeoverContexts) ? windowsTakeoverContexts : [];
   const contentHtml =
     contexts.length === 0
-      ? `<div class="help" style="margin-top: 12px;">当前没有可接管的断开屏幕。只有 Windows 仍能在显示拓扑里看到的断开显示设备，才会出现在这里。</div>`
+      ? `<div class="help" style="margin-top: 12px;">当前没有需要接回的共享屏。如果共享屏已经在 ${escapeHtml(
+          getLocalMachineLabel()
+        )} 上，它会出现在下面的“当前在 ${escapeHtml(
+          getLocalMachineLabel()
+        )} 上的屏幕”里；如果它正在对方机器上，且 Windows 还能看到断开的显示设备，接回按钮才会出现在这里。</div>`
       : contexts.map(renderWindowsTakeoverCard).join("");
 
   return `<div class="card soft">
-    <div class="section-title">Windows 主动接管</div>
-    <div class="help" style="margin-top: 12px;">用于“共享屏现在显示 Mac，但我要从 Windows 把它接回来”。接管会先把这块屏加回 Windows 桌面，再切到配置的当前机器接口。是否能成功取决于显示器是否在非当前输入源下仍向 Windows 暴露 DDC/CI 控制通道。</div>
+    <div class="section-title">接回 ${escapeHtml(getLocalMachineLabel())}</div>
+    <div class="help" style="margin-top: 12px;">用于“共享屏现在给对方机器用，我要把它拿回这台电脑”。软件会先把共享屏加回 Windows 桌面，再切到当前机器接口。这个动作依赖显卡和显示器在切到别的输入源时仍允许 Windows 控制 DDC/CI。</div>
     <div class="stack" style="margin-top: 16px;">
       ${contentHtml}
     </div>
@@ -3640,24 +3797,29 @@ function renderWindowsTakeoverCard(monitorContext) {
   const runtime = getExistingMonitorDesktopRuntime(monitorContext.id);
   const candidateSourceText =
     monitorContext.takeoverSource === "heuristic"
-      ? "候选来源：Windows 拓扑推断"
+      ? "识别来源：Windows 拓扑推断"
       : runtime?.pendingRestore
-        ? "候选来源：等待接回记录"
-        : "候选来源：已保存屏幕配置";
+        ? "识别来源：等待接回记录"
+        : "识别来源：已保存屏幕配置";
 
   return `<div class="interface-card">
     <div class="section-title">${escapeHtml(getMonitorDisplayTitle(monitorContext))}</div>
     <div class="display-meta">
       ${escapeHtml(getMonitorSystemIdentityText(monitorContext))}<br>
       ${escapeHtml(candidateSourceText)}<br>
-      接管目标：${escapeHtml(localTarget.label)}（输入值 ${escapeHtml(String(localTarget.inputValue))}）
+      接回目标：${escapeHtml(getLocalMachineLabel())}（${escapeHtml(localTarget.label)}，输入值 ${escapeHtml(
+        String(localTarget.inputValue)
+      )}）
     </div>
     <form method="post" action="/api/${encodeURIComponent(
       state.controlToken
     )}/windows/takeover/${encodeURIComponent(monitorContext.id)}" style="margin-top: 14px;">
-      <button type="submit">尝试接管到 ${escapeHtml(localTarget.label)}</button>
+      <button type="submit">接回 ${escapeHtml(getLocalMachineLabel())}</button>
     </form>
-    ${renderMonitorConfigForm(monitorContext)}
+    <details class="advanced" style="margin-top: 14px;">
+      <summary>高级：校准这块屏</summary>
+      ${renderMonitorConfigForm(monitorContext)}
+    </details>
   </div>`;
 }
 
@@ -3668,7 +3830,7 @@ function renderMonitorSection(monitorContext) {
       ? `<form method="post" action="/api/${encodeURIComponent(
           state.controlToken
         )}/windows/refresh/${encodeURIComponent(monitorContext.id)}" style="margin-top: 16px;">
-          <button type="submit" class="secondary">主动刷新这块 Windows 屏幕</button>
+          <button type="submit" class="secondary">手动修复这块屏幕状态</button>
         </form>`
       : "";
 
@@ -3687,11 +3849,57 @@ function renderMonitorSection(monitorContext) {
         ? `<div class="banner success" style="margin-top: 12px;">这块屏已经标记为“等待接回”。Windows 会持续尝试把它重新加回桌面。</div>`
         : ""
     }
-    <div class="interface-grid">
-      ${TARGET_IDS.map((targetId) => renderInterfaceStatusCard(monitorContext, targetId)).join("")}
+    ${renderDailyVisibleMonitorActions(monitorContext)}
+    <details class="advanced" style="margin-top: 16px;">
+      <summary>高级：单独切输入源 / 校准 DDC 值</summary>
+      <div class="interface-grid">
+        ${TARGET_IDS.map((targetId) => renderInterfaceStatusCard(monitorContext, targetId)).join("")}
+      </div>
+      ${renderMonitorConfigForm(monitorContext)}
+      ${refreshHtml}
+    </details>
+  </div>`;
+}
+
+function renderDailyVisibleMonitorActions(monitorContext) {
+  const directSwitchEnabled = isMonitorDirectSwitchEnabled(monitorContext);
+  const peerTargetId = getPreferredPeerTargetId(monitorContext.monitor);
+  const peerTarget = peerTargetId ? getTarget(peerTargetId, monitorContext.monitor) : null;
+  const localTarget = getTarget(getLocalInterfaceId(monitorContext.monitor), monitorContext.monitor);
+  const currentText = Number.isInteger(monitorContext.status.currentInputValue)
+    ? `当前回读：${describeInputValue(monitorContext.status.currentInputValue)}`
+    : monitorContext.status.ddcAvailable === false
+      ? "当前不能确认输入源，但可以按按钮发送切换命令。"
+      : "当前输入源未知，切换后可能需要人工看屏幕确认。";
+
+  if (!peerTarget) {
+    return `<div class="banner error" style="margin-top: 14px;">没有找到可交给对方机器的接口，请在高级配置里检查当前机器接口。</div>`;
+  }
+
+  return `<div class="daily-actions">
+    <div class="daily-card">
+      <div class="section-title">日常动作</div>
+      <div class="help" style="margin-top: 10px;">
+        这块屏现在在 ${escapeHtml(getLocalMachineLabel())} 上。<br>
+        ${escapeHtml(currentText)}
+      </div>
+      <form method="post" action="/api/${encodeURIComponent(state.controlToken)}/switch/${encodeURIComponent(
+        monitorContext.id
+      )}/${encodeURIComponent(peerTargetId)}" style="margin-top: 14px;">
+        <button type="submit"${directSwitchEnabled ? "" : " disabled"}>
+          交给${escapeHtml(getPeerMachineLabel(peerTargetId))}（${escapeHtml(peerTarget.label)}）
+        </button>
+      </form>
+      <div class="help" style="margin-top: 10px;">
+        执行后会先把显示器切到 ${escapeHtml(peerTarget.label)}；如果当前机器是 Windows，还会把这块屏从桌面里移除，让窗口回到主屏。
+      </div>
     </div>
-    ${renderMonitorConfigForm(monitorContext)}
-    ${refreshHtml}
+    <div class="daily-card muted">
+      <div class="section-title">当前机器接口</div>
+      <div class="help" style="margin-top: 10px;">
+        ${escapeHtml(getLocalMachineLabel())} 使用 ${escapeHtml(localTarget.label)}。如果显示器菜单里名字和 DDC 数值不一致，只改下面高级配置里的输入值，不改日常按钮。
+      </div>
+    </div>
   </div>`;
 }
 
@@ -4165,6 +4373,42 @@ function getSwitchActionLabel(targetId, monitorConfig) {
   return isLocalInterfaceTarget(targetId, monitorConfig)
     ? `${target.label}（当前机器接口）`
     : target.label;
+}
+
+function getPreferredPeerTargetId(monitorConfig) {
+  const localInterfaceId = getLocalInterfaceId(monitorConfig);
+  const preferredTargetId =
+    process.platform === "win32" ? "hdmi1" : process.platform === "darwin" ? "dp2" : "";
+
+  if (preferredTargetId && preferredTargetId !== localInterfaceId) {
+    return preferredTargetId;
+  }
+
+  return TARGET_IDS.find((targetId) => targetId !== localInterfaceId) || "";
+}
+
+function getLocalMachineLabel() {
+  if (process.platform === "win32") {
+    return "Windows";
+  }
+
+  if (process.platform === "darwin") {
+    return "这台 Mac";
+  }
+
+  return "这台电脑";
+}
+
+function getPeerMachineLabel(targetId = "") {
+  if (process.platform === "win32" && targetId === "hdmi1") {
+    return "Mac mini / 对方机器";
+  }
+
+  if (process.platform === "darwin" && targetId === "dp2") {
+    return "Windows / 对方机器";
+  }
+
+  return "对方机器";
 }
 
 function shouldUseSamsungMstarCompat(monitorConfig) {

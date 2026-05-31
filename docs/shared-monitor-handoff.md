@@ -8,6 +8,14 @@ This project now uses one rule set only:
 - no shared-screen negotiation layer
 - no remote prepare / receive handshake
 
+## Daily user model
+
+- `Give to peer`: use this when the shared screen is currently visible on the local host. On Windows this also removes the shared screen from the Windows desktop topology so windows move back to the remaining screen.
+- `Take back to Windows`: use this when the shared screen is currently on the peer machine but Windows still has a detached display device candidate. The app first re-attaches that Windows display device, then switches the monitor back to the configured local Windows interface.
+- `Advanced repair`: use this only when Windows display state is stuck, for example when Settings still shows a gray second screen after the shared monitor has been handed away.
+- A gray second screen in Windows Settings is not treated as proof that Windows owns the picture. It can be a detached / remembered topology entry.
+- DP / HDMI numeric values are calibration data only. UI labels should keep the user's mental model stable even when MCCS values differ from the monitor menu names.
+
 ## Current business rules
 
 ### 1. Screen discovery

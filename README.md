@@ -2,6 +2,16 @@
 
 Cross-platform tray app for switching each locally connected external DDC/CI-capable monitor directly between four configurable input interfaces.
 
+## 日常使用逻辑
+
+这个软件现在按“共享屏交接”理解，不按“两个电脑互相联网控制”理解：
+
+- 共享屏现在显示 Windows 画面时，在 Windows 托盘点 `交给 Mac mini / 对方机器`。Windows 会发送切到对方输入的命令，并把这块屏从 Windows 桌面移除，让窗口回到剩下的主屏。
+- 共享屏现在显示 Mac mini 画面时，在 Windows 托盘点 `接回 Windows 的共享屏`。Windows 会先尝试把断开的显示设备加回桌面，再发送切回 Windows 接口的命令。
+- Windows 设置里看到灰色第二屏，通常只是拓扑残留或等待接回，不代表 Windows 已经真正拿到画面。卡住时再用 `高级：修复 Windows 屏幕状态`。
+- macOS 端只控制当前还能被 Mac 看见的屏幕。屏幕已经切走之后，Mac 不负责远程抢回，由 Windows 接回或通过显示器实体菜单处理。
+- `DP1` / `DP2` / `HDMI1` / `HDMI2` 的 DDC 数值只是高级校准项。显示器菜单名和 DDC 数值不一致时，只改数值，不改日常按钮含义。
+
 ## What it does
 
 - Windows: system tray app with a right-click menu
