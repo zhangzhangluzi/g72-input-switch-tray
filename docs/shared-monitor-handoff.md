@@ -15,6 +15,7 @@ This project now uses one rule set only:
 - `Advanced repair`: use this only when Windows display state is stuck, for example when Settings still shows a gray second screen after the shared monitor has been handed away.
 - A gray second screen in Windows Settings is not treated as proof that Windows owns the picture. It can be a detached / remembered topology entry.
 - DP / HDMI numeric values are calibration data only. UI labels should keep the user's mental model stable even when MCCS values differ from the monitor menu names.
+- Per-interface device labels are optional presentation labels only. They may change text like `Give to peer` into `Give to Mac mini`, but they must not change DDC targeting or ownership rules.
 
 ## Current business rules
 
