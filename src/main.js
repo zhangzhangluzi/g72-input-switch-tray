@@ -2440,6 +2440,7 @@ function createWindowsDetachedMonitorConfig(topologyDisplay, fallbackMonitorConf
   const inheritedConfig = fallbackMonitorConfig
     ? {
         localInterfaceId: fallbackMonitorConfig.localInterfaceId,
+        peerInterfaceId: fallbackMonitorConfig.peerInterfaceId,
         compatibilityMode: fallbackMonitorConfig.compatibilityMode,
         windowsDisplayHandoffMode: fallbackMonitorConfig.windowsDisplayHandoffMode,
         interfaces: cloneInterfacesConfig(fallbackMonitorConfig.interfaces),
@@ -3965,6 +3966,8 @@ function renderInterfaceStatusCard(monitorContext, targetId) {
 
 function renderMonitorConfigForm(monitorContext) {
   const monitorConfig = monitorContext.monitor;
+  const localInterfaceId = getLocalInterfaceId(monitorConfig);
+  const configuredPeerInterfaceId = getConfiguredPeerInterfaceId(monitorConfig);
 
   return `<form method="post" action="/api/${encodeURIComponent(
     state.controlToken
@@ -3977,9 +3980,23 @@ function renderMonitorConfigForm(monitorContext) {
             renderNamedOption(
               targetId,
               getTarget(targetId, monitorConfig).label,
-              getLocalInterfaceId(monitorConfig)
+              localInterfaceId
             )
           ).join("")}
+        </select>
+      </label>
+      <label>
+        日常交给对方接口
+        <select name="peerInterfaceId">
+          ${renderNamedOption("", "自动选择（推荐）", configuredPeerInterfaceId)}
+          ${TARGET_IDS.filter((targetId) => targetId !== localInterfaceId)
+            .map((targetId) => {
+              const target = getTarget(targetId, monitorConfig);
+              const deviceLabel = normalizeText(target.deviceLabel);
+              const label = deviceLabel ? `${target.label} · ${deviceLabel}` : target.label;
+              return renderNamedOption(targetId, label, configuredPeerInterfaceId);
+            })
+            .join("")}
         </select>
       </label>
       <label>
@@ -3998,7 +4015,7 @@ function renderMonitorConfigForm(monitorContext) {
             <select name="windowsDisplayHandoffMode">
               ${renderNamedOption(
                 "auto",
-                "自动：切走后移出桌面，回来后自动接回",
+                "自动：交给对方时移出桌面，接回时恢复",
                 monitorConfig.windowsDisplayHandoffMode
               )}
               ${renderNamedOption("off", "关闭联动", monitorConfig.windowsDisplayHandoffMode)}
@@ -4236,6 +4253,7 @@ function createDefaultMonitorConfig(partial = {}) {
     roleLabel: normalizeText(partial.roleLabel) || "当前机器屏幕",
     displayName: normalizeText(partial.displayName),
     localInterfaceId: parseTargetId(partial.localInterfaceId) || TARGET_IDS[0],
+    peerInterfaceId: parseTargetId(partial.peerInterfaceId) || "",
     compatibilityMode: parseCompatibilityMode(partial.compatibilityMode),
     windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(partial.windowsDisplayHandoffMode),
     interfaces: cloneInterfacesConfig(partial.interfaces),
@@ -4289,6 +4307,7 @@ function buildMonitorConfigFromForm(form, existingMonitorConfig) {
       ...existingMonitorConfig,
       localInterfaceId:
         parseTargetId(form.get("localInterfaceId")) || existingMonitorConfig.localInterfaceId,
+      peerInterfaceId: parseTargetId(form.get("peerInterfaceId")) || "",
       compatibilityMode: parseCompatibilityMode(form.get("compatibilityMode")),
       windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
         form.get("windowsDisplayHandoffMode")
@@ -4315,6 +4334,13 @@ function getMonitorConfigValidationErrors(monitorConfig) {
 
   if (!parseTargetId(monitorConfig.localInterfaceId)) {
     errors.push("当前机器接口配置无效。");
+  }
+
+  if (
+    parseTargetId(monitorConfig.peerInterfaceId) &&
+    monitorConfig.peerInterfaceId === getLocalInterfaceId(monitorConfig)
+  ) {
+    errors.push("日常交给对方接口不能和当前机器接口相同。");
   }
 
   if (!["auto", "off", "samsung_mstar"].includes(monitorConfig.compatibilityMode)) {
@@ -4384,6 +4410,13 @@ function getLocalInterfaceId(monitorConfig) {
   return parseTargetId(monitorConfig?.localInterfaceId) || TARGET_IDS[0];
 }
 
+function getConfiguredPeerInterfaceId(monitorConfig) {
+  const peerInterfaceId = parseTargetId(monitorConfig?.peerInterfaceId);
+  return peerInterfaceId && peerInterfaceId !== getLocalInterfaceId(monitorConfig)
+    ? peerInterfaceId
+    : "";
+}
+
 function isLocalInterfaceTarget(targetId, monitorConfig) {
   return parseTargetId(targetId) === getLocalInterfaceId(monitorConfig);
 }
@@ -4397,16 +4430,12 @@ function getSwitchActionLabel(targetId, monitorConfig) {
 
 function getPreferredPeerTargetId(monitorConfig) {
   const localInterfaceId = getLocalInterfaceId(monitorConfig);
-  const configuredPeerTargetId = TARGET_IDS.find(
-    (targetId) =>
-      targetId !== localInterfaceId &&
-      normalizeText(monitorConfig?.interfaces?.[targetId]?.deviceLabel)
-  );
+  const configuredPeerInterfaceId = getConfiguredPeerInterfaceId(monitorConfig);
   const preferredTargetId =
     process.platform === "win32" ? "hdmi1" : process.platform === "darwin" ? "dp2" : "";
 
-  if (configuredPeerTargetId) {
-    return configuredPeerTargetId;
+  if (configuredPeerInterfaceId) {
+    return configuredPeerInterfaceId;
   }
 
   if (preferredTargetId && preferredTargetId !== localInterfaceId) {
@@ -4656,6 +4685,7 @@ function normalizeState(nextState) {
     rawConfig && (rawConfig.interfaces || rawConfig.localInterfaceId || rawConfig.compatibilityMode)
       ? createDefaultMonitorConfig({
           localInterfaceId: parseTargetId(rawConfig.localInterfaceId) || TARGET_IDS[0],
+          peerInterfaceId: parseTargetId(rawConfig.peerInterfaceId) || "",
           compatibilityMode: parseCompatibilityMode(rawConfig.compatibilityMode),
           windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
             rawConfig.windowsDisplayHandoffMode

@@ -11,7 +11,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - Windows 设置里看到灰色第二屏，通常只是拓扑残留或等待接回，不代表 Windows 已经真正拿到画面。卡住时再用 `高级：修复 Windows 屏幕状态`。
 - macOS 端只控制当前还能被 Mac 看见的屏幕。屏幕已经切走之后，Mac 不负责远程抢回，由 Windows 接回或通过显示器实体菜单处理。
 - `DP1` / `DP2` / `HDMI1` / `HDMI2` 的 DDC 数值只是高级校准项。显示器菜单名和 DDC 数值不一致时，只改数值，不改日常按钮含义。
-- 如果想把按钮从 `交给对方机器` 改成 `交给 Mac mini`、`交给游戏机` 这类名字，可以在高级配置里给对应接口填写“连接设备名”。
+- “日常交给对方接口”决定 `交给对方机器` 实际切到哪个输入口；“连接设备名”只决定按钮上显示成 `Mac mini`、`游戏机` 这类名字。
 
 ## What it does
 
@@ -44,6 +44,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
   - `HDMI2`
 - Each interface has its own numeric DDC input value
 - Each profile also stores which one of the four interfaces is the local machine's own cable for that screen
+- Each profile can optionally store which interface should be used by the daily "give to peer" action; if unset, the app falls back to the old platform default
 - On Windows, the profile is matched primarily by the screen's Win32 `DeviceName`, so two same-model monitors can still be distinguished
 - On macOS, the profile is matched primarily by hardware identity when the monitor reports a usable vendor / product / serial tuple; otherwise it falls back to the local display ID
 - Internal laptop / built-in panels are not exposed as four-interface switch targets

@@ -69,6 +69,10 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function renderUsageGuide/u);
   assert.match(mainSource, /function renderDailyVisibleMonitorActions/u);
   assert.match(mainSource, /function getPreferredPeerTargetId/u);
+  assert.match(mainSource, /function getConfiguredPeerInterfaceId/u);
+  assert.match(mainSource, /peerInterfaceId: parseTargetId/u);
+  assert.match(mainSource, /日常交给对方接口/u);
+  assert.doesNotMatch(mainSource, /configuredPeerTargetId/u);
   assert.match(mainSource, /日常逻辑/u);
   assert.match(mainSource, /灰色第二屏/u);
   assert.match(mainSource, /高级：单独切输入源 \/ 校准 DDC 值/u);
@@ -77,6 +81,8 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /连接设备名（可选）/u);
   assert.match(mainSource, /当前没有可接回共享屏/u);
   assert.match(mainSource, /待接回屏幕/u);
+  assert.match(mainSource, /自动：交给对方时移出桌面，接回时恢复/u);
+  assert.doesNotMatch(mainSource, /回来后自动接回/u);
   assert.doesNotMatch(mainSource, /Mac mini \/ 对方机器/u);
   assert.doesNotMatch(mainSource, /Windows 主动接管失败/u);
   assert.match(mainSource, /\/windows\/takeover\//u);
@@ -182,6 +188,7 @@ function verifyLocalOnlyDocs() {
   assert.match(readme, /hardware identity/u);
   assert.match(readme, /日常使用逻辑/u);
   assert.match(readme, /交给对方机器/u);
+  assert.match(readme, /日常交给对方接口/u);
   assert.match(readme, /连接设备名/u);
   assert.match(readme, /接回 Windows 的共享屏/u);
   assert.match(readme, /灰色第二屏/u);
@@ -189,6 +196,7 @@ function verifyLocalOnlyDocs() {
   assert.match(handoffDoc, /Daily user model/u);
   assert.match(handoffDoc, /A gray second screen in Windows Settings is not treated as proof/u);
   assert.match(handoffDoc, /Per-interface device labels are optional presentation labels only/u);
+  assert.match(handoffDoc, /configured daily peer interface is the actual target/u);
   assert.match(handoffDoc, /does not blindly re-add a detached waiting screen/u);
   assert.match(handoffDoc, /takeover path first attaches the detached Windows display device/u);
   assert.match(handoffDoc, /hardware-bound/u);
