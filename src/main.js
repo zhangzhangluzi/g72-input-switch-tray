@@ -230,6 +230,13 @@ async function refreshMenu({ monitorContexts = null } = {}) {
     const nextMonitorContexts = Array.isArray(monitorContexts)
       ? monitorContexts
       : await buildMonitorContextsWithStatus();
+    const windowsTakeoverContexts =
+      process.platform === "win32"
+        ? await getWindowsDetachedTakeoverContexts({
+            connectedMonitorContexts: nextMonitorContexts,
+            persistCandidates: true,
+          })
+        : [];
     const monitorMenuItems =
       nextMonitorContexts.length === 0
         ? [
@@ -239,6 +246,7 @@ async function refreshMenu({ monitorContexts = null } = {}) {
             },
           ]
         : nextMonitorContexts.map((monitorContext) => buildTrayMonitorItem(monitorContext));
+    const windowsTakeoverMenuItems = buildTrayWindowsTakeoverMenuItems(windowsTakeoverContexts);
 
     const menu = Menu.buildFromTemplate([
       {
@@ -250,6 +258,7 @@ async function refreshMenu({ monitorContexts = null } = {}) {
       ...(process.platform === "win32"
         ? [
             { type: "separator" },
+            ...windowsTakeoverMenuItems,
             {
               label: "主动刷新全部等待接回的 Windows 屏幕",
               click: () => {
@@ -374,12 +383,50 @@ function buildTrayMonitorItem(monitorContext) {
   };
 }
 
+function buildTrayWindowsTakeoverMenuItems(windowsTakeoverContexts) {
+  if (process.platform !== "win32") {
+    return [];
+  }
+
+  if (!Array.isArray(windowsTakeoverContexts) || windowsTakeoverContexts.length === 0) {
+    return [
+      {
+        label: "主动接管断开的 Windows 屏幕：当前没有候选",
+        enabled: false,
+      },
+    ];
+  }
+
+  return [
+    {
+      label: "主动接管断开的 Windows 屏幕",
+      submenu: windowsTakeoverContexts.map((monitorContext) => {
+        const localTarget = getTarget(getLocalInterfaceId(monitorContext.monitor), monitorContext.monitor);
+        return {
+          label: `接管 ${getMonitorDisplayTitle(monitorContext)} -> ${localTarget.label}`,
+          click: () => handleTrayWindowsTakeover(monitorContext.id),
+        };
+      }),
+    },
+  ];
+}
+
 function handleTrayDirectSwitch(monitorId, targetId) {
   void switchMonitor(monitorId, targetId, {
     notifyOnSuccess: true,
     showErrorDialog: false,
   }).catch((error) => {
     appendDiagnosticLog(`Direct switch failed (${monitorId}:${targetId})`, error);
+    void refreshMenu();
+  });
+}
+
+function handleTrayWindowsTakeover(monitorId) {
+  void takeoverWindowsDetachedMonitor(monitorId, {
+    notifyOnSuccess: true,
+    showErrorDialog: false,
+  }).catch((error) => {
+    appendDiagnosticLog(`Windows takeover failed (${monitorId})`, error);
     void refreshMenu();
   });
 }
@@ -475,6 +522,9 @@ async function handleControlRequest(request, response) {
   const windowsRefreshPathMatch = new RegExp(
     `^/api/${state.controlToken}/windows/refresh(?:/([^/]+))?$`
   ).exec(requestUrl.pathname);
+  const windowsTakeoverPathMatch = new RegExp(
+    `^/api/${state.controlToken}/windows/takeover/([^/]+)$`
+  ).exec(requestUrl.pathname);
 
   if (requestUrl.pathname === "/health") {
     return writeJson(response, 200, {
@@ -493,7 +543,18 @@ async function handleControlRequest(request, response) {
 
   if (requestUrl.pathname === getSettingsPath()) {
     const monitorContexts = await buildMonitorContextsWithStatus();
-    return writeHtml(response, 200, renderSettingsPage(requestUrl, monitorContexts));
+    const windowsTakeoverContexts =
+      process.platform === "win32"
+        ? await getWindowsDetachedTakeoverContexts({
+            connectedMonitorContexts: monitorContexts,
+            persistCandidates: true,
+          })
+        : [];
+    return writeHtml(
+      response,
+      200,
+      renderSettingsPage(requestUrl, monitorContexts, windowsTakeoverContexts)
+    );
   }
 
   if (requestUrl.pathname === `/api/${state.controlToken}/state` && request.method === "GET") {
@@ -531,6 +592,14 @@ async function handleControlRequest(request, response) {
       response,
       requestUrl,
       windowsRefreshPathMatch[1] ? decodePathSegment(windowsRefreshPathMatch[1]) : null
+    );
+  }
+
+  if (windowsTakeoverPathMatch && request.method === "POST") {
+    return handleWindowsTakeoverRequest(
+      response,
+      requestUrl,
+      decodePathSegment(windowsTakeoverPathMatch[1])
     );
   }
 
@@ -634,6 +703,24 @@ async function handleWindowsRefreshRequest(response, requestUrl, monitorId = nul
     redirectToSettingsPage(response, requestUrl, {
       status: "error",
       message: normalizeText(error.message) || "Windows 刷新失败。",
+    });
+  }
+}
+
+async function handleWindowsTakeoverRequest(response, requestUrl, monitorId) {
+  try {
+    const result = await takeoverWindowsDetachedMonitor(normalizeText(monitorId), {
+      notifyOnSuccess: false,
+      showErrorDialog: false,
+    });
+    redirectToSettingsPage(response, requestUrl, {
+      status: "success",
+      message: result.message,
+    });
+  } catch (error) {
+    redirectToSettingsPage(response, requestUrl, {
+      status: "error",
+      message: normalizeText(error.message) || "Windows 主动接管失败。",
     });
   }
 }
@@ -1358,6 +1445,98 @@ async function refreshWindowsDisplayState({ monitorId = null, notifyOnSuccess = 
   };
 }
 
+async function takeoverWindowsDetachedMonitor(
+  monitorId,
+  { notifyOnSuccess = false, showErrorDialog = false } = {}
+) {
+  if (process.platform !== "win32") {
+    throw new Error("当前平台不是 Windows，不能执行 Windows 主动接管。");
+  }
+
+  const normalizedMonitorId = normalizeText(monitorId);
+  const takeoverContexts = await getWindowsDetachedTakeoverContexts({
+    persistCandidates: true,
+  });
+  const takeoverContext = takeoverContexts.find(
+    (monitorContext) => monitorContext.id === normalizedMonitorId
+  );
+  if (!takeoverContext) {
+    throw new Error("没有找到可接管的 Windows 断开屏幕。");
+  }
+
+  const monitorConfig = takeoverContext.monitor;
+  const localTargetId = getLocalInterfaceId(monitorConfig);
+  const localTarget = getTarget(localTargetId, monitorConfig);
+  let attachedDuringTakeover = false;
+
+  try {
+    upsertStoredMonitorConfig(monitorConfig);
+    saveState(state);
+
+    const topologyDisplays = await getWindowsTopologyDisplays();
+    const topologyDisplay = topologyDisplays.find((display) =>
+      isTopologyDisplayMatchMonitor(display, monitorConfig)
+    );
+    if (!topologyDisplay) {
+      throw new Error("Windows 拓扑里没有找到这块断开的屏幕。");
+    }
+
+    if (!topologyDisplay.attached) {
+      const expectedAttachedDisplayCount =
+        topologyDisplays.filter((display) => display.attached).length + 1;
+      await attachWindowsDisplayForMonitor(
+        monitorConfig,
+        expectedAttachedDisplayCount,
+        getExistingMonitorDesktopRuntime(monitorConfig.id)?.restoreLayout || null
+      );
+      attachedDuringTakeover = true;
+      await delay(WINDOWS_DISPLAY_HANDOFF_DELAY_MS);
+      await syncMonitorConfigsFromLocalDisplays({ persist: true });
+    }
+
+    const switchResult = await switchMonitor(monitorConfig.id, localTargetId, {
+      notifyOnSuccess: false,
+      showErrorDialog: false,
+    });
+    clearMonitorPendingRestore(monitorConfig.id);
+    await syncMonitorConfigsFromLocalDisplays({ persist: true });
+    void refreshMenu();
+
+    const message =
+      switchResult?.verificationStatus === "unconfirmed"
+        ? `${getMonitorDisplayTitle(monitorConfig)} 已接回 Windows 桌面，并已发送切到 ${localTarget.label} 的命令，结果待人工确认。`
+        : `${getMonitorDisplayTitle(monitorConfig)} 已主动接管到 ${localTarget.label}。`;
+
+    if (notifyOnSuccess) {
+      notify(message);
+    }
+
+    return {
+      changed: true,
+      message,
+    };
+  } catch (error) {
+    if (attachedDuringTakeover) {
+      try {
+        await detachWindowsTopologyDisplay(monitorConfig, "takeover command failed");
+      } catch (detachError) {
+        appendDiagnosticLog("Failed to rollback Windows takeover attach", detachError);
+      }
+    }
+
+    const message = normalizeText(error.message) || "Windows 主动接管失败。";
+    recordSwitchOutcome("error", monitorConfig.id, localTargetId, message);
+    saveState(state);
+    void refreshMenu();
+
+    if (showErrorDialog) {
+      dialog.showErrorBox(APP_NAME, message);
+    }
+
+    throw new Error(message);
+  }
+}
+
 async function attemptPendingWindowsRestores({
   monitorId: targetMonitorId = null,
   displaySummaries = null,
@@ -1616,7 +1795,7 @@ function findStoredMonitorConfigForTopologyDisplay(topologyDisplay) {
 }
 
 async function detachWindowsTopologyDisplay(topologyDisplay, reason = "") {
-  const deviceName = normalizeText(topologyDisplay?.deviceName);
+  const deviceName = normalizeText(topologyDisplay?.deviceName || topologyDisplay?.match?.gdiDeviceName);
   if (!deviceName) {
     throw new Error("Windows duplicate display did not include a GDI device name.");
   }
@@ -1860,6 +2039,339 @@ async function getConnectedMonitorContexts({
     .filter(Boolean);
 }
 
+async function getWindowsDetachedTakeoverContexts({
+  connectedMonitorContexts = null,
+  topologyDisplays = null,
+  persistCandidates = false,
+} = {}) {
+  if (process.platform !== "win32") {
+    return [];
+  }
+
+  const connectedContexts = Array.isArray(connectedMonitorContexts)
+    ? connectedMonitorContexts
+    : await getConnectedMonitorContexts();
+  const connectedMonitorIds = new Set(
+    connectedContexts.map((monitorContext) => monitorContext.id)
+  );
+  const connectedDeviceNames = new Set(
+    connectedContexts
+      .map((monitorContext) => normalizeText(monitorContext.display?.gdiDeviceName).toLowerCase())
+      .filter(Boolean)
+  );
+  const resolvedTopologyDisplays = Array.isArray(topologyDisplays)
+    ? topologyDisplays
+    : await getWindowsTopologyDisplays();
+  const prunedHeuristicConfigs = persistCandidates
+    ? pruneRedundantWindowsHeuristicTakeoverConfigs(connectedMonitorIds)
+    : false;
+  const knownContexts = [];
+  const usedDeviceNames = new Set(connectedDeviceNames);
+
+  for (const monitorConfig of getStoredMonitorConfigs()) {
+    if (connectedMonitorIds.has(monitorConfig.id)) {
+      continue;
+    }
+
+    const gdiDeviceName = normalizeText(monitorConfig.match?.gdiDeviceName);
+    if (!gdiDeviceName) {
+      continue;
+    }
+
+    const topologyDisplay = resolvedTopologyDisplays.find((display) =>
+      isTopologyDisplayMatchMonitor(display, monitorConfig)
+    );
+    if (!topologyDisplay || topologyDisplay.attached) {
+      continue;
+    }
+
+    const monitorContext = createWindowsDetachedTakeoverContext(
+      monitorConfig,
+      topologyDisplay,
+      "stored"
+    );
+    knownContexts.push(monitorContext);
+    usedDeviceNames.add(gdiDeviceName.toLowerCase());
+  }
+
+  const heuristicDisplays =
+    knownContexts.length === 0
+      ? getWindowsHeuristicDetachedTakeoverDisplays(resolvedTopologyDisplays, usedDeviceNames)
+      : [];
+  const fallbackConfig = getStoredMonitorConfigs()[0] || null;
+  const heuristicContexts = heuristicDisplays.map((topologyDisplay) => {
+    const monitorConfig = createWindowsDetachedMonitorConfig(topologyDisplay, fallbackConfig);
+    if (persistCandidates) {
+      upsertStoredMonitorConfig(monitorConfig);
+    }
+    return createWindowsDetachedTakeoverContext(monitorConfig, topologyDisplay, "heuristic");
+  });
+
+  if (persistCandidates && (heuristicContexts.length > 0 || prunedHeuristicConfigs)) {
+    saveState(state);
+  }
+
+  return [...knownContexts, ...heuristicContexts].sort((left, right) =>
+    normalizeText(left.display.gdiDeviceName).localeCompare(
+      normalizeText(right.display.gdiDeviceName),
+      undefined,
+      { numeric: true }
+    )
+  );
+}
+
+function pruneRedundantWindowsHeuristicTakeoverConfigs(connectedMonitorIds) {
+  if (process.platform !== "win32" || !(connectedMonitorIds instanceof Set)) {
+    return false;
+  }
+
+  const storedMonitorConfigs = getStoredMonitorConfigs();
+  const autoGeneratedConfigs = storedMonitorConfigs
+    .filter(
+      (monitorConfig) =>
+        !connectedMonitorIds.has(monitorConfig.id) &&
+        isWindowsAutoGeneratedTakeoverConfig(monitorConfig)
+    )
+    .sort(
+      (left, right) =>
+        getWindowsDisplayDeviceNumber(left.match?.gdiDeviceName) -
+        getWindowsDisplayDeviceNumber(right.match?.gdiDeviceName)
+    );
+
+  if (autoGeneratedConfigs.length <= 1) {
+    return false;
+  }
+
+  const keepMonitorId = autoGeneratedConfigs[0].id;
+  const removeMonitorIds = new Set(
+    autoGeneratedConfigs
+      .filter((monitorConfig) => monitorConfig.id !== keepMonitorId)
+      .map((monitorConfig) => monitorConfig.id)
+  );
+
+  state.config.monitors = storedMonitorConfigs.filter(
+    (monitorConfig) => !removeMonitorIds.has(monitorConfig.id)
+  );
+
+  const runtimeMap = state.windowsDesktop?.byMonitorId;
+  if (runtimeMap && typeof runtimeMap === "object") {
+    for (const monitorId of removeMonitorIds) {
+      delete runtimeMap[monitorId];
+    }
+  }
+
+  return removeMonitorIds.size > 0;
+}
+
+function isWindowsAutoGeneratedTakeoverConfig(monitorConfig) {
+  if (monitorConfig?.roleLabel !== "可接管屏幕") {
+    return false;
+  }
+
+  if (getExistingMonitorDesktopRuntime(monitorConfig.id)?.pendingRestore) {
+    return false;
+  }
+
+  const gdiDeviceName = normalizeText(monitorConfig.match?.gdiDeviceName);
+  if (!Number.isInteger(getWindowsDisplayDeviceNumber(gdiDeviceName))) {
+    return false;
+  }
+
+  const displayName = getMonitorDisplayName(monitorConfig);
+  const productCode = normalizeText(monitorConfig.match?.productCode);
+  return (
+    displayName === gdiDeviceName &&
+    (!productCode || isWindowsGenericDetachedDisplayName(productCode))
+  );
+}
+
+function createWindowsDetachedTakeoverContext(monitorConfig, topologyDisplay, takeoverSource) {
+  return {
+    id: monitorConfig.id,
+    monitor: monitorConfig,
+    display: createWindowsDetachedDisplaySummary(monitorConfig, topologyDisplay),
+    takeoverSource,
+    status: {
+      visible: false,
+      ddcAvailable: false,
+      ddcProbeStatus: "",
+      ddcUnavailableReason: "这块屏当前不在 Windows 桌面里，接管时会先加回桌面。",
+      currentInputValue: null,
+      currentInputError: null,
+    },
+  };
+}
+
+function createWindowsDetachedDisplaySummary(monitorConfig, topologyDisplay) {
+  const deviceName = normalizeText(topologyDisplay?.deviceName || monitorConfig?.match?.gdiDeviceName);
+  const displayKey = deviceName ? `win:${deviceName}` : normalizeText(monitorConfig?.displayKey);
+  const detectedName =
+    getWindowsUsableDetachedDisplayName(topologyDisplay) ||
+    getMonitorDisplayName(monitorConfig) ||
+    deviceName ||
+    "断开的 Windows 屏幕";
+  const width = Number.isFinite(topologyDisplay?.width) ? topologyDisplay.width : 0;
+  const height = Number.isFinite(topologyDisplay?.height) ? topologyDisplay.height : 0;
+
+  return {
+    id: monitorConfig.id,
+    displayKey,
+    index: null,
+    roleLabel: "可接管屏幕",
+    detectedName,
+    resolution: width > 0 && height > 0 ? `${width} × ${height}` : "当前未接入桌面",
+    position: "当前未接入桌面",
+    internal: false,
+    electronDisplayId: null,
+    macSystemDisplayId: null,
+    macVendorId: "",
+    macProductId: "",
+    macSerialNumber: "",
+    gdiDeviceName: deviceName,
+    productCode: normalizeText(topologyDisplay?.productCode || monitorConfig?.match?.productCode),
+    bounds: {
+      x: 0,
+      y: 0,
+      width,
+      height,
+    },
+  };
+}
+
+function createWindowsDetachedMonitorConfig(topologyDisplay, fallbackMonitorConfig = null) {
+  const deviceName = normalizeText(topologyDisplay?.deviceName);
+  const displayKey = deviceName ? `win:${deviceName}` : `win-detached:${crypto.randomUUID()}`;
+  const detectedName =
+    getWindowsUsableDetachedDisplayName(topologyDisplay) || deviceName || "断开的 Windows 屏幕";
+  const inheritedConfig = fallbackMonitorConfig
+    ? {
+        localInterfaceId: fallbackMonitorConfig.localInterfaceId,
+        compatibilityMode: fallbackMonitorConfig.compatibilityMode,
+        windowsDisplayHandoffMode: fallbackMonitorConfig.windowsDisplayHandoffMode,
+        interfaces: cloneInterfacesConfig(fallbackMonitorConfig.interfaces),
+      }
+    : {};
+
+  return normalizeMonitorConfig(
+    {
+      ...inheritedConfig,
+      id: createMonitorId(displayKey),
+      displayKey,
+      roleLabel: "可接管屏幕",
+      displayName: detectedName,
+      match: {
+        electronDisplayId: null,
+        macSystemDisplayId: null,
+        macVendorId: "",
+        macProductId: "",
+        macSerialNumber: "",
+        gdiDeviceName: deviceName,
+        productCode: normalizeText(topologyDisplay?.productCode),
+      },
+    },
+    createDefaultMonitorConfig({
+      id: createMonitorId(displayKey),
+      displayKey,
+      roleLabel: "可接管屏幕",
+      displayName: detectedName,
+      match: {
+        gdiDeviceName: deviceName,
+        productCode: normalizeText(topologyDisplay?.productCode),
+      },
+    })
+  );
+}
+
+function getWindowsHeuristicDetachedTakeoverDisplays(topologyDisplays, usedDeviceNames) {
+  const usedNames = usedDeviceNames instanceof Set ? usedDeviceNames : new Set();
+  const detachedDisplays = Array.isArray(topologyDisplays)
+    ? topologyDisplays.filter(
+        (display) =>
+          !display.attached &&
+          !usedNames.has(normalizeText(display.deviceName).toLowerCase()) &&
+          isWindowsPhysicalDetachedDisplayCandidate(display)
+      )
+    : [];
+
+  const namedDisplays = detachedDisplays.filter((display) => getWindowsUsableDetachedDisplayName(display));
+  if (namedDisplays.length > 0) {
+    return namedDisplays;
+  }
+
+  const attachedNumbers = Array.isArray(topologyDisplays)
+    ? topologyDisplays
+        .filter((display) => display.attached)
+        .map((display) => getWindowsDisplayDeviceNumber(display.deviceName))
+        .filter(Number.isInteger)
+    : [];
+  const genericCandidates = detachedDisplays
+    .map((display) => ({
+      display,
+      deviceNumber: getWindowsDisplayDeviceNumber(display.deviceName),
+    }))
+    .filter((entry) => Number.isInteger(entry.deviceNumber))
+    .sort((left, right) => left.deviceNumber - right.deviceNumber);
+
+  if (genericCandidates.length === 0) {
+    return [];
+  }
+
+  if (attachedNumbers.length === 0) {
+    return [genericCandidates[0].display];
+  }
+
+  const preferredDeviceNumber = Math.max(...attachedNumbers) + 1;
+  const preferredCandidate =
+    genericCandidates.find((entry) => entry.deviceNumber === preferredDeviceNumber) ||
+    genericCandidates.find((entry) => entry.deviceNumber > Math.min(...attachedNumbers)) ||
+    genericCandidates[0];
+  return preferredCandidate ? [preferredCandidate.display] : [];
+}
+
+function isWindowsPhysicalDetachedDisplayCandidate(display) {
+  const deviceName = normalizeText(display?.deviceName);
+  if (!deviceName || !/^\\\\\.\\DISPLAY\d+$/iu.test(deviceName)) {
+    return false;
+  }
+
+  const text = [
+    display?.deviceString,
+    display?.displayName,
+    display?.friendlyName,
+    display?.productCode,
+  ]
+    .map((value) => normalizeText(value).toLowerCase())
+    .join(" ");
+
+  return !/\b(gameviewer|todesk|raylink|virtual|idd|indirect|spacedesk|parsec|dummy)\b/u.test(text);
+}
+
+function getWindowsUsableDetachedDisplayName(display) {
+  for (const value of [display?.friendlyName, display?.displayName, display?.productCode]) {
+    const normalized = normalizeText(value);
+    if (normalized && !isWindowsGenericDetachedDisplayName(normalized)) {
+      return normalized;
+    }
+  }
+
+  return "";
+}
+
+function isWindowsGenericDetachedDisplayName(value) {
+  const normalized = normalizeText(value);
+  return (
+    !normalized ||
+    /^VEN_/iu.test(normalized) ||
+    /^AMD Radeon\b/iu.test(normalized) ||
+    /\bvirtual\b/iu.test(normalized)
+  );
+}
+
+function getWindowsDisplayDeviceNumber(deviceName) {
+  const match = /^\\\\\.\\DISPLAY(\d+)$/iu.exec(normalizeText(deviceName));
+  return match ? Number.parseInt(match[1], 10) : NaN;
+}
+
 async function getMonitorContextById(monitorId) {
   const monitorContexts = await getConnectedMonitorContexts();
   return monitorContexts.find((monitorContext) => monitorContext.id === normalizeText(monitorId)) || null;
@@ -1996,7 +2508,10 @@ function shouldPreserveDisconnectedMonitorConfig(monitorConfig) {
     return false;
   }
 
-  return Boolean(getExistingMonitorDesktopRuntime(monitorConfig.id)?.pendingRestore);
+  return Boolean(
+    normalizeText(monitorConfig?.match?.gdiDeviceName) ||
+      getExistingMonitorDesktopRuntime(monitorConfig.id)?.pendingRestore
+  );
 }
 
 function getExistingMonitorDesktopRuntime(monitorId) {
@@ -2775,10 +3290,14 @@ async function waitForDisplayCount(expectedCount, errorMessage) {
   throw new Error(errorMessage);
 }
 
-function renderSettingsPage(requestUrl, monitorContexts) {
+function renderSettingsPage(requestUrl, monitorContexts, windowsTakeoverContexts = []) {
   const status = requestUrl.searchParams.get("status");
   const message = requestUrl.searchParams.get("message");
   const statusHtml = renderSettingsBanner(status, message);
+  const windowsTakeoverHtml =
+    process.platform === "win32"
+      ? renderWindowsTakeoverSection(windowsTakeoverContexts)
+      : "";
   const globalRefreshHtml =
     process.platform === "win32"
       ? `<div class="card soft">
@@ -2897,12 +3416,55 @@ function renderSettingsPage(requestUrl, monitorContexts) {
     <p>这里只按“当前主机直接控制当前主机已连接的物理屏”工作。识别到几块本机屏幕，就展示几块。</p>
     <div class="stack">
       ${statusHtml}
+      ${windowsTakeoverHtml}
       ${globalRefreshHtml}
       ${contentHtml}
     </div>
   </main>
 </body>
 </html>`;
+}
+
+function renderWindowsTakeoverSection(windowsTakeoverContexts) {
+  const contexts = Array.isArray(windowsTakeoverContexts) ? windowsTakeoverContexts : [];
+  const contentHtml =
+    contexts.length === 0
+      ? `<div class="help" style="margin-top: 12px;">当前没有可接管的断开屏幕。只有 Windows 仍能在显示拓扑里看到的断开显示设备，才会出现在这里。</div>`
+      : contexts.map(renderWindowsTakeoverCard).join("");
+
+  return `<div class="card soft">
+    <div class="section-title">Windows 主动接管</div>
+    <div class="help" style="margin-top: 12px;">用于“共享屏现在显示 Mac，但我要从 Windows 把它接回来”。接管会先把这块屏加回 Windows 桌面，再切到配置的当前机器接口。</div>
+    <div class="stack" style="margin-top: 16px;">
+      ${contentHtml}
+    </div>
+  </div>`;
+}
+
+function renderWindowsTakeoverCard(monitorContext) {
+  const localTarget = getTarget(getLocalInterfaceId(monitorContext.monitor), monitorContext.monitor);
+  const runtime = getExistingMonitorDesktopRuntime(monitorContext.id);
+  const candidateSourceText =
+    monitorContext.takeoverSource === "heuristic"
+      ? "候选来源：Windows 拓扑推断"
+      : runtime?.pendingRestore
+        ? "候选来源：等待接回记录"
+        : "候选来源：已保存屏幕配置";
+
+  return `<div class="interface-card">
+    <div class="section-title">${escapeHtml(getMonitorDisplayTitle(monitorContext))}</div>
+    <div class="display-meta">
+      ${escapeHtml(getMonitorSystemIdentityText(monitorContext))}<br>
+      ${escapeHtml(candidateSourceText)}<br>
+      接管目标：${escapeHtml(localTarget.label)}（输入值 ${escapeHtml(String(localTarget.inputValue))}）
+    </div>
+    <form method="post" action="/api/${encodeURIComponent(
+      state.controlToken
+    )}/windows/takeover/${encodeURIComponent(monitorContext.id)}" style="margin-top: 14px;">
+      <button type="submit">主动接管到 ${escapeHtml(localTarget.label)}</button>
+    </form>
+    ${renderMonitorConfigForm(monitorContext)}
+  </div>`;
 }
 
 function renderMonitorSection(monitorContext) {
@@ -3354,6 +3916,30 @@ function getMonitorConfigValidationErrors(monitorConfig) {
 
 function getStoredMonitorConfigs() {
   return Array.isArray(state.config?.monitors) ? state.config.monitors : [];
+}
+
+function upsertStoredMonitorConfig(monitorConfig) {
+  const nextMonitorConfig = normalizeMonitorConfig(monitorConfig);
+  const existingIndex = getStoredMonitorConfigs().findIndex(
+    (storedMonitorConfig) => storedMonitorConfig.id === nextMonitorConfig.id
+  );
+
+  if (!state.config || typeof state.config !== "object") {
+    state.config = {
+      monitors: [],
+    };
+  }
+
+  if (!Array.isArray(state.config.monitors)) {
+    state.config.monitors = [];
+  }
+
+  if (existingIndex >= 0) {
+    state.config.monitors[existingIndex] = nextMonitorConfig;
+    return;
+  }
+
+  state.config.monitors.push(nextMonitorConfig);
 }
 
 function getTarget(targetId, monitorConfig = null) {

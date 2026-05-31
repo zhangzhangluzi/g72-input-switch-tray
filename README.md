@@ -17,7 +17,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
   - configuring one local-interface slot per detected screen
   - configuring the DDC input value for each of the four interfaces on each screen
 - Optional Samsung / MStar compatibility mode for monitors whose real input-switch values do not match the standard MCCS values
-- Optional Windows desktop handoff mode that removes a switched-away screen from the Windows desktop, keeps it out while it belongs to another host, and lets an explicit receive / refresh action add it back
+- Optional Windows desktop handoff mode that removes a switched-away screen from the Windows desktop, keeps it out while it belongs to another host, and lets an explicit takeover / refresh action add it back
 - Optional launch at login
 - Windows uninstall entry via the packaged NSIS uninstaller
 - macOS self-uninstall command from the app menu
@@ -47,7 +47,8 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - On Windows, desktop handoff is per monitor profile:
   - switching away from the local interface can detach that specific screen from the Windows desktop
   - if that specific screen is still the current Windows primary display, another attached Windows screen is promoted to primary first
-  - the background watcher does not blindly re-add a detached waiting screen; the explicit receive / refresh action is allowed to attach it back
+  - the background watcher does not blindly re-add a detached waiting screen; the explicit takeover / refresh action is allowed to attach it back
+  - the takeover action first adds the detached display back to the Windows desktop topology, then switches it to the configured local interface
   - if Windows keeps a same-model duplicate attached while its input is not that screen's configured local interface, the app removes that duplicate from the Windows desktop topology
 - If `DisplaySwitch.exe` is not enough, the app falls back to a bundled topology helper that directly detaches or re-attaches the targeted Windows monitor.
 - Windows monitor matching no longer relies on friendly monitor names as the primary selector, so two same-model monitors do not collapse into one target.
