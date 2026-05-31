@@ -17,7 +17,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
   - configuring one local-interface slot per detected screen
   - configuring the DDC input value for each of the four interfaces on each screen
 - Optional Samsung / MStar compatibility mode for monitors whose real input-switch values do not match the standard MCCS values
-- Optional Windows desktop handoff mode that removes a switched-away screen from the Windows desktop and re-attaches it automatically when that screen comes back to Windows
+- Optional Windows desktop handoff mode that removes a switched-away screen from the Windows desktop, keeps it out while it belongs to another host, and lets an explicit receive / refresh action add it back
 - Optional launch at login
 - Windows uninstall entry via the packaged NSIS uninstaller
 - macOS self-uninstall command from the app menu
@@ -47,7 +47,8 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - On Windows, desktop handoff is per monitor profile:
   - switching away from the local interface can detach that specific screen from the Windows desktop
   - if that specific screen is still the current Windows primary display, another attached Windows screen is promoted to primary first
-  - when that specific screen returns to Windows later, the watcher can re-attach it automatically
+  - the background watcher does not blindly re-add a detached waiting screen; the explicit receive / refresh action is allowed to attach it back
+  - if Windows keeps a same-model duplicate attached while its input is not that screen's configured local interface, the app removes that duplicate from the Windows desktop topology
 - If `DisplaySwitch.exe` is not enough, the app falls back to a bundled topology helper that directly detaches or re-attaches the targeted Windows monitor.
 - Windows monitor matching no longer relies on friendly monitor names as the primary selector, so two same-model monitors do not collapse into one target.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.

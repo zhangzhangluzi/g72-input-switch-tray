@@ -51,6 +51,7 @@ let explorerSignature = null;
 let refreshMenuInFlight = false;
 let refreshMenuQueued = false;
 let windowsRestoreInFlight = false;
+let windowsDuplicateDetachInFlight = false;
 let windowsTopologyOperationQueue = Promise.resolve();
 let switchOperationQueue = Promise.resolve();
 const switchInFlightByMonitorId = new Map();
@@ -139,7 +140,13 @@ app.whenReady().then(async () => {
   }
 
   try {
-    await syncMonitorConfigsFromLocalDisplays({ persist: true });
+    const displaySummaries = await syncMonitorConfigsFromLocalDisplays({ persist: true });
+    if (process.platform === "win32") {
+      await attemptPendingWindowsRestores({
+        displaySummaries,
+      });
+      await attemptWindowsDuplicateForeignDisplayDetaches();
+    }
   } catch (error) {
     appendDiagnosticLog("Failed to synchronize displays during startup", error);
     notify("显示器列表初始化失败，可打开设置页或稍后重试。");
@@ -1325,10 +1332,21 @@ async function refreshWindowsDisplayState({ monitorId = null, notifyOnSuccess = 
     };
   }
 
-  const changed = await attemptPendingWindowsRestores({
+  const restored = await attemptPendingWindowsRestores({
+    monitorId,
+    allowAttachDetached: true,
+  });
+  const detachedDuplicates = await attemptWindowsDuplicateForeignDisplayDetaches({
     monitorId,
   });
-  const message = changed ? "Windows 已刷新并处理等待接回的屏幕。" : "Windows 已刷新当前屏幕状态。";
+  const changed = restored || detachedDuplicates;
+  const message = detachedDuplicates
+    ? restored
+      ? "Windows 已刷新接回状态，并移除误挂回来的重复屏幕。"
+      : "Windows 已移除误挂回来的重复屏幕。"
+    : restored
+      ? "Windows 已刷新并处理等待接回的屏幕。"
+      : "Windows 已刷新当前屏幕状态。";
 
   if (notifyOnSuccess) {
     notify(message);
@@ -1343,6 +1361,7 @@ async function refreshWindowsDisplayState({ monitorId = null, notifyOnSuccess = 
 async function attemptPendingWindowsRestores({
   monitorId: targetMonitorId = null,
   displaySummaries = null,
+  allowAttachDetached = false,
 } = {}) {
   if (process.platform !== "win32" || windowsRestoreInFlight) {
     return false;
@@ -1375,6 +1394,10 @@ async function attemptPendingWindowsRestores({
       }
 
       if (!topologyDisplay.attached) {
+        if (!allowAttachDetached) {
+          continue;
+        }
+
         try {
           await attachWindowsDisplayForMonitor(
             monitorConfig,
@@ -1399,6 +1422,231 @@ async function attemptPendingWindowsRestores({
   } finally {
     windowsRestoreInFlight = false;
   }
+}
+
+async function attemptWindowsDuplicateForeignDisplayDetaches({ monitorId = null } = {}) {
+  if (process.platform !== "win32" || windowsDuplicateDetachInFlight) {
+    return false;
+  }
+
+  windowsDuplicateDetachInFlight = true;
+
+  try {
+    const topologyDisplays = await getWindowsTopologyDisplays();
+    const candidates = await getWindowsDuplicateForeignDisplayDetachCandidates(
+      topologyDisplays,
+      normalizeText(monitorId) || null
+    );
+    let changed = false;
+
+    for (const candidate of candidates) {
+      try {
+        await detachWindowsTopologyDisplay(candidate.display, candidate.reason);
+        changed = true;
+      } catch (error) {
+        appendDiagnosticLog(
+          `Failed to detach duplicate Windows display ${candidate.display.deviceName}`,
+          error
+        );
+      }
+    }
+
+    if (changed) {
+      await syncMonitorConfigsFromLocalDisplays({ persist: true });
+      void refreshMenu();
+    }
+
+    return changed;
+  } finally {
+    windowsDuplicateDetachInFlight = false;
+  }
+}
+
+async function getWindowsDuplicateForeignDisplayDetachCandidates(topologyDisplays, targetMonitorId) {
+  const attachedDisplays = Array.isArray(topologyDisplays)
+    ? topologyDisplays.filter((display) => display.attached)
+    : [];
+  const duplicateGroups = groupWindowsDuplicateAttachedDisplays(attachedDisplays);
+  const candidates = [];
+
+  for (const group of duplicateGroups) {
+    const primaryDisplay = group.find((display) => display.primary);
+    if (!primaryDisplay) {
+      continue;
+    }
+
+    for (const display of group.filter((item) => !item.primary)) {
+      const monitorConfig = findStoredMonitorConfigForTopologyDisplay(display);
+      if (
+        !monitorConfig ||
+        (targetMonitorId && monitorConfig.id !== targetMonitorId) ||
+        !shouldUseWindowsDisplayHandoffForMonitor(monitorConfig, attachedDisplays.length)
+      ) {
+        continue;
+      }
+
+      const runtime = getExistingMonitorDesktopRuntime(monitorConfig.id);
+      const currentInput = await getWindowsCurrentInputResultForTopologyDisplay(display);
+      const localTarget = getTarget(getLocalInterfaceId(monitorConfig), monitorConfig);
+      const inputLooksForeign = currentInput.ok && !isWindowsInputValueForTarget(
+        currentInput.value,
+        localTarget,
+        monitorConfig
+      );
+      const pendingAwayAndUnverified = Boolean(runtime?.pendingRestore) && !currentInput.ok;
+
+      if (!inputLooksForeign && !pendingAwayAndUnverified) {
+        continue;
+      }
+
+      candidates.push({
+        display,
+        reason: inputLooksForeign
+          ? `input ${currentInput.value} differs from configured local input ${localTarget.inputValue}`
+          : "pending restore display is attached but input could not be verified",
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function groupWindowsDuplicateAttachedDisplays(attachedDisplays) {
+  const groupsByIdentity = new Map();
+
+  for (const display of attachedDisplays) {
+    const identityKey = getWindowsDuplicateDisplayIdentityKey(display);
+    if (!identityKey) {
+      continue;
+    }
+
+    if (!groupsByIdentity.has(identityKey)) {
+      groupsByIdentity.set(identityKey, []);
+    }
+
+    groupsByIdentity.get(identityKey).push(display);
+  }
+
+  return [...groupsByIdentity.values()].filter((group) => {
+    const primaryCount = group.filter((display) => display.primary).length;
+    return group.length > 1 && primaryCount === 1;
+  });
+}
+
+function getWindowsDuplicateDisplayIdentityKey(display) {
+  const productCode = normalizeText(display?.productCode).toLowerCase();
+  const displayName = normalizeText(display?.friendlyName || display?.displayName).toLowerCase();
+  const width = Number.isFinite(display?.width) ? display.width : 0;
+  const height = Number.isFinite(display?.height) ? display.height : 0;
+
+  if (!productCode || !displayName || width <= 0 || height <= 0) {
+    return "";
+  }
+
+  return `${productCode}:${displayName}:${width}x${height}`;
+}
+
+async function getWindowsCurrentInputResultForTopologyDisplay(topologyDisplay) {
+  if (process.platform !== "win32") {
+    return {
+      ok: false,
+      value: null,
+      error: "当前平台不支持 Windows 输入读取。",
+    };
+  }
+
+  const deviceName = normalizeText(topologyDisplay?.deviceName);
+  if (!deviceName) {
+    return {
+      ok: false,
+      value: null,
+      error: "Windows topology display did not include a GDI device name.",
+    };
+  }
+
+  const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
+  try {
+    const output = await runCommand("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      scriptPath,
+      "-GdiDeviceName",
+      deviceName,
+      "-ReadInputValue",
+    ]);
+    const parsed = JSON.parse(output);
+    const currentInputValue = Number.isInteger(parsed?.currentInputValue)
+      ? parsed.currentInputValue
+      : NaN;
+
+    if (!Number.isInteger(currentInputValue)) {
+      throw new Error(`无法从读取结果里解析当前输入值：${output}`);
+    }
+
+    return {
+      ok: true,
+      value: currentInputValue,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      value: null,
+      error: normalizeText(error.message),
+    };
+  }
+}
+
+function isWindowsInputValueForTarget(inputValue, target, monitorConfig) {
+  if (!Number.isInteger(inputValue) || !Number.isInteger(target?.inputValue)) {
+    return false;
+  }
+
+  return getExpectedProbeInputValues(target.inputValue, monitorConfig).includes(inputValue);
+}
+
+function findStoredMonitorConfigForTopologyDisplay(topologyDisplay) {
+  return (
+    getStoredMonitorConfigs().find((monitorConfig) =>
+      isTopologyDisplayMatchMonitor(topologyDisplay, monitorConfig)
+    ) || null
+  );
+}
+
+async function detachWindowsTopologyDisplay(topologyDisplay, reason = "") {
+  const deviceName = normalizeText(topologyDisplay?.deviceName);
+  if (!deviceName) {
+    throw new Error("Windows duplicate display did not include a GDI device name.");
+  }
+
+  await runWindowsTopologyCommand(["-MonitorName", deviceName, "-DetachMonitor"]);
+  await waitForWindowsTopologyDeviceAttachmentState(
+    deviceName,
+    false,
+    `Windows 没有把误挂回来的重复屏幕 ${deviceName} 从桌面拓扑里移除。`
+  );
+  appendDiagnosticLog(`Detached duplicate Windows display ${deviceName}${reason ? ` (${reason})` : ""}`);
+}
+
+async function waitForWindowsTopologyDeviceAttachmentState(deviceName, expectedAttached, errorMessage) {
+  const normalizedDeviceName = normalizeText(deviceName).toLowerCase();
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < 8000) {
+    const topologyDisplays = await getWindowsTopologyDisplays();
+    const topologyDisplay = topologyDisplays.find(
+      (display) => normalizeText(display.deviceName).toLowerCase() === normalizedDeviceName
+    );
+    if (Boolean(topologyDisplay?.attached) === expectedAttached) {
+      return;
+    }
+
+    await delay(250);
+  }
+
+  throw new Error(errorMessage);
 }
 
 function startWindowsRestoreWatcher() {
@@ -1434,6 +1682,7 @@ async function handleLocalDisplayTopologyChange() {
       await attemptPendingWindowsRestores({
         displaySummaries,
       });
+      await attemptWindowsDuplicateForeignDisplayDetaches();
       scheduleTrayRebuild("display-change");
       return;
     }

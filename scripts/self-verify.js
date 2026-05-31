@@ -35,6 +35,13 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function buildMacSoftDisplayKey/u);
   assert.match(mainSource, /function withDisplayNameUniqueness/u);
   assert.match(mainSource, /async function attemptPendingWindowsRestores\(\{\s*monitorId: targetMonitorId = null,\s*displaySummaries = null,/u);
+  assert.match(mainSource, /allowAttachDetached = false/u);
+  assert.match(mainSource, /allowAttachDetached: true/u);
+  assert.match(mainSource, /async function attemptWindowsDuplicateForeignDisplayDetaches/u);
+  assert.match(mainSource, /function getWindowsDuplicateDisplayIdentityKey/u);
+  assert.match(mainSource, /function isWindowsInputValueForTarget/u);
+  assert.match(mainSource, /!shouldUseWindowsDisplayHandoffForMonitor\(monitorConfig, attachedDisplays\.length\)/u);
+  assert.match(mainSource, /pendingAwayAndUnverified/u);
   assert.match(mainSource, /const externalDisplays = orderedDisplays\.filter\(\(display\) => !display\.internal\);/u);
   assert.match(
     mainSource,
@@ -129,6 +136,8 @@ function verifyLocalOnlyDocs() {
   assert.match(readme, /127\.0\.0\.1/u);
   assert.match(readme, /hardware identity/u);
   assert.match(handoffDoc, /no LAN peer discovery/u);
+  assert.match(handoffDoc, /does not blindly re-add a detached waiting screen/u);
+  assert.match(handoffDoc, /same-model duplicate attached to Windows while its input is not that screen's configured local interface/u);
   assert.match(
     handoffDoc,
     /controls only the external physical screens that are currently attached to the local host/u
