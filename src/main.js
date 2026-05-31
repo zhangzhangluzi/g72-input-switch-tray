@@ -17,8 +17,11 @@ const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
 const MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000;
 const DDC_PROBE_CACHE_TTL_MS = 10000;
 const HELPER_COMMAND_TIMEOUT_MS = 15000;
+const WINDOWS_TOPOLOGY_COMMAND_TIMEOUT_MS = 45000;
+const WINDOWS_DDC_PROBE_TIMEOUT_MS = 8000;
 const CURRENT_INPUT_COMMAND_TIMEOUT_MS = 5000;
 const SYSTEM_PROFILER_COMMAND_TIMEOUT_MS = 45000;
+const WINDOWS_TAKEOVER_SETTLE_MS = 45000;
 const LOCAL_REQUEST_BODY_LIMIT_BYTES = 64 * 1024;
 const TARGET_SLOTS = [
   { id: "dp1", title: "DP1", defaultInputValue: 15 },
@@ -52,6 +55,8 @@ let refreshMenuInFlight = false;
 let refreshMenuQueued = false;
 let windowsRestoreInFlight = false;
 let windowsDuplicateDetachInFlight = false;
+const windowsTakeoverInProgressMonitorIds = new Set();
+const windowsTakeoverProtectedUntilByMonitorId = new Map();
 let windowsTopologyOperationQueue = Promise.resolve();
 let switchOperationQueue = Promise.resolve();
 const switchInFlightByMonitorId = new Map();
@@ -1468,6 +1473,7 @@ async function takeoverWindowsDetachedMonitor(
   const localTargetId = getLocalInterfaceId(monitorConfig);
   const localTarget = getTarget(localTargetId, monitorConfig);
   let attachedDuringTakeover = false;
+  windowsTakeoverInProgressMonitorIds.add(monitorConfig.id);
 
   try {
     upsertStoredMonitorConfig(monitorConfig);
@@ -1495,7 +1501,15 @@ async function takeoverWindowsDetachedMonitor(
     }
 
     const switchResult = await switchWindowsDisplayForMonitorConfig(monitorConfig, localTarget);
+    await waitForWindowsTopologyDeviceAttachmentState(
+      monitorConfig.match?.gdiDeviceName,
+      true,
+      `${getMonitorDisplayTitle(monitorConfig)} 已发送接管命令，但 Windows 显示拓扑没有稳定保留这块屏。`,
+      30000,
+      3000
+    );
     clearMonitorPendingRestore(monitorConfig.id);
+    markWindowsTakeoverProtection(monitorConfig.id);
     await syncMonitorConfigsFromLocalDisplays({ persist: true });
     void refreshMenu();
 
@@ -1533,6 +1547,8 @@ async function takeoverWindowsDetachedMonitor(
     }
 
     throw new Error(message);
+  } finally {
+    windowsTakeoverInProgressMonitorIds.delete(monitorConfig.id);
   }
 }
 
@@ -1720,6 +1736,7 @@ async function getWindowsDuplicateForeignDisplayDetachCandidates(topologyDisplay
       if (
         !monitorConfig ||
         (targetMonitorId && monitorConfig.id !== targetMonitorId) ||
+        isWindowsTakeoverInProgress(monitorConfig) ||
         !shouldUseWindowsDisplayHandoffForMonitor(monitorConfig, attachedDisplays.length)
       ) {
         continue;
@@ -1727,12 +1744,9 @@ async function getWindowsDuplicateForeignDisplayDetachCandidates(topologyDisplay
 
       const runtime = getExistingMonitorDesktopRuntime(monitorConfig.id);
       const currentInput = await getWindowsCurrentInputResultForTopologyDisplay(display);
-      const localTarget = getTarget(getLocalInterfaceId(monitorConfig), monitorConfig);
-      const inputLooksForeign = currentInput.ok && !isWindowsInputValueForTarget(
-        currentInput.value,
-        localTarget,
-        monitorConfig
-      );
+      const inputLooksForeign =
+        currentInput.ok &&
+        isWindowsInputValueForConfiguredExternalHandoffTarget(currentInput.value, monitorConfig);
       const pendingAwayAndUnverified = Boolean(runtime?.pendingRestore) && !currentInput.ok;
 
       if (!inputLooksForeign && !pendingAwayAndUnverified) {
@@ -1742,13 +1756,53 @@ async function getWindowsDuplicateForeignDisplayDetachCandidates(topologyDisplay
       candidates.push({
         display,
         reason: inputLooksForeign
-          ? `input ${currentInput.value} differs from configured local input ${localTarget.inputValue}`
+          ? `input ${currentInput.value} matches configured external handoff target`
           : "pending restore display is attached but input could not be verified",
       });
     }
   }
 
   return candidates;
+}
+
+function isWindowsTakeoverInProgress(monitorConfigOrId) {
+  const monitorId =
+    typeof monitorConfigOrId === "string"
+      ? normalizeText(monitorConfigOrId)
+      : normalizeText(monitorConfigOrId?.id);
+  return Boolean(
+    monitorId &&
+      (windowsTakeoverInProgressMonitorIds.has(monitorId) ||
+        isWindowsTakeoverSettleProtected(monitorId))
+  );
+}
+
+function markWindowsTakeoverProtection(monitorId, durationMs = WINDOWS_TAKEOVER_SETTLE_MS) {
+  const normalizedMonitorId = normalizeText(monitorId);
+  if (!normalizedMonitorId) {
+    return;
+  }
+
+  windowsTakeoverProtectedUntilByMonitorId.set(normalizedMonitorId, Date.now() + durationMs);
+}
+
+function isWindowsTakeoverSettleProtected(monitorId) {
+  const normalizedMonitorId = normalizeText(monitorId);
+  if (!normalizedMonitorId) {
+    return false;
+  }
+
+  const protectedUntil = windowsTakeoverProtectedUntilByMonitorId.get(normalizedMonitorId);
+  if (!Number.isFinite(protectedUntil)) {
+    return false;
+  }
+
+  if (Date.now() <= protectedUntil) {
+    return true;
+  }
+
+  windowsTakeoverProtectedUntilByMonitorId.delete(normalizedMonitorId);
+  return false;
 }
 
 function groupWindowsDuplicateAttachedDisplays(attachedDisplays) {
@@ -1847,6 +1901,25 @@ function isWindowsInputValueForTarget(inputValue, target, monitorConfig) {
   return getExpectedProbeInputValues(target.inputValue, monitorConfig).includes(inputValue);
 }
 
+function isWindowsInputValueForConfiguredExternalHandoffTarget(inputValue, monitorConfig) {
+  if (!Number.isInteger(inputValue)) {
+    return false;
+  }
+
+  const localInterfaceId = getLocalInterfaceId(monitorConfig);
+  return TARGET_IDS.some((targetId) => {
+    if (targetId === localInterfaceId || !isExternalWindowsHandoffTargetId(targetId)) {
+      return false;
+    }
+
+    return isWindowsInputValueForTarget(inputValue, getTarget(targetId, monitorConfig), monitorConfig);
+  });
+}
+
+function isExternalWindowsHandoffTargetId(targetId) {
+  return /^hdmi\d+$/iu.test(normalizeText(targetId));
+}
+
 function findStoredMonitorConfigForTopologyDisplay(topologyDisplay) {
   return (
     getStoredMonitorConfigs().find((monitorConfig) =>
@@ -1870,17 +1943,36 @@ async function detachWindowsTopologyDisplay(topologyDisplay, reason = "") {
   appendDiagnosticLog(`Detached duplicate Windows display ${deviceName}${reason ? ` (${reason})` : ""}`);
 }
 
-async function waitForWindowsTopologyDeviceAttachmentState(deviceName, expectedAttached, errorMessage) {
+async function waitForWindowsTopologyDeviceAttachmentState(
+  deviceName,
+  expectedAttached,
+  errorMessage,
+  timeoutMs = 8000,
+  stableMs = 0
+) {
   const normalizedDeviceName = normalizeText(deviceName).toLowerCase();
   const startedAt = Date.now();
+  let matchedSince = 0;
 
-  while (Date.now() - startedAt < 8000) {
+  while (Date.now() - startedAt < timeoutMs) {
     const topologyDisplays = await getWindowsTopologyDisplays();
     const topologyDisplay = topologyDisplays.find(
       (display) => normalizeText(display.deviceName).toLowerCase() === normalizedDeviceName
     );
     if (Boolean(topologyDisplay?.attached) === expectedAttached) {
-      return;
+      if (stableMs <= 0) {
+        return;
+      }
+
+      if (!matchedSince) {
+        matchedSince = Date.now();
+      }
+
+      if (Date.now() - matchedSince >= stableMs) {
+        return;
+      }
+    } else {
+      matchedSince = 0;
     }
 
     await delay(250);
@@ -3190,6 +3282,18 @@ async function getWindowsDdcProbeResult(topologyDisplay) {
     return cachedResult;
   }
 
+  const monitorConfig = findStoredMonitorConfigForTopologyDisplay(topologyDisplay);
+  if (monitorConfig && isWindowsTakeoverInProgress(monitorConfig)) {
+    const settlingResult = {
+      ok: cachedResult?.ok !== false,
+      status: "settling",
+      checkedAt: Date.now(),
+      error: cachedResult?.ok === false ? cachedResult.error : "",
+    };
+    windowsDdcProbeCache.set(cacheKey, settlingResult);
+    return settlingResult;
+  }
+
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
   try {
     const output = await runCommand("powershell.exe", [
@@ -3201,7 +3305,9 @@ async function getWindowsDdcProbeResult(topologyDisplay) {
       "-GdiDeviceName",
       deviceName,
       "-ProbeDdc",
-    ]);
+    ], {
+      timeout: WINDOWS_DDC_PROBE_TIMEOUT_MS,
+    });
     const parsed = JSON.parse(output);
     const nextResult = {
       ok: Boolean(parsed?.ok) && Number(parsed?.physicalMonitorCount || 0) > 0,
@@ -3348,7 +3454,9 @@ async function runWindowsTopologyCommand(args) {
       "-File",
       topologyScriptPath,
       ...args,
-    ]);
+    ], {
+      timeout: WINDOWS_TOPOLOGY_COMMAND_TIMEOUT_MS,
+    });
 
   const nextOperation = windowsTopologyOperationQueue.then(commandTask, commandTask);
   windowsTopologyOperationQueue = nextOperation.catch(() => {});
@@ -4555,21 +4663,72 @@ function runCommand(file, args, options = {}) {
   }
 
   return new Promise((resolve, reject) => {
-    execFile(file, args, execOptions, (error, stdout, stderr) => {
-      const combinedOutput = [stdout, stderr].filter(Boolean).join("\n").trim();
-      if (error) {
-        if (error.killed && execOptions.timeout) {
-          reject(new Error(`底层 helper 超时（${execOptions.timeout}ms）：${file}`));
-          return;
-        }
+    const timeoutMs = Number.isFinite(execOptions.timeout) ? execOptions.timeout : 0;
+    const childOptions = {
+      ...execOptions,
+      timeout: 0,
+    };
+    let settled = false;
+    let timeoutTimer = null;
 
-        reject(new Error(combinedOutput || error.message));
+    const settle = (callback) => {
+      if (settled) {
         return;
       }
 
-      resolve(combinedOutput);
+      settled = true;
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+      callback();
+    };
+
+    const child = execFile(file, args, childOptions, (error, stdout, stderr) => {
+      const combinedOutput = [stdout, stderr].filter(Boolean).join("\n").trim();
+      settle(() => {
+        if (error) {
+          reject(new Error(combinedOutput || error.message));
+          return;
+        }
+
+        resolve(combinedOutput);
+      });
     });
+
+    if (timeoutMs > 0) {
+      timeoutTimer = setTimeout(() => {
+        settle(() => {
+          killProcessTree(child.pid);
+          reject(new Error(`底层 helper 超时（${timeoutMs}ms）：${file}`));
+        });
+      }, timeoutMs);
+    }
   });
+}
+
+function killProcessTree(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    try {
+      execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        timeout: 5000,
+      }, () => {});
+    } catch {
+      // Best effort: the command has already timed out from the app's perspective.
+    }
+    return;
+  }
+
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Best effort only.
+  }
 }
 
 function getBundledResourcePath(...segments) {
