@@ -4379,6 +4379,19 @@ function normalizeMonitorConfig(rawMonitorConfig = {}, fallbackMonitorConfig = {
 }
 
 function buildMonitorConfigFromForm(form, existingMonitorConfig) {
+  const inputValueErrors = [];
+  const interfaces = TARGET_IDS.reduce((result, targetId) => {
+    const inputValue = parseInputValue(form.get(`${targetId}InputValue`));
+    if (!Number.isInteger(inputValue) || inputValue < 1 || inputValue > 255) {
+      inputValueErrors.push(`${getTargetSlotName(targetId)} 的输入值必须是 1 到 255 的整数。`);
+    }
+
+    result[targetId] = {
+      inputValue,
+      deviceLabel: normalizeText(form.get(`${targetId}DeviceLabel`)).slice(0, 40),
+    };
+    return result;
+  }, {});
   const monitorConfig = normalizeMonitorConfig(
     {
       ...existingMonitorConfig,
@@ -4389,20 +4402,14 @@ function buildMonitorConfigFromForm(form, existingMonitorConfig) {
       windowsDisplayHandoffMode: parseWindowsDisplayHandoffMode(
         form.get("windowsDisplayHandoffMode")
       ),
-      interfaces: TARGET_IDS.reduce((result, targetId) => {
-        result[targetId] = {
-          inputValue: parseInputValue(form.get(`${targetId}InputValue`)),
-          deviceLabel: normalizeText(form.get(`${targetId}DeviceLabel`)).slice(0, 40),
-        };
-        return result;
-      }, {}),
+      interfaces,
     },
     existingMonitorConfig
   );
 
   return {
     monitorConfig,
-    errors: getMonitorConfigValidationErrors(monitorConfig),
+    errors: Array.from(new Set([...inputValueErrors, ...getMonitorConfigValidationErrors(monitorConfig)])),
   };
 }
 

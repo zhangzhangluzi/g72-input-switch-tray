@@ -193,7 +193,10 @@ function verifyMainSourceBusinessGuards() {
 function extractFunction(source, name) {
   const start = source.indexOf(`function ${name}`);
   assert.notEqual(start, -1, `Missing function ${name}`);
-  const bodyStart = source.indexOf("{", start);
+  const declarationEnd = source.indexOf(") {", start);
+  const bodyStart = declarationEnd >= 0
+    ? source.indexOf("{", declarationEnd)
+    : source.indexOf("{", start);
   let depth = 0;
 
   for (let index = bodyStart; index < source.length; index += 1) {
@@ -349,6 +352,77 @@ function verifyStrictIntegerParsing() {
   assert.equal(context.result.fallbackInvalid, 7);
   assert.equal(context.result.displayZero, 0);
   assert.equal(context.result.displayInvalid, null);
+}
+
+function verifyMonitorConfigFormRejectsInvalidInputValues() {
+  const mainSourcePath = path.resolve(__dirname, "..", "src", "main.js");
+  const mainSource = fs.readFileSync(mainSourcePath, "utf8");
+  const functionNames = [
+    "normalizeText",
+    "parseStrictInteger",
+    "normalizePositiveInteger",
+    "parseInputValue",
+    "parseCompatibilityMode",
+    "parseWindowsDisplayHandoffMode",
+    "parseTargetId",
+    "cloneInterfacesConfig",
+    "createDefaultInterfacesConfig",
+    "createDefaultMonitorConfig",
+    "normalizeMonitorConfig",
+    "getTargetSlotName",
+    "getLocalInterfaceId",
+    "getMonitorConfigValidationErrors",
+    "buildMonitorConfigFromForm",
+  ];
+  const helperSource = functionNames.map((name) => extractFunction(mainSource, name)).join("\n");
+  const script = `
+    const TARGET_SLOTS = [
+      { id: "dp1", title: "DP1", defaultInputValue: 15 },
+      { id: "dp2", title: "DP2", defaultInputValue: 16 },
+      { id: "hdmi1", title: "HDMI1", defaultInputValue: 17 },
+      { id: "hdmi2", title: "HDMI2", defaultInputValue: 18 },
+    ];
+    const TARGET_SLOT_MAP = new Map(TARGET_SLOTS.map((slot) => [slot.id, slot]));
+    const TARGET_IDS = TARGET_SLOTS.map((slot) => slot.id);
+    ${helperSource}
+    const existingMonitorConfig = {
+      id: "monitor-test",
+      displayKey: "mac-system:2",
+      displayName: "H24E7",
+      localInterfaceId: "hdmi1",
+      peerInterfaceId: "dp2",
+      compatibilityMode: "auto",
+      windowsDisplayHandoffMode: "auto",
+      interfaces: {
+        dp1: { inputValue: 99, deviceLabel: "" },
+        dp2: { inputValue: 16, deviceLabel: "" },
+        hdmi1: { inputValue: 17, deviceLabel: "" },
+        hdmi2: { inputValue: 18, deviceLabel: "" },
+      },
+      match: {},
+    };
+    const valid = buildMonitorConfigFromForm(new URLSearchParams(
+      "localInterfaceId=hdmi1&peerInterfaceId=dp2&compatibilityMode=auto&windowsDisplayHandoffMode=auto&dp1InputValue=42&dp1DeviceLabel=&dp2InputValue=16&dp2DeviceLabel=&hdmi1InputValue=17&hdmi1DeviceLabel=&hdmi2InputValue=18&hdmi2DeviceLabel="
+    ), existingMonitorConfig);
+    const suffix = buildMonitorConfigFromForm(new URLSearchParams(
+      "localInterfaceId=hdmi1&peerInterfaceId=dp2&compatibilityMode=auto&windowsDisplayHandoffMode=auto&dp1InputValue=17abc&dp1DeviceLabel=&dp2InputValue=16&dp2DeviceLabel=&hdmi1InputValue=17&hdmi1DeviceLabel=&hdmi2InputValue=18&hdmi2DeviceLabel="
+    ), existingMonitorConfig);
+    const outOfRange = buildMonitorConfigFromForm(new URLSearchParams(
+      "localInterfaceId=hdmi1&peerInterfaceId=dp2&compatibilityMode=auto&windowsDisplayHandoffMode=auto&dp1InputValue=0&dp1DeviceLabel=&dp2InputValue=16&dp2DeviceLabel=&hdmi1InputValue=17&hdmi1DeviceLabel=&hdmi2InputValue=18&hdmi2DeviceLabel="
+    ), existingMonitorConfig);
+    globalThis.result = {
+      validErrors: valid.errors,
+      validDp1: valid.monitorConfig.interfaces.dp1.inputValue,
+      suffixErrors: suffix.errors,
+      outOfRangeErrors: outOfRange.errors,
+    };
+  `;
+  const context = { URLSearchParams };
+  vm.runInNewContext(script, context);
+  assert.deepEqual(Array.from(context.result.validErrors), []);
+  assert.equal(context.result.validDp1, 42);
+  assert.deepEqual(Array.from(context.result.suffixErrors), ["DP1 的输入值必须是 1 到 255 的整数。"]);
+  assert.deepEqual(Array.from(context.result.outOfRangeErrors), ["DP1 的输入值必须是 1 到 255 的整数。"]);
 }
 
 function verifyLocalOnlyDocs() {
@@ -860,6 +934,7 @@ function main() {
   verifyMainSourceBusinessGuards();
   verifyMacMonitorConfigSyncBehavior();
   verifyStrictIntegerParsing();
+  verifyMonitorConfigFormRejectsInvalidInputValues();
   verifyLocalOnlyDocs();
   verifyPinnedMacDdcctlBuildScript();
   verifyWindowsHelperSourceGuards();
