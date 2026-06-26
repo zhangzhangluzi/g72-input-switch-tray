@@ -187,6 +187,7 @@ function verifyMainSourceBusinessGuards() {
   assert.doesNotMatch(mainSource, /:\s*displaySummary\.electronDisplayId/u);
   assert.match(mainSource, /function runSwitchCandidateSequence/u);
   assert.match(mainSource, /getExpectedProbeInputValues\(target\.inputValue, monitorContext\.monitor\)/u);
+  assert.match(mainSource, /function parseStrictInteger/u);
 }
 
 function extractFunction(source, name) {
@@ -308,6 +309,46 @@ function verifyMacMonitorConfigSyncBehavior() {
   assert.equal(context.result.blankIdentity, "");
   assert.equal(context.result.virtualIdentity, "");
   assert.equal(context.result.virtualPhysical, false);
+}
+
+function verifyStrictIntegerParsing() {
+  const mainSourcePath = path.resolve(__dirname, "..", "src", "main.js");
+  const mainSource = fs.readFileSync(mainSourcePath, "utf8");
+  const functionNames = [
+    "normalizeText",
+    "parseStrictInteger",
+    "normalizePositiveInteger",
+    "normalizeDisplayIdentifier",
+    "parseInputValue",
+  ];
+  const helperSource = functionNames.map((name) => extractFunction(mainSource, name)).join("\n");
+  const script = `
+    ${helperSource}
+    globalThis.result = {
+      validInput: parseInputValue("17"),
+      paddedInput: parseInputValue(" 017 "),
+      decimalInput: parseInputValue("17.5"),
+      suffixInput: parseInputValue("17abc"),
+      negativeInput: parseInputValue("-1"),
+      blankInput: parseInputValue(""),
+      fallbackValid: normalizePositiveInteger("42", 7),
+      fallbackInvalid: normalizePositiveInteger("42px", 7),
+      displayZero: normalizeDisplayIdentifier("0"),
+      displayInvalid: normalizeDisplayIdentifier("1x"),
+    };
+  `;
+  const context = {};
+  vm.runInNewContext(script, context);
+  assert.equal(context.result.validInput, 17);
+  assert.equal(context.result.paddedInput, 17);
+  assert.equal(Number.isNaN(context.result.decimalInput), true);
+  assert.equal(Number.isNaN(context.result.suffixInput), true);
+  assert.equal(Number.isNaN(context.result.negativeInput), true);
+  assert.equal(Number.isNaN(context.result.blankInput), true);
+  assert.equal(context.result.fallbackValid, 42);
+  assert.equal(context.result.fallbackInvalid, 7);
+  assert.equal(context.result.displayZero, 0);
+  assert.equal(context.result.displayInvalid, null);
 }
 
 function verifyLocalOnlyDocs() {
@@ -818,6 +859,7 @@ function main() {
   verifyMainSourceSyntax();
   verifyMainSourceBusinessGuards();
   verifyMacMonitorConfigSyncBehavior();
+  verifyStrictIntegerParsing();
   verifyLocalOnlyDocs();
   verifyPinnedMacDdcctlBuildScript();
   verifyWindowsHelperSourceGuards();

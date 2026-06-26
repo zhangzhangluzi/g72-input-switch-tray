@@ -5203,19 +5203,23 @@ function normalizeText(value) {
   return String(value ?? "").trim();
 }
 
+function parseStrictInteger(value) {
+  const normalized = normalizeText(value);
+  return /^\d+$/u.test(normalized) ? Number.parseInt(normalized, 10) : NaN;
+}
+
 function normalizePositiveInteger(value, fallbackValue) {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
+  const parsed = parseStrictInteger(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallbackValue;
 }
 
 function normalizeDisplayIdentifier(value) {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
+  const parsed = parseStrictInteger(value);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function parseInputValue(value) {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
-  return Number.isInteger(parsed) ? parsed : NaN;
+  return parseStrictInteger(value);
 }
 
 function parseCompatibilityMode(value) {
