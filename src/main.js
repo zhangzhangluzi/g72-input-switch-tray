@@ -4162,6 +4162,7 @@ function renderSharedStyles() {
       background: var(--panel);
       box-shadow: 0 18px 60px rgba(31, 42, 44, 0.12);
       backdrop-filter: blur(10px);
+      overflow-wrap: anywhere;
     }
     .eyebrow {
       margin-bottom: 10px;
@@ -4215,6 +4216,7 @@ function renderSharedStyles() {
       border-radius: 16px;
       padding: 16px 18px;
       font-size: 18px;
+      line-height: 1.25;
       font-weight: 700;
       cursor: pointer;
       color: white;
@@ -4226,6 +4228,13 @@ function renderSharedStyles() {
     button:disabled {
       opacity: 0.55;
       cursor: not-allowed;
+    }
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    summary:focus-visible {
+      outline: 3px solid rgba(13, 107, 98, 0.34);
+      outline-offset: 2px;
     }
     @media (max-width: 640px) {
       main {
