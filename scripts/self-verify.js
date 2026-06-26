@@ -151,6 +151,7 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function findStoredMonitorConfigForDisplay/u);
   assert.match(mainSource, /customizedMacSoftMatches\.length === 1/u);
   assert.match(mainSource, /function isUserCustomizedMonitorConfig/u);
+  assert.match(mainSource, /function isUsableMacHardwareId/u);
   assert.match(mainSource, /function getMacPersistableMonitorIdentityKey/u);
   assert.match(mainSource, /function hasMacPersistableMonitorIdentity/u);
   assert.match(mainSource, /function isGenericMacDisplayName/u);
@@ -219,6 +220,8 @@ function verifyMacMonitorConfigSyncBehavior() {
     "getLocalInterfaceId",
     "getConfiguredPeerInterfaceId",
     "isUserCustomizedMonitorConfig",
+    "hasMacPhysicalIdentity",
+    "isUsableMacHardwareId",
     "buildMacHardwareDisplayKey",
     "buildMacSoftDisplayKey",
     "isSingleMacSoftDisplayMatch",
@@ -292,6 +295,10 @@ function verifyMacMonitorConfigSyncBehavior() {
       calibratedIdentity: getMacPersistableMonitorIdentityKey(calibrated),
       blankIdentity: getMacPersistableMonitorIdentityKey(blankShell),
       virtualIdentity: getMacPersistableMonitorIdentityKey(virtualShell),
+      virtualPhysical: hasMacPhysicalIdentity({
+        macVendorId: "756e6b6e",
+        macProductId: "76697274",
+      }),
     };
   `;
   const context = { process: { platform: "darwin" } };
@@ -300,6 +307,7 @@ function verifyMacMonitorConfigSyncBehavior() {
   assert.match(context.result.calibratedIdentity, /^mac-soft:4d67:2431:h24e7$/u);
   assert.equal(context.result.blankIdentity, "");
   assert.equal(context.result.virtualIdentity, "");
+  assert.equal(context.result.virtualPhysical, false);
 }
 
 function verifyLocalOnlyDocs() {

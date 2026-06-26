@@ -1255,7 +1255,16 @@ function parseMacDdcProbeOutput(output) {
 function hasMacPhysicalIdentity(displaySummary) {
   const vendorId = normalizeText(displaySummary?.macVendorId).toLowerCase();
   const productId = normalizeText(displaySummary?.macProductId).toLowerCase();
-  return Boolean(vendorId && productId && !/^(0x)?0+$/u.test(vendorId) && !/^(0x)?0+$/u.test(productId));
+  return isUsableMacHardwareId(vendorId) && isUsableMacHardwareId(productId);
+}
+
+function isUsableMacHardwareId(value) {
+  const normalized = normalizeText(value).toLowerCase().replace(/^0x/u, "");
+  return Boolean(
+    normalized &&
+      !/^0+$/u.test(normalized) &&
+      !["unknown", "unkn", "virt", "756e6b6e", "76697274"].includes(normalized)
+  );
 }
 
 function parseMacInputValueOutput(output) {
