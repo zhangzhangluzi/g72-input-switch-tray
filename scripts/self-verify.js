@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const vm = require("node:vm");
 const { execFileSync } = require("node:child_process");
 
 function run(command, args) {
@@ -147,7 +148,14 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /switchOperationQueue = switchTask\.catch\(\(\) => \{\}\)/u);
   assert.match(mainSource, /function shouldPreserveDisconnectedMonitorConfig/u);
   assert.match(mainSource, /process\.platform === "darwin"[\s\S]{0,120}hasMacPersistableMonitorIdentity/u);
+  assert.match(mainSource, /function findStoredMonitorConfigForDisplay/u);
+  assert.match(mainSource, /customizedMacSoftMatches\.length === 1/u);
+  assert.match(mainSource, /function isUserCustomizedMonitorConfig/u);
+  assert.match(mainSource, /function getMacPersistableMonitorIdentityKey/u);
   assert.match(mainSource, /function hasMacPersistableMonitorIdentity/u);
+  assert.match(mainSource, /function isGenericMacDisplayName/u);
+  assert.match(mainSource, /preservedMacIdentityKeys/u);
+  assert.doesNotMatch(mainSource, /buildMacSoftDisplayKey\(monitorConfig\) \|\|\s*normalizeText\(monitorConfig\.displayKey\)/u);
   assert.match(mainSource, /function pruneStateForKnownMonitorIds/u);
   assert.match(mainSource, /function normalizePersistedSwitchOutcome/u);
   assert.match(mainSource, /function shouldClearPersistedSwitchOutcome/u);
@@ -178,6 +186,120 @@ function verifyMainSourceBusinessGuards() {
   assert.doesNotMatch(mainSource, /:\s*displaySummary\.electronDisplayId/u);
   assert.match(mainSource, /function runSwitchCandidateSequence/u);
   assert.match(mainSource, /getExpectedProbeInputValues\(target\.inputValue, monitorContext\.monitor\)/u);
+}
+
+function extractFunction(source, name) {
+  const start = source.indexOf(`function ${name}`);
+  assert.notEqual(start, -1, `Missing function ${name}`);
+  const bodyStart = source.indexOf("{", start);
+  let depth = 0;
+
+  for (let index = bodyStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(start, index + 1);
+      }
+    }
+  }
+
+  throw new Error(`Could not extract function ${name}`);
+}
+
+function verifyMacMonitorConfigSyncBehavior() {
+  const mainSourcePath = path.resolve(__dirname, "..", "src", "main.js");
+  const mainSource = fs.readFileSync(mainSourcePath, "utf8");
+  const functionNames = [
+    "normalizeText",
+    "parseTargetId",
+    "getTarget",
+    "getLocalInterfaceId",
+    "getConfiguredPeerInterfaceId",
+    "isUserCustomizedMonitorConfig",
+    "buildMacHardwareDisplayKey",
+    "buildMacSoftDisplayKey",
+    "isSingleMacSoftDisplayMatch",
+    "getMacPersistableMonitorIdentityKey",
+    "isGenericMacDisplayName",
+    "findStoredMonitorConfigForDisplay",
+  ];
+  const helperSource = functionNames.map((name) => extractFunction(mainSource, name)).join("\n");
+  const script = `
+    const TARGET_SLOTS = [
+      { id: "dp1", title: "DP1", defaultInputValue: 15 },
+      { id: "dp2", title: "DP2", defaultInputValue: 16 },
+      { id: "hdmi1", title: "HDMI1", defaultInputValue: 17 },
+      { id: "hdmi2", title: "HDMI2", defaultInputValue: 18 },
+    ];
+    const TARGET_SLOT_MAP = new Map(TARGET_SLOTS.map((slot) => [slot.id, slot]));
+    const TARGET_IDS = TARGET_SLOTS.map((slot) => slot.id);
+    ${helperSource}
+    const displaySummary = {
+      displayKey: "mac-system:2",
+      detectedName: "H24E7",
+      macVendorId: "4d67",
+      macProductId: "2431",
+      macSerialNumber: "1",
+      macSystemDisplayId: 2,
+      electronDisplayId: 2,
+    };
+    const staleDefault = {
+      id: "monitor-new",
+      displayKey: "mac-system:2",
+      displayName: "H24E7",
+      localInterfaceId: "dp1",
+      peerInterfaceId: "",
+      interfaces: {},
+      match: { macVendorId: "4d67", macProductId: "2431", macSerialNumber: "1" },
+    };
+    const calibrated = {
+      id: "monitor-old",
+      displayKey: "mac-system:1",
+      displayName: "H24E7",
+      localInterfaceId: "hdmi1",
+      peerInterfaceId: "dp2",
+      interfaces: {},
+      match: { macVendorId: "4d67", macProductId: "2431", macSerialNumber: "1" },
+    };
+    const blankShell = {
+      id: "monitor-blank",
+      displayKey: "mac:5",
+      displayName: "",
+      localInterfaceId: "dp1",
+      peerInterfaceId: "",
+      interfaces: {},
+      match: {},
+    };
+    const virtualShell = {
+      id: "monitor-virtual",
+      displayKey: "mac-system:7",
+      displayName: "spdisplays_display",
+      localInterfaceId: "dp1",
+      peerInterfaceId: "",
+      interfaces: {},
+      match: { macVendorId: "756e6b6e", macProductId: "76697274" },
+    };
+    globalThis.result = {
+      matchId: findStoredMonitorConfigForDisplay(
+        displaySummary,
+        [staleDefault, calibrated, blankShell, virtualShell],
+        new Set(),
+        true
+      ).id,
+      calibratedIdentity: getMacPersistableMonitorIdentityKey(calibrated),
+      blankIdentity: getMacPersistableMonitorIdentityKey(blankShell),
+      virtualIdentity: getMacPersistableMonitorIdentityKey(virtualShell),
+    };
+  `;
+  const context = { process: { platform: "darwin" } };
+  vm.runInNewContext(script, context);
+  assert.equal(context.result.matchId, "monitor-old");
+  assert.match(context.result.calibratedIdentity, /^mac-soft:4d67:2431:h24e7$/u);
+  assert.equal(context.result.blankIdentity, "");
+  assert.equal(context.result.virtualIdentity, "");
 }
 
 function verifyLocalOnlyDocs() {
@@ -687,6 +809,7 @@ function verifyMacHelperAppsIfAvailable() {
 function main() {
   verifyMainSourceSyntax();
   verifyMainSourceBusinessGuards();
+  verifyMacMonitorConfigSyncBehavior();
   verifyLocalOnlyDocs();
   verifyPinnedMacDdcctlBuildScript();
   verifyWindowsHelperSourceGuards();

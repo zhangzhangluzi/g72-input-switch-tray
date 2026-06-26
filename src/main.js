@@ -2587,37 +2587,20 @@ async function syncMonitorConfigsFromLocalDisplays({
     storedMonitorConfigs.length === 1 && !normalizeText(storedMonitorConfigs[0].displayKey)
       ? storedMonitorConfigs[0]
       : null;
-  const singleMacSoftMatchAllowed = shouldAllowSingleMacSoftDisplayMatch(
-    displaySummaries,
-    unmatchedStoredMonitorConfigs
-  );
+  const singleMacSoftMatchAllowed = shouldAllowSingleMacSoftDisplayMatch(displaySummaries);
   let legacyMonitorConfigConsumed = false;
   const usedMonitorIds = new Set();
   const nextMonitorConfigs = [];
   const resolvedDisplaySummaries = [];
 
   for (const displaySummary of displaySummaries) {
-    const macHardwareDisplayKey = buildMacHardwareDisplayKey(displaySummary);
     const matchingMonitorConfig =
-      unmatchedStoredMonitorConfigs.find((monitorConfig) => {
-        if (usedMonitorIds.has(monitorConfig.id)) {
-          return false;
-        }
-
-        return (
-          normalizeText(monitorConfig.displayKey) === displaySummary.displayKey ||
-          (macHardwareDisplayKey &&
-            buildMacHardwareDisplayKey(monitorConfig) === macHardwareDisplayKey) ||
-          (singleMacSoftMatchAllowed &&
-            isSingleMacSoftDisplayMatch(monitorConfig, displaySummary)) ||
-          (Number.isInteger(displaySummary.macSystemDisplayId) &&
-            monitorConfig.match?.macSystemDisplayId === displaySummary.macSystemDisplayId) ||
-          (displaySummary.gdiDeviceName &&
-            normalizeText(monitorConfig.match?.gdiDeviceName) === displaySummary.gdiDeviceName) ||
-          (Number.isInteger(displaySummary.electronDisplayId) &&
-            monitorConfig.match?.electronDisplayId === displaySummary.electronDisplayId)
-        );
-      }) ||
+      findStoredMonitorConfigForDisplay(
+        displaySummary,
+        unmatchedStoredMonitorConfigs,
+        usedMonitorIds,
+        singleMacSoftMatchAllowed
+      ) ||
       (!legacyMonitorConfigConsumed && legacyMonitorConfig ? legacyMonitorConfig : null);
 
     if (matchingMonitorConfig === legacyMonitorConfig) {
@@ -2669,13 +2652,25 @@ async function syncMonitorConfigsFromLocalDisplays({
     resolvedDisplaySummaries.push(resolvedDisplaySummary);
   }
 
+  const preservedMacIdentityKeys = new Set(
+    nextMonitorConfigs.map(getMacPersistableMonitorIdentityKey).filter(Boolean)
+  );
+
   for (const storedMonitorConfig of unmatchedStoredMonitorConfigs) {
     if (usedMonitorIds.has(storedMonitorConfig.id)) {
       continue;
     }
 
+    const macIdentityKey = getMacPersistableMonitorIdentityKey(storedMonitorConfig);
+    if (macIdentityKey && preservedMacIdentityKeys.has(macIdentityKey)) {
+      continue;
+    }
+
     if (shouldPreserveDisconnectedMonitorConfig(storedMonitorConfig)) {
       nextMonitorConfigs.push(normalizeMonitorConfig(storedMonitorConfig));
+      if (macIdentityKey) {
+        preservedMacIdentityKeys.add(macIdentityKey);
+      }
     }
   }
 
@@ -2698,6 +2693,45 @@ async function syncMonitorConfigsFromLocalDisplays({
   return resolvedDisplaySummaries;
 }
 
+function findStoredMonitorConfigForDisplay(
+  displaySummary,
+  storedMonitorConfigs,
+  usedMonitorIds,
+  singleMacSoftMatchAllowed
+) {
+  const candidates = storedMonitorConfigs.filter(
+    (monitorConfig) => !usedMonitorIds.has(monitorConfig.id)
+  );
+  const macHardwareDisplayKey = buildMacHardwareDisplayKey(displaySummary);
+  const macSoftMatches = singleMacSoftMatchAllowed
+    ? candidates.filter((monitorConfig) => isSingleMacSoftDisplayMatch(monitorConfig, displaySummary))
+    : [];
+  const customizedMacSoftMatches = macSoftMatches.filter(isUserCustomizedMonitorConfig);
+
+  if (customizedMacSoftMatches.length === 1) {
+    return customizedMacSoftMatches[0];
+  }
+
+  if (macSoftMatches.length === 1) {
+    return macSoftMatches[0];
+  }
+
+  return (
+    candidates.find((monitorConfig) => {
+      return (
+        normalizeText(monitorConfig.displayKey) === displaySummary.displayKey ||
+        (macHardwareDisplayKey && buildMacHardwareDisplayKey(monitorConfig) === macHardwareDisplayKey) ||
+        (Number.isInteger(displaySummary.macSystemDisplayId) &&
+          monitorConfig.match?.macSystemDisplayId === displaySummary.macSystemDisplayId) ||
+        (displaySummary.gdiDeviceName &&
+          normalizeText(monitorConfig.match?.gdiDeviceName) === displaySummary.gdiDeviceName) ||
+        (Number.isInteger(displaySummary.electronDisplayId) &&
+          monitorConfig.match?.electronDisplayId === displaySummary.electronDisplayId)
+      );
+    }) || null
+  );
+}
+
 function shouldPreserveDisconnectedMonitorConfig(monitorConfig) {
   if (process.platform === "darwin") {
     return hasMacPersistableMonitorIdentity(monitorConfig);
@@ -2714,15 +2748,7 @@ function shouldPreserveDisconnectedMonitorConfig(monitorConfig) {
 }
 
 function hasMacPersistableMonitorIdentity(monitorConfig) {
-  if (!monitorConfig || typeof monitorConfig !== "object") {
-    return false;
-  }
-
-  return Boolean(
-    buildMacHardwareDisplayKey(monitorConfig) ||
-      buildMacSoftDisplayKey(monitorConfig) ||
-      normalizeText(monitorConfig.displayKey)
-  );
+  return Boolean(getMacPersistableMonitorIdentityKey(monitorConfig));
 }
 
 function getExistingMonitorDesktopRuntime(monitorId) {
@@ -3197,13 +3223,11 @@ function buildMacHardwareDisplayKey(monitorContextOrDisplay) {
   return `mac-hw:${vendorId}:${productId}:${serialNumber}`;
 }
 
-function shouldAllowSingleMacSoftDisplayMatch(displaySummaries, unmatchedStoredMonitorConfigs) {
+function shouldAllowSingleMacSoftDisplayMatch(displaySummaries) {
   return (
     process.platform === "darwin" &&
     Array.isArray(displaySummaries) &&
-    displaySummaries.length === 1 &&
-    Array.isArray(unmatchedStoredMonitorConfigs) &&
-    unmatchedStoredMonitorConfigs.length === 1
+    displaySummaries.length === 1
   );
 }
 
@@ -3239,6 +3263,25 @@ function buildMacSoftDisplayKey(monitorContextOrDisplay) {
   }
 
   return `mac-soft:${vendorId}:${productId}:${displayName}`;
+}
+
+function getMacPersistableMonitorIdentityKey(monitorConfig) {
+  const hardwareKey = buildMacHardwareDisplayKey(monitorConfig);
+  if (hardwareKey) {
+    return hardwareKey;
+  }
+
+  const softKey = buildMacSoftDisplayKey(monitorConfig);
+  const displayName = normalizeText(monitorConfig?.displayName || monitorConfig?.detectedName);
+  if (!softKey || isGenericMacDisplayName(displayName)) {
+    return "";
+  }
+
+  return softKey;
+}
+
+function isGenericMacDisplayName(displayName) {
+  return /^(|display|spdisplays_display|unknown display)$/iu.test(normalizeText(displayName));
 }
 
 async function getWindowsTopologyDisplays() {
@@ -4431,6 +4474,21 @@ function getConfiguredPeerInterfaceId(monitorConfig) {
   return peerInterfaceId && peerInterfaceId !== getLocalInterfaceId(monitorConfig)
     ? peerInterfaceId
     : "";
+}
+
+function isUserCustomizedMonitorConfig(monitorConfig) {
+  if (getLocalInterfaceId(monitorConfig) !== TARGET_IDS[0] || getConfiguredPeerInterfaceId(monitorConfig)) {
+    return true;
+  }
+
+  return TARGET_IDS.some((targetId) => {
+    const target = getTarget(targetId, monitorConfig);
+    const defaultTarget = TARGET_SLOT_MAP.get(targetId);
+    return Boolean(
+      target.deviceLabel ||
+        (Number.isInteger(target.inputValue) && target.inputValue !== defaultTarget?.defaultInputValue)
+    );
+  });
 }
 
 function isLocalInterfaceTarget(targetId, monitorConfig) {
