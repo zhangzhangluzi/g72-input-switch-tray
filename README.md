@@ -62,6 +62,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
   - the background watcher does not blindly re-add a detached waiting screen; the explicit takeover / refresh action is allowed to attach it back
   - the takeover action first adds the detached display back to the Windows desktop topology, then switches it to the configured local interface
   - takeover still depends on the monitor / GPU exposing a DDC/CI control path while the screen is on another input; if Windows cannot get a physical monitor handle, the app reports that hardware limit instead of showing a raw helper error
+  - takeover candidates ignore known virtual display adapters such as ToDesk, MuMu, RayLink, GameViewer, spacedesk, Parsec, dummy, and generic IDD devices
   - if Windows keeps a same-model duplicate attached while its input is not that screen's configured local interface, the app removes that duplicate from the Windows desktop topology
 - If `DisplaySwitch.exe` is not enough, the app falls back to a bundled topology helper that directly detaches or re-attaches the targeted Windows monitor.
 - Windows monitor matching no longer relies on friendly monitor names as the primary selector, so two same-model monitors do not collapse into one target.

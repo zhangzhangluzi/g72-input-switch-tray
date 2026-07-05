@@ -69,6 +69,12 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function getUsageIntroText/u);
   assert.match(mainSource, /function renderUsageGuide/u);
   assert.match(mainSource, /function renderDailyVisibleMonitorActions/u);
+  assert.match(mainSource, /place-items: start center;/u);
+  assert.match(mainSource, /width: min\(calc\(100vw - 32px\), 920px\);/u);
+  assert.match(mainSource, /width: calc\(100vw - 24px\);/u);
+  assert.match(mainSource, /main \{[\s\S]{0,160}min-width: 0;[\s\S]{0,80}box-sizing: border-box;/u);
+  assert.match(mainSource, /overflow-wrap: anywhere;/u);
+  assert.match(mainSource, /"PingFang SC", "Microsoft YaHei", "Noto Sans SC"/u);
   assert.match(mainSource, /function getPreferredPeerTargetId/u);
   assert.match(mainSource, /function getConfiguredPeerInterfaceId/u);
   assert.match(mainSource, /peerInterfaceId: parseTargetId/u);
@@ -178,6 +184,11 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /if \(shouldLogControlRequestError\(error\)\) \{\s*appendDiagnosticLog\("Control request failed", error\);/u);
   assert.match(mainSource, /async function mapSequential\(items, mapper\)/u);
   assert.match(mainSource, /const probeResults = await mapSequential\(/u);
+  assert.match(mainSource, /function shouldUseWindowsPowerShellTemp\(file\)/u);
+  assert.match(mainSource, /function getWindowsPowerShellEnv\(\)/u);
+  assert.match(mainSource, /function getWindowsHelperTempPath\(\)/u);
+  assert.match(mainSource, /TEMP: tempPath/u);
+  assert.match(mainSource, /TMP: tempPath/u);
   assert.doesNotMatch(mainSource, /request\.destroy\(\)/u);
   assert.match(mainSource, /function hasMacPhysicalIdentity/u);
   assert.match(mainSource, /function hasMacSafeDdcTargetIdentity/u);
@@ -425,6 +436,52 @@ function verifyMonitorConfigFormRejectsInvalidInputValues() {
   assert.deepEqual(Array.from(context.result.outOfRangeErrors), ["DP1 的输入值必须是 1 到 255 的整数。"]);
 }
 
+function verifyWindowsDetachedVirtualDisplaysRejected() {
+  const mainSourcePath = path.resolve(__dirname, "..", "src", "main.js");
+  const mainSource = fs.readFileSync(mainSourcePath, "utf8");
+  const helperSource = [
+    "normalizeText",
+    "getWindowsDisplayDeviceNumber",
+    "isWindowsPhysicalDetachedDisplayCandidate",
+  ].map((name) => extractFunction(mainSource, name)).join("\n");
+  const script = `
+    ${helperSource}
+    const physicalDeviceName = String.raw\`\\\\.\\DISPLAY2\`;
+    const mumuDeviceName = String.raw\`\\\\.\\DISPLAY27\`;
+    const todeskDeviceName = String.raw\`\\\\.\\DISPLAY18\`;
+    globalThis.result = {
+      physical: isWindowsPhysicalDetachedDisplayCandidate({
+        deviceName: physicalDeviceName,
+        deviceString: "AMD Radeon RX 6750 GRE 12GB",
+        displayName: "H24E7",
+        friendlyName: "H24E7",
+        productCode: "SKG2431",
+      }),
+      mumuVirtual: isWindowsPhysicalDetachedDisplayCandidate({
+        deviceName: mumuDeviceName,
+        deviceString: "MuMu Virtual Display Adapter",
+        displayName: "H24E7",
+        friendlyName: "H24E7",
+        productCode: "SKG2431",
+      }),
+      todeskVirtual: isWindowsPhysicalDetachedDisplayCandidate({
+        deviceName: todeskDeviceName,
+        deviceString: "Todesk Virtual Display Adapter",
+        displayName: "Todesk Virtual Display Adapter",
+        friendlyName: "",
+        productCode: "tdIdd",
+      }),
+    };
+  `;
+  const context = {};
+  vm.runInNewContext(script, context);
+
+  assert.equal(context.result.physical, true);
+  assert.equal(context.result.mumuVirtual, false);
+  assert.equal(context.result.todeskVirtual, false);
+  assert.match(mainSource, /!isWindowsPhysicalDetachedDisplayCandidate\(topologyDisplay\)/u);
+}
+
 function verifyLocalOnlyDocs() {
   const readmePath = path.resolve(__dirname, "..", "README.md");
   const handoffDocPath = path.resolve(__dirname, "..", "docs", "shared-monitor-handoff.md");
@@ -439,6 +496,7 @@ function verifyLocalOnlyDocs() {
   assert.match(readme, /连接设备名/u);
   assert.match(readme, /接回 Windows 的共享屏/u);
   assert.match(readme, /灰色第二屏/u);
+  assert.match(readme, /takeover candidates ignore known virtual display adapters/u);
   assert.match(handoffDoc, /no LAN peer discovery/u);
   assert.match(handoffDoc, /Daily user model/u);
   assert.match(handoffDoc, /A gray second screen in Windows Settings is not treated as proof/u);
@@ -448,6 +506,7 @@ function verifyLocalOnlyDocs() {
   assert.match(handoffDoc, /takeover path first attaches the detached Windows display device/u);
   assert.match(handoffDoc, /hardware-bound/u);
   assert.match(handoffDoc, /same-model duplicate attached to Windows while its input is not that screen's configured local interface/u);
+  assert.match(handoffDoc, /Known virtual display adapters/u);
   assert.match(
     handoffDoc,
     /controls only the external physical screens that are currently attached to the local host/u
@@ -473,6 +532,34 @@ function verifyPinnedMacDdcctlBuildScript() {
   assert.match(ensureScript, /rev-parse HEAD/u);
   assert.match(ensureScript, /"\$OUTPUT_STAMP"/u);
   assert.match(gitignore, /resources\/bin\/ddcctl\.commit/u);
+}
+
+function verifyBuildScriptsUseUserTempWrapper() {
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8")
+  );
+  const wrapperPath = path.resolve(__dirname, "with-user-temp.js");
+  const wrapper = fs.readFileSync(wrapperPath, "utf8");
+
+  assert.match(
+    packageJson.scripts.dist,
+    /node scripts\/with-user-temp\.js node node_modules\/electron-builder\/out\/cli\/cli\.js/u
+  );
+  assert.match(
+    packageJson.scripts["dist:win"],
+    /node scripts\/with-user-temp\.js node node_modules\/electron-builder\/out\/cli\/cli\.js --win/u
+  );
+  assert.match(
+    packageJson.scripts.release,
+    /node scripts\/with-user-temp\.js node node_modules\/electron-builder\/out\/cli\/cli\.js/u
+  );
+  assert.match(wrapper, /rawCommand === "node" \? process\.execPath : rawCommand/u);
+  assert.doesNotMatch(wrapper, /shell:/u);
+  assert.match(wrapper, /G72_INPUT_SWITCH_TEMP/u);
+  assert.match(wrapper, /LOCALAPPDATA/u);
+  assert.match(wrapper, /TEMP: tempRoot/u);
+  assert.match(wrapper, /TMP: tempRoot/u);
+  assert.match(wrapper, /TMPDIR: tempRoot/u);
 }
 
 function verifyWindowsHelperSourceGuards() {
@@ -935,8 +1022,10 @@ function main() {
   verifyMacMonitorConfigSyncBehavior();
   verifyStrictIntegerParsing();
   verifyMonitorConfigFormRejectsInvalidInputValues();
+  verifyWindowsDetachedVirtualDisplaysRejected();
   verifyLocalOnlyDocs();
   verifyPinnedMacDdcctlBuildScript();
+  verifyBuildScriptsUseUserTempWrapper();
   verifyWindowsHelperSourceGuards();
   verifyCiWorkflowTriggers();
 

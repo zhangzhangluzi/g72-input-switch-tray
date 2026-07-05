@@ -58,6 +58,7 @@ This project now uses one rule set only:
 - The background watcher does not blindly re-add a detached waiting screen. A user-triggered takeover / refresh action is the path that may add that screen back into the Windows desktop topology.
 - The takeover path first attaches the detached Windows display device, then switches that screen to the configured local interface.
 - The takeover path is hardware-bound: if the monitor does not expose a DDC/CI physical monitor handle to Windows while it is displaying another input, Windows cannot actively pull that screen back.
+- Takeover candidates must be physical Windows display devices. Known virtual display adapters such as ToDesk, MuMu, RayLink, GameViewer, spacedesk, Parsec, dummy, and generic IDD devices must not appear as shared-screen takeover targets.
 - If a same-model duplicate attached to Windows while its input is not that screen's configured local interface, the app can remove that duplicate from the Windows desktop topology.
 - This is not remote coordination. It is only Windows repairing its own local desktop state.
 
