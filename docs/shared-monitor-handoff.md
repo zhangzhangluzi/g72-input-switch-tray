@@ -23,6 +23,7 @@ This project now uses one rule set only:
 ### 1. Screen discovery
 
 - The app reads the external DDC/CI-capable screens that the current host can see right now.
+- Windows profiles prefer the logical monitor's display-device identity and retain the current GDI device name for actions, reducing profile swaps when same-model screens are re-enumerated.
 - If the current host sees 1 external screen, the UI shows 1 screen.
 - If the current host sees 2 or 3 external screens, the UI shows 2 or 3 screens.
 - The app does not keep showing screens that are no longer attached to the current host.
@@ -53,13 +54,14 @@ This project now uses one rule set only:
 
 - This is local to Windows only.
 - When Windows switches a screen away from Windows' own cable, the app can remove that screen from the Windows desktop topology.
-- That detach step is allowed only after the switch result has been confirmed, not when the command is merely unconfirmed.
+- That detach step is allowed after confirmed readback, or after a successful write followed by complete DDC/readback loss without any observed old-input value. If readback explicitly remains on the old input, the result stays unconfirmed and the screen is not detached.
 - If the target Windows screen is still the current primary desktop, another attached Windows screen must become primary first before the target can be detached.
-- The background watcher does not blindly re-add a detached waiting screen. A user-triggered takeover / refresh action is the path that may add that screen back into the Windows desktop topology.
+- The background watcher and manual repair action do not blindly re-add a detached waiting screen. Only the user-triggered takeover action may add that screen back into the Windows desktop topology.
 - The takeover path first attaches the detached Windows display device, then switches that screen to the configured local interface.
 - The takeover path is hardware-bound: if the monitor does not expose a DDC/CI physical monitor handle to Windows while it is displaying another input, Windows cannot actively pull that screen back.
 - Takeover candidates must be physical Windows display devices. Known virtual display adapters such as ToDesk, MuMu, RayLink, GameViewer, spacedesk, Parsec, dummy, and generic IDD devices must not appear as shared-screen takeover targets.
 - If a same-model duplicate attached to Windows while its input is not that screen's configured local interface, the app can remove that duplicate from the Windows desktop topology.
+- Background restore checks are read-only and back off after topology failures. Only an explicit takeover action may attach a detached screen before switching it to the local Windows input.
 - This is not remote coordination. It is only Windows repairing its own local desktop state.
 
 ### 5. Current input readback

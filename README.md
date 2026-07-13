@@ -28,7 +28,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
   - configuring one local-interface slot per detected screen
   - configuring the DDC input value for each of the four interfaces on each screen
 - Optional Samsung / MStar compatibility mode for monitors whose real input-switch values do not match the standard MCCS values
-- Optional Windows desktop handoff mode that removes a switched-away screen from the Windows desktop, keeps it out while it belongs to another host, and lets an explicit takeover / refresh action add it back
+- Optional Windows desktop handoff mode that removes a switched-away screen from the Windows desktop, keeps it out while it belongs to another host, and lets only an explicit takeover action add it back
 - Optional launch at login
 - Windows uninstall entry via the packaged NSIS uninstaller
 - macOS self-uninstall command from the app menu
@@ -45,7 +45,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - Each interface has its own numeric DDC input value
 - Each profile also stores which one of the four interfaces is the local machine's own cable for that screen
 - Each profile can optionally store which interface should be used by the daily "give to peer" action; if unset, the app falls back to the old platform default
-- On Windows, the profile is matched primarily by the screen's Win32 `DeviceName`, so two same-model monitors can still be distinguished
+- On Windows, the profile prefers the monitor's Win32 display-device identity and keeps the current GDI `DeviceName` as the action selector, so reconnects and same-model monitors are less likely to swap profiles
 - On macOS, the profile is matched primarily by hardware identity when the monitor reports a usable vendor / product / serial tuple; otherwise it falls back to the local display ID
 - Internal laptop / built-in panels are not exposed as four-interface switch targets
 
@@ -53,19 +53,19 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 
 - Windows switching is done with a bundled PowerShell DDC/CI helper that maps the target monitor through Win32 / WMI / DXVA2. The installer does **not** bundle `.NET`.
 - Some monitors do not report a trustworthy “current input” value over DDC/CI. The settings page shows the current input only when it can be read back reliably.
-- If a switch command can be written but the monitor does not provide a reliable input readback, the app treats the action as “command sent, result not confirmed” instead of forcing a hard failure.
+- If a switch command can be written but the monitor does not provide a reliable input readback, the app distinguishes “write accepted, then readback disappeared” from “readback still reports the old input”. On Windows, only the first case may complete desktop handoff; an explicit old-input mismatch stays unconfirmed and does not detach the screen.
 - The app does **not** pretend to know whether every inactive interface has a live machine connected. It can reliably show the current active interface when the monitor reports it; inactive-interface connection state remains best-effort.
 - For Samsung / MStar compatibility mode, the app sends the configured standard input value first and then tries a short list of known alternate values for the same port family.
 - On Windows, desktop handoff is per monitor profile:
-  - switching away from the local interface can detach that specific screen from the Windows desktop
+  - switching away from the local interface can detach that specific screen after the target input is confirmed, or after the write succeeds and the monitor immediately stops exposing readback without ever reporting the old input
   - if that specific screen is still the current Windows primary display, another attached Windows screen is promoted to primary first
-  - the background watcher does not blindly re-add a detached waiting screen; the explicit takeover / refresh action is allowed to attach it back
+  - the background watcher and manual repair action do not blindly re-add a detached waiting screen; only the explicit takeover action attaches it back
   - the takeover action first adds the detached display back to the Windows desktop topology, then switches it to the configured local interface
   - takeover still depends on the monitor / GPU exposing a DDC/CI control path while the screen is on another input; if Windows cannot get a physical monitor handle, the app reports that hardware limit instead of showing a raw helper error
   - takeover candidates ignore known virtual display adapters such as ToDesk, MuMu, RayLink, GameViewer, spacedesk, Parsec, dummy, and generic IDD devices
   - if Windows keeps a same-model duplicate attached while its input is not that screen's configured local interface, the app removes that duplicate from the Windows desktop topology
-- If `DisplaySwitch.exe` is not enough, the app falls back to a bundled topology helper that directly detaches or re-attaches the targeted Windows monitor.
-- Windows monitor matching no longer relies on friendly monitor names as the primary selector, so two same-model monitors do not collapse into one target.
+- Windows desktop handoff uses the bundled topology helper to directly detach or re-attach the targeted monitor; it does not switch every display through a global `DisplaySwitch.exe` mode.
+- Windows monitor matching no longer relies on friendly names as the primary selector. A cached display-device identity is preferred when available, with the current GDI name used to execute detach, attach, and DDC actions.
 - If the target device is asleep, has no active signal, or the monitor is configured to auto-select a different source, the screen may stay on the current picture even though the switch command was sent.
 - macOS switching prefers BetterDisplay command-line control when it is available and targets the specific local display ID when possible.
 - When macOS can read a reliable hardware identity for a screen, that identity is persisted so same-model dual-screen setups are less likely to swap profiles after reconnects.
@@ -78,6 +78,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - The app starts a local settings page on port `3847` and binds it to `127.0.0.1` only. The HTTP server is only used for local setup and local direct switch actions; the app does not rely on LAN peer discovery or cross-machine coordination.
 - If port `3847` is unavailable, the local pages automatically fall back to another free local port.
 - The local `/health` endpoint reports an Electron display snapshot only; it does not run DDC probes, query current input, or rewrite monitor configuration.
+- Windows topology polling backs off after repeated helper failures, and the diagnostic log is rate-limited and size-capped so a temporary display-driver failure cannot create an unbounded PowerShell/logging loop.
 - macOS only switches screens that are still visible to the current Mac. Once a screen has moved to another host, the current Mac no longer pretends it can still control that screen locally.
 - On Windows, only screens that can be stably mapped to a local external display are exposed as switch targets.
 

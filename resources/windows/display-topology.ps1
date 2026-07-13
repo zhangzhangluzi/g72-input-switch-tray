@@ -19,6 +19,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$Utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+[Console]::OutputEncoding = $Utf8NoBom
+$OutputEncoding = $Utf8NoBom
 
 Add-Type @"
 using System;
@@ -845,6 +848,7 @@ function Read-DisplayCache {
                 if ($null -ne $entry -and -not [string]::IsNullOrWhiteSpace($entry.DeviceName)) {
                     $cache[$entry.DeviceName.ToUpperInvariant()] = @{
                         DeviceName   = [string]$entry.DeviceName
+                        DisplayDeviceId = [string]$entry.DisplayDeviceId
                         DisplayName  = [string]$entry.DisplayName
                         FriendlyName = [string]$entry.FriendlyName
                         ProductCode  = [string]$entry.ProductCode
@@ -871,6 +875,7 @@ function Read-DisplayCache {
                 if (-not [string]::IsNullOrWhiteSpace($key)) {
                     $cache[$key.ToUpperInvariant()] = @{
                         DeviceName   = $key
+                        DisplayDeviceId = [string]$entry.DisplayDeviceId
                         DisplayName  = [string]$entry.DisplayName
                         FriendlyName = [string]$entry.FriendlyName
                         ProductCode  = [string]$entry.ProductCode
@@ -889,6 +894,7 @@ function Read-DisplayCache {
         if ($null -ne $parsed -and -not [string]::IsNullOrWhiteSpace($parsed.DeviceName)) {
             $cache[$parsed.DeviceName.ToUpperInvariant()] = @{
                 DeviceName   = [string]$parsed.DeviceName
+                DisplayDeviceId = [string]$parsed.DisplayDeviceId
                 DisplayName  = [string]$parsed.DisplayName
                 FriendlyName = [string]$parsed.FriendlyName
                 ProductCode  = [string]$parsed.ProductCode
@@ -936,6 +942,7 @@ function Set-DisplayCacheEntry {
     param(
         [hashtable]$DisplayCache,
         [string]$DeviceName,
+        [string]$DisplayDeviceId,
         [string]$DisplayName,
         [string]$FriendlyName,
         [string]$ProductCode,
@@ -952,6 +959,7 @@ function Set-DisplayCacheEntry {
     $cacheKey = $DeviceName.ToUpperInvariant()
     $DisplayCache[$cacheKey] = @{
         DeviceName   = $DeviceName
+        DisplayDeviceId = $DisplayDeviceId
         DisplayName  = $DisplayName
         FriendlyName = $FriendlyName
         ProductCode  = $ProductCode
@@ -1019,6 +1027,13 @@ function Get-DisplayEntries {
         }
 
         $friendlyName = $null
+        $resolvedDisplayDeviceId = if ($null -ne $matchingLogicalMonitor -and -not [string]::IsNullOrWhiteSpace($matchingLogicalMonitor.DisplayDeviceId)) {
+            [string]$matchingLogicalMonitor.DisplayDeviceId
+        } elseif ($null -ne $cachedEntry -and -not [string]::IsNullOrWhiteSpace($cachedEntry.DisplayDeviceId)) {
+            [string]$cachedEntry.DisplayDeviceId
+        } else {
+            ""
+        }
         $resolvedProductCode = if ($null -ne $matchingLogicalMonitor -and -not [string]::IsNullOrWhiteSpace($matchingLogicalMonitor.DisplayProductCode)) {
             [string]$matchingLogicalMonitor.DisplayProductCode
         } elseif ($null -ne $cachedEntry -and -not [string]::IsNullOrWhiteSpace($cachedEntry.ProductCode)) {
@@ -1094,6 +1109,7 @@ function Get-DisplayEntries {
             Set-DisplayCacheEntry `
                 -DisplayCache $DisplayCache `
                 -DeviceName $display.DeviceName `
+                -DisplayDeviceId $resolvedDisplayDeviceId `
                 -DisplayName $displayName `
                 -FriendlyName $friendlyName `
                 -ProductCode $resolvedProductCode `
@@ -1105,6 +1121,7 @@ function Get-DisplayEntries {
 
         $entries += [pscustomobject]@{
             Display               = $display
+            DisplayDeviceId       = $resolvedDisplayDeviceId
             FriendlyName          = $friendlyName
             DisplayName           = $displayName
             ProductCode           = $resolvedProductCode
@@ -1209,6 +1226,7 @@ try {
             foreach ($entry in $displayEntries) {
                 [pscustomobject]@{
                     DeviceName   = $entry.DeviceName
+                    DisplayDeviceId = $entry.DisplayDeviceId
                     DeviceString = $entry.Display.DeviceString
                     DisplayName  = $entry.DisplayName
                     FriendlyName = $entry.FriendlyName
@@ -1340,5 +1358,6 @@ catch {
         $message = [string]$_
     }
 
-    throw $message.Trim()
+    [Console]::Error.WriteLine($message.Trim())
+    exit 1
 }

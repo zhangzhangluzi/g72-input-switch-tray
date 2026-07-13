@@ -13,6 +13,8 @@ const LOOPBACK_HOST = "127.0.0.1";
 const PREFERRED_CONTROL_PORT = 3847;
 const TRAY_REBUILD_DELAY_MS = 1200;
 const TRAY_HEALTHCHECK_INTERVAL_MS = 5000;
+const DISPLAY_CHANGE_DEBOUNCE_MS = 750;
+const WINDOWS_RESTORE_CHECK_INTERVAL_MS = 5000;
 const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
 const MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000;
 const DDC_PROBE_CACHE_TTL_MS = 10000;
@@ -22,7 +24,12 @@ const WINDOWS_DDC_PROBE_TIMEOUT_MS = 8000;
 const CURRENT_INPUT_COMMAND_TIMEOUT_MS = 5000;
 const SYSTEM_PROFILER_COMMAND_TIMEOUT_MS = 45000;
 const WINDOWS_TAKEOVER_SETTLE_MS = 45000;
+const WINDOWS_TOPOLOGY_FAILURE_BACKOFF_BASE_MS = 5000;
+const WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS = 60000;
 const LOCAL_REQUEST_BODY_LIMIT_BYTES = 64 * 1024;
+const DIAGNOSTIC_LOG_MAX_BYTES = 2 * 1024 * 1024;
+const DIAGNOSTIC_LOG_TAIL_BYTES = 512 * 1024;
+const DIAGNOSTIC_LOG_REPEAT_INTERVAL_MS = 5 * 60 * 1000;
 const TARGET_SLOTS = [
   { id: "dp1", title: "DP1", defaultInputValue: 15 },
   { id: "dp2", title: "DP2", defaultInputValue: 16 },
@@ -50,13 +57,19 @@ let activeControlPort = PREFERRED_CONTROL_PORT;
 let windowsRestoreTimer = null;
 let trayRebuildTimer = null;
 let trayHealthTimer = null;
+let displayChangeTimer = null;
+let displayChangeInFlight = false;
+let displayChangeQueued = false;
 let explorerSignature = null;
 let refreshMenuInFlight = false;
 let refreshMenuQueued = false;
 let windowsRestoreInFlight = false;
 let windowsDuplicateDetachInFlight = false;
+let windowsTopologyFailureCount = 0;
+let windowsTopologyRetryAfter = 0;
 const windowsTakeoverInProgressMonitorIds = new Set();
 const windowsTakeoverProtectedUntilByMonitorId = new Map();
+const diagnosticLogLastWriteByKey = new Map();
 let windowsTopologyOperationQueue = Promise.resolve();
 let switchOperationQueue = Promise.resolve();
 const switchInFlightByMonitorId = new Map();
@@ -117,12 +130,19 @@ app.on("before-quit", () => {
     clearInterval(trayHealthTimer);
     trayHealthTimer = null;
   }
+
+  if (displayChangeTimer) {
+    clearTimeout(displayChangeTimer);
+    displayChangeTimer = null;
+  }
 });
 
 app.whenReady().then(async () => {
   if (process.platform === "darwin" && app.dock) {
     app.dock.hide();
   }
+
+  trimDiagnosticLogIfNeeded();
 
   try {
     state = loadState();
@@ -145,11 +165,9 @@ app.whenReady().then(async () => {
   }
 
   try {
-    const displaySummaries = await syncMonitorConfigsFromLocalDisplays({ persist: true });
+    await syncMonitorConfigsFromLocalDisplays({ persist: true });
     if (process.platform === "win32") {
-      await attemptPendingWindowsRestores({
-        displaySummaries,
-      });
+      await attemptPendingWindowsRestores();
       await attemptWindowsDuplicateForeignDisplayDetaches();
     }
   } catch (error) {
@@ -746,30 +764,34 @@ async function handleWindowsTakeoverRequest(response, requestUrl, monitorId) {
   }
 }
 
-async function switchMonitor(monitorId, targetId, options = {}) {
+function queueMonitorOperation(monitorId, operation) {
   const normalizedMonitorId = normalizeText(monitorId);
-  const parsedTargetId = parseTargetId(targetId);
   const lockKey = normalizedMonitorId || `raw:${normalizeText(monitorId)}`;
   if (lockKey && switchInFlightByMonitorId.has(lockKey)) {
-    throw new Error("这块屏幕正在执行切换，请等待当前命令完成。");
+    return Promise.reject(new Error("这块屏幕正在执行操作，请等待当前命令完成。"));
   }
 
   const switchTask = switchOperationQueue.then(
-    () => switchMonitorUnlocked(normalizedMonitorId, parsedTargetId, options),
-    () => switchMonitorUnlocked(normalizedMonitorId, parsedTargetId, options)
+    () => operation(normalizedMonitorId),
+    () => operation(normalizedMonitorId)
   );
   switchOperationQueue = switchTask.catch(() => {});
   if (lockKey) {
     switchInFlightByMonitorId.set(lockKey, switchTask);
   }
 
-  try {
-    return await switchTask;
-  } finally {
+  return switchTask.finally(() => {
     if (lockKey && switchInFlightByMonitorId.get(lockKey) === switchTask) {
       switchInFlightByMonitorId.delete(lockKey);
     }
-  }
+  });
+}
+
+async function switchMonitor(monitorId, targetId, options = {}) {
+  const parsedTargetId = parseTargetId(targetId);
+  return queueMonitorOperation(monitorId, (normalizedMonitorId) =>
+    switchMonitorUnlocked(normalizedMonitorId, parsedTargetId, options)
+  );
 }
 
 async function switchMonitorUnlocked(monitorId, targetId, options = {}) {
@@ -871,7 +893,7 @@ async function switchMonitorUnlocked(monitorId, targetId, options = {}) {
 async function switchOnWindowsForContext(monitorContext, targetId, target) {
   const monitorConfig = monitorContext.monitor;
   const switchingToLocalInterface = isLocalInterfaceTarget(targetId, monitorConfig);
-  const topologyDisplays = await getWindowsTopologyDisplays();
+  const topologyDisplays = await getWindowsTopologyDisplays({ force: true });
   const attachedTopologyDisplayCount = topologyDisplays.filter((display) => display.attached).length;
   let topologyDisplay = topologyDisplays.find((display) =>
     isTopologyDisplayMatchMonitor(display, monitorContext)
@@ -922,8 +944,9 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
     };
   });
 
+  let desktopHandoffCompleted = false;
   if (
-    switchResult.verificationStatus === "confirmed" &&
+    ["confirmed", "accepted"].includes(switchResult.verificationStatus) &&
     !switchingToLocalInterface &&
     shouldUseWindowsDisplayHandoffForMonitor(monitorConfig, attachedTopologyDisplayCount)
   ) {
@@ -933,6 +956,7 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
       attachedDisplayCountBeforeSwitch,
       buildWindowsRestoreLayout(topologyDisplay)
     );
+    desktopHandoffCompleted = true;
   } else if (switchingToLocalInterface) {
     clearMonitorPendingRestore(monitorConfig.id);
   }
@@ -940,6 +964,7 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
   return {
     verificationStatus: switchResult.verificationStatus,
     message: switchResult.message,
+    desktopHandoffCompleted,
   };
 }
 
@@ -1033,7 +1058,12 @@ async function verifyWindowsSwitchOutcomeForContext(monitorContext, target, expe
     await delay(250);
   }
 
-  if (Number.isInteger(lastObservedValue)) {
+  const verification = classifyWindowsSwitchVerification(
+    expectedValues,
+    lastObservedValue,
+    lastErrorMessage
+  );
+  if (verification.status === "unconfirmed") {
     return {
       status: "unconfirmed",
       message: `${getMonitorDisplayTitle(
@@ -1043,10 +1073,28 @@ async function verifyWindowsSwitchOutcomeForContext(monitorContext, target, expe
   }
 
   return {
-    status: "unconfirmed",
+    status: verification.status,
     message:
-      lastErrorMessage ||
-      `${getMonitorDisplayTitle(monitorContext)} 已发送切换命令，但当前显示器没有提供可靠的输入回读。`,
+      verification.error ||
+      `${getMonitorDisplayTitle(
+        monitorContext
+      )} 已接受切换命令，随后未再提供输入回读。`,
+  };
+}
+
+function classifyWindowsSwitchVerification(expectedValues, lastObservedValue, lastErrorMessage = "") {
+  if (Number.isInteger(lastObservedValue)) {
+    return {
+      status: Array.isArray(expectedValues) && expectedValues.includes(lastObservedValue)
+        ? "confirmed"
+        : "unconfirmed",
+      error: "",
+    };
+  }
+
+  return {
+    status: "accepted",
+    error: normalizeText(lastErrorMessage),
   };
 }
 
@@ -1345,6 +1393,7 @@ async function detachWindowsDisplayForMonitor(
   expectedAttachedDisplayCount,
   restoreLayout = null
 ) {
+  markMonitorPendingRestore(monitorConfig.id, expectedAttachedDisplayCount, restoreLayout);
   await runWindowsTopologyCommand([
     "-MonitorName",
     getWindowsTopologySelectorValue(monitorConfig),
@@ -1355,7 +1404,6 @@ async function detachWindowsDisplayForMonitor(
     false,
     "Windows 没有把这块屏从桌面拓扑里移除。"
   );
-  markMonitorPendingRestore(monitorConfig.id, expectedAttachedDisplayCount, restoreLayout);
 }
 
 async function attachWindowsDisplayForMonitor(
@@ -1392,8 +1440,10 @@ async function attachWindowsDisplayForMonitor(
 
 async function waitForWindowsMonitorAttachmentState(monitorConfig, expectedAttached, errorMessage) {
   const startedAt = Date.now();
+  let forceTopologyRefresh = true;
   while (Date.now() - startedAt < 8000) {
-    const topologyDisplays = await getWindowsTopologyDisplays();
+    const topologyDisplays = await getWindowsTopologyDisplays({ force: forceTopologyRefresh });
+    forceTopologyRefresh = false;
     if (isWindowsMonitorAttachedInTopology(topologyDisplays, monitorConfig) === expectedAttached) {
       return;
     }
@@ -1406,8 +1456,10 @@ async function waitForWindowsMonitorAttachmentState(monitorConfig, expectedAttac
 
 async function waitForWindowsMonitorNoLongerPrimary(monitorConfig, errorMessage) {
   const startedAt = Date.now();
+  let forceTopologyRefresh = true;
   while (Date.now() - startedAt < 8000) {
-    const topologyDisplays = await getWindowsTopologyDisplays();
+    const topologyDisplays = await getWindowsTopologyDisplays({ force: forceTopologyRefresh });
+    forceTopologyRefresh = false;
     const topologyDisplay = topologyDisplays.find((display) =>
       isTopologyDisplayMatchMonitor(display, monitorConfig)
     );
@@ -1449,12 +1501,23 @@ async function refreshWindowsDisplayState({ monitorId = null, notifyOnSuccess = 
     };
   }
 
+  const operationKey = normalizeText(monitorId) || "windows-refresh";
+  return queueMonitorOperation(operationKey, () =>
+    refreshWindowsDisplayStateUnlocked({
+      monitorId,
+      notifyOnSuccess,
+    })
+  );
+}
+
+async function refreshWindowsDisplayStateUnlocked({ monitorId = null, notifyOnSuccess = false } = {}) {
   const restored = await attemptPendingWindowsRestores({
     monitorId,
-    allowAttachDetached: true,
+    forceTopologyRefresh: true,
   });
   const detachedDuplicates = await attemptWindowsDuplicateForeignDisplayDetaches({
     monitorId,
+    forceTopologyRefresh: true,
   });
   const changed = restored || detachedDuplicates;
   const message = detachedDuplicates
@@ -1483,9 +1546,21 @@ async function takeoverWindowsDetachedMonitor(
     throw new Error("当前平台不是 Windows，不能执行 Windows 接回共享屏。");
   }
 
-  const normalizedMonitorId = normalizeText(monitorId);
+  return queueMonitorOperation(monitorId, (normalizedMonitorId) =>
+    takeoverWindowsDetachedMonitorUnlocked(normalizedMonitorId, {
+      notifyOnSuccess,
+      showErrorDialog,
+    })
+  );
+}
+
+async function takeoverWindowsDetachedMonitorUnlocked(
+  normalizedMonitorId,
+  { notifyOnSuccess = false, showErrorDialog = false } = {}
+) {
   const takeoverContexts = await getWindowsDetachedTakeoverContexts({
     persistCandidates: true,
+    forceTopologyRefresh: true,
   });
   const takeoverContext = takeoverContexts.find(
     (monitorContext) => monitorContext.id === normalizedMonitorId
@@ -1504,7 +1579,7 @@ async function takeoverWindowsDetachedMonitor(
     upsertStoredMonitorConfig(monitorConfig);
     saveState(state);
 
-    const topologyDisplays = await getWindowsTopologyDisplays();
+    const topologyDisplays = await getWindowsTopologyDisplays({ force: true });
     const topologyDisplay = topologyDisplays.find((display) =>
       isTopologyDisplayMatchMonitor(display, monitorConfig)
     );
@@ -1539,7 +1614,7 @@ async function takeoverWindowsDetachedMonitor(
     void refreshMenu();
 
     const message =
-      switchResult?.verificationStatus === "unconfirmed"
+      switchResult?.verificationStatus !== "confirmed"
         ? `${getMonitorDisplayTitle(monitorConfig)} 已接回 Windows 桌面，并已发送切到 ${localTarget.label} 的命令，结果待人工确认。`
         : `${getMonitorDisplayTitle(monitorConfig)} 已接回 Windows（${localTarget.label}）。`;
     recordSwitchOutcome("success", monitorConfig.id, localTargetId, message);
@@ -1631,7 +1706,7 @@ async function switchWindowsDisplayForMonitorConfig(monitorConfig, target) {
     }
 
     return {
-      verificationStatus: "unconfirmed",
+      verificationStatus: currentInputResult.ok ? "unconfirmed" : "accepted",
       message: currentInputResult.ok
         ? `当前输入仍为 ${describeInputValue(currentInputResult.value)}。`
         : currentInputResult.error,
@@ -1641,8 +1716,7 @@ async function switchWindowsDisplayForMonitorConfig(monitorConfig, target) {
 
 async function attemptPendingWindowsRestores({
   monitorId: targetMonitorId = null,
-  displaySummaries = null,
-  allowAttachDetached = false,
+  forceTopologyRefresh = false,
 } = {}) {
   if (process.platform !== "win32" || windowsRestoreInFlight) {
     return false;
@@ -1651,44 +1725,32 @@ async function attemptPendingWindowsRestores({
   windowsRestoreInFlight = true;
 
   try {
-    if (!Array.isArray(displaySummaries)) {
-      await syncMonitorConfigsFromLocalDisplays({ persist: false });
+    const pendingMonitorConfigs = getStoredMonitorConfigs().filter((monitorConfig) => {
+      if (targetMonitorId && monitorConfig.id !== targetMonitorId) {
+        return false;
+      }
+
+      return Boolean(getExistingMonitorDesktopRuntime(monitorConfig.id)?.pendingRestore);
+    });
+    if (pendingMonitorConfigs.length === 0) {
+      return false;
     }
-    const topologyDisplays = await getWindowsTopologyDisplays();
+
+    const topologyDisplays = await getWindowsTopologyDisplays({ force: forceTopologyRefresh });
     let changed = false;
 
-    for (const monitorConfig of getStoredMonitorConfigs()) {
-      if (targetMonitorId && monitorConfig.id !== targetMonitorId) {
-        continue;
-      }
-
-      const runtime = getMonitorDesktopRuntime(monitorConfig.id);
-      if (!runtime.pendingRestore) {
-        continue;
-      }
-
+    for (const monitorConfig of pendingMonitorConfigs) {
       const topologyDisplay = topologyDisplays.find((display) =>
         isTopologyDisplayMatchMonitor(display, monitorConfig)
       );
-      if (!topologyDisplay) {
+      if (!topologyDisplay?.attached) {
         continue;
       }
 
-      if (!topologyDisplay.attached) {
-        if (!allowAttachDetached) {
-          continue;
-        }
-
-        try {
-          await attachWindowsDisplayForMonitor(
-            monitorConfig,
-            runtime.expectedAttachedDisplayCount || null,
-            runtime.restoreLayout
-          );
-        } catch (error) {
-          appendDiagnosticLog("Failed to attach Windows display back into topology", error);
-          continue;
-        }
+      const currentInput = await getWindowsCurrentInputResultForTopologyDisplay(topologyDisplay);
+      const localTarget = getTarget(getLocalInterfaceId(monitorConfig), monitorConfig);
+      if (!currentInput.ok || !isWindowsInputValueForTarget(currentInput.value, localTarget, monitorConfig)) {
+        continue;
       }
 
       clearMonitorPendingRestore(monitorConfig.id);
@@ -1705,7 +1767,10 @@ async function attemptPendingWindowsRestores({
   }
 }
 
-async function attemptWindowsDuplicateForeignDisplayDetaches({ monitorId = null } = {}) {
+async function attemptWindowsDuplicateForeignDisplayDetaches({
+  monitorId = null,
+  forceTopologyRefresh = false,
+} = {}) {
   if (process.platform !== "win32" || windowsDuplicateDetachInFlight) {
     return false;
   }
@@ -1713,7 +1778,7 @@ async function attemptWindowsDuplicateForeignDisplayDetaches({ monitorId = null 
   windowsDuplicateDetachInFlight = true;
 
   try {
-    const topologyDisplays = await getWindowsTopologyDisplays();
+    const topologyDisplays = await getWindowsTopologyDisplays({ force: forceTopologyRefresh });
     const candidates = await getWindowsDuplicateForeignDisplayDetachCandidates(
       topologyDisplays,
       normalizeText(monitorId) || null
@@ -1978,9 +2043,11 @@ async function waitForWindowsTopologyDeviceAttachmentState(
   const normalizedDeviceName = normalizeText(deviceName).toLowerCase();
   const startedAt = Date.now();
   let matchedSince = 0;
+  let forceTopologyRefresh = true;
 
   while (Date.now() - startedAt < timeoutMs) {
-    const topologyDisplays = await getWindowsTopologyDisplays();
+    const topologyDisplays = await getWindowsTopologyDisplays({ force: forceTopologyRefresh });
+    forceTopologyRefresh = false;
     const topologyDisplay = topologyDisplays.find(
       (display) => normalizeText(display.deviceName).toLowerCase() === normalizedDeviceName
     );
@@ -2013,12 +2080,12 @@ function startWindowsRestoreWatcher() {
 
   windowsRestoreTimer = setInterval(() => {
     void attemptPendingWindowsRestores();
-  }, 2500);
+  }, WINDOWS_RESTORE_CHECK_INTERVAL_MS);
 }
 
 function startDisplayChangeWatcher() {
   const handleDisplayChange = () => {
-    void handleLocalDisplayTopologyChange();
+    scheduleLocalDisplayTopologyChange();
   };
 
   screen.on("display-added", handleDisplayChange);
@@ -2026,7 +2093,24 @@ function startDisplayChangeWatcher() {
   screen.on("display-metrics-changed", handleDisplayChange);
 }
 
+function scheduleLocalDisplayTopologyChange(delayMs = DISPLAY_CHANGE_DEBOUNCE_MS) {
+  if (displayChangeTimer) {
+    clearTimeout(displayChangeTimer);
+  }
+
+  displayChangeTimer = setTimeout(() => {
+    displayChangeTimer = null;
+    void handleLocalDisplayTopologyChange();
+  }, delayMs);
+}
+
 async function handleLocalDisplayTopologyChange() {
+  if (displayChangeInFlight) {
+    displayChangeQueued = true;
+    return;
+  }
+
+  displayChangeInFlight = true;
   try {
     windowsDdcProbeCache.clear();
     macDdcProbeCache.clear();
@@ -2036,9 +2120,7 @@ async function handleLocalDisplayTopologyChange() {
     });
 
     if (process.platform === "win32") {
-      await attemptPendingWindowsRestores({
-        displaySummaries,
-      });
+      await attemptPendingWindowsRestores();
       await attemptWindowsDuplicateForeignDisplayDetaches();
       scheduleTrayRebuild("display-change");
       return;
@@ -2048,6 +2130,12 @@ async function handleLocalDisplayTopologyChange() {
     await refreshMenu({ monitorContexts });
   } catch (error) {
     appendDiagnosticLog("Failed to handle local display topology change", error);
+  } finally {
+    displayChangeInFlight = false;
+    if (displayChangeQueued) {
+      displayChangeQueued = false;
+      scheduleLocalDisplayTopologyChange();
+    }
   }
 }
 
@@ -2070,6 +2158,10 @@ async function verifyTrayHealth() {
   if (!tray || isTrayDestroyed()) {
     rebuildTray("tray-missing");
     return;
+  }
+
+  if (windowsTopologyFailureCount > 0 && Date.now() >= windowsTopologyRetryAfter) {
+    void refreshMenu();
   }
 
   const nextExplorerSignature = await getExplorerSignature();
@@ -2099,7 +2191,7 @@ async function getExplorerSignature() {
     ]);
     return normalizeText(output) || null;
   } catch (error) {
-    appendDiagnosticLog("Failed to read explorer signature", error);
+    appendDiagnosticLogRateLimited("explorer-signature", "Failed to read explorer signature", error);
     return null;
   }
 }
@@ -2111,7 +2203,12 @@ function isTrayDestroyed() {
 async function buildMonitorContextsWithStatus(options = {}) {
   const monitorContexts = await getConnectedMonitorContexts(options);
   const sharedWindowsTopologyDisplays =
-    process.platform === "win32" ? await getWindowsTopologyDisplays() : null;
+    process.platform === "win32"
+      ? monitorContexts.map((monitorContext) => ({
+          deviceName: monitorContext.display?.gdiDeviceName,
+          attached: true,
+        }))
+      : null;
   return Promise.all(
     monitorContexts.map(async (monitorContext) => ({
       ...monitorContext,
@@ -2221,6 +2318,7 @@ async function getWindowsDetachedTakeoverContexts({
   connectedMonitorContexts = null,
   topologyDisplays = null,
   persistCandidates = false,
+  forceTopologyRefresh = false,
 } = {}) {
   if (process.platform !== "win32") {
     return [];
@@ -2239,7 +2337,7 @@ async function getWindowsDetachedTakeoverContexts({
   );
   const resolvedTopologyDisplays = Array.isArray(topologyDisplays)
     ? topologyDisplays
-    : await getWindowsTopologyDisplays();
+    : await getWindowsTopologyDisplays({ force: forceTopologyRefresh });
   const prunedHeuristicConfigs = persistCandidates
     ? pruneRedundantWindowsHeuristicTakeoverConfigs(
         connectedMonitorIds,
@@ -2248,6 +2346,7 @@ async function getWindowsDetachedTakeoverContexts({
     : false;
   const knownContexts = [];
   const usedDeviceNames = new Set(connectedDeviceNames);
+  let refreshedStoredCandidates = false;
 
   for (const monitorConfig of getStoredMonitorConfigs()) {
     if (connectedMonitorIds.has(monitorConfig.id)) {
@@ -2275,8 +2374,17 @@ async function getWindowsDetachedTakeoverContexts({
       topologyDisplay,
       "stored"
     );
+    if (
+      persistCandidates &&
+      JSON.stringify(monitorContext.monitor) !== JSON.stringify(monitorConfig)
+    ) {
+      upsertStoredMonitorConfig(monitorContext.monitor);
+      refreshedStoredCandidates = true;
+    }
     knownContexts.push(monitorContext);
-    usedDeviceNames.add(gdiDeviceName.toLowerCase());
+    usedDeviceNames.add(
+      normalizeText(monitorContext.display.gdiDeviceName || gdiDeviceName).toLowerCase()
+    );
   }
 
   const heuristicDisplays =
@@ -2292,7 +2400,10 @@ async function getWindowsDetachedTakeoverContexts({
     return createWindowsDetachedTakeoverContext(monitorConfig, topologyDisplay, "heuristic");
   });
 
-  if (persistCandidates && (heuristicContexts.length > 0 || prunedHeuristicConfigs)) {
+  if (
+    persistCandidates &&
+    (heuristicContexts.length > 0 || prunedHeuristicConfigs || refreshedStoredCandidates)
+  ) {
     saveState(state);
   }
 
@@ -2397,10 +2508,30 @@ function isWindowsAutoGeneratedTakeoverConfig(monitorConfig) {
 }
 
 function createWindowsDetachedTakeoverContext(monitorConfig, topologyDisplay, takeoverSource) {
+  const displaySummary = createWindowsDetachedDisplaySummary(monitorConfig, topologyDisplay);
+  const resolvedMonitorConfig = normalizeMonitorConfig(
+    {
+      ...monitorConfig,
+      displayKey: displaySummary.displayKey || monitorConfig.displayKey,
+      displayName: getMonitorDisplayName(monitorConfig) || displaySummary.detectedName,
+      match: {
+        ...monitorConfig.match,
+        windowsDisplayDeviceId:
+          displaySummary.windowsDisplayDeviceId ||
+          normalizeText(monitorConfig.match?.windowsDisplayDeviceId),
+        gdiDeviceName:
+          displaySummary.gdiDeviceName || normalizeText(monitorConfig.match?.gdiDeviceName),
+        productCode:
+          displaySummary.productCode || normalizeText(monitorConfig.match?.productCode),
+      },
+    },
+    monitorConfig
+  );
+
   return {
-    id: monitorConfig.id,
-    monitor: monitorConfig,
-    display: createWindowsDetachedDisplaySummary(monitorConfig, topologyDisplay),
+    id: resolvedMonitorConfig.id,
+    monitor: resolvedMonitorConfig,
+    display: displaySummary,
     takeoverSource,
     status: {
       visible: false,
@@ -2415,7 +2546,14 @@ function createWindowsDetachedTakeoverContext(monitorConfig, topologyDisplay, ta
 
 function createWindowsDetachedDisplaySummary(monitorConfig, topologyDisplay) {
   const deviceName = normalizeText(topologyDisplay?.deviceName || monitorConfig?.match?.gdiDeviceName);
-  const displayKey = deviceName ? `win:${deviceName}` : normalizeText(monitorConfig?.displayKey);
+  const windowsDisplayDeviceId = normalizeText(
+    topologyDisplay?.displayDeviceId || monitorConfig?.match?.windowsDisplayDeviceId
+  );
+  const displayKey = windowsDisplayDeviceId
+    ? `win-device:${windowsDisplayDeviceId.toLowerCase()}`
+    : deviceName
+      ? `win:${deviceName}`
+      : normalizeText(monitorConfig?.displayKey);
   const detectedName =
     getWindowsUsableDetachedDisplayName(topologyDisplay) ||
     getMonitorDisplayName(monitorConfig) ||
@@ -2434,6 +2572,7 @@ function createWindowsDetachedDisplaySummary(monitorConfig, topologyDisplay) {
     position: "当前未接入桌面",
     internal: false,
     electronDisplayId: null,
+    windowsDisplayDeviceId,
     macSystemDisplayId: null,
     macVendorId: "",
     macProductId: "",
@@ -2473,6 +2612,7 @@ function createWindowsDetachedMonitorConfig(topologyDisplay, fallbackMonitorConf
       displayName: detectedName,
       match: {
         electronDisplayId: null,
+        windowsDisplayDeviceId: normalizeText(topologyDisplay?.displayDeviceId),
         macSystemDisplayId: null,
         macVendorId: "",
         macProductId: "",
@@ -2487,6 +2627,7 @@ function createWindowsDetachedMonitorConfig(topologyDisplay, fallbackMonitorConf
       roleLabel: "待接回屏幕",
       displayName: detectedName,
       match: {
+        windowsDisplayDeviceId: normalizeText(topologyDisplay?.displayDeviceId),
         gdiDeviceName: deviceName,
         productCode: normalizeText(topologyDisplay?.productCode),
       },
@@ -2593,8 +2734,11 @@ async function syncMonitorConfigsFromLocalDisplays({
   persist = true,
   forceMacDisplayMetadataRefresh = false,
 } = {}) {
+  const windowsTopologyDisplays =
+    process.platform === "win32" ? await getWindowsTopologyDisplays() : null;
   const displaySummaries = await getLocalDisplaySummaries({
     forceMacDisplayMetadataRefresh,
+    windowsTopologyDisplays,
   });
   const storedMonitorConfigs = getStoredMonitorConfigs();
   const unmatchedStoredMonitorConfigs = storedMonitorConfigs.filter(
@@ -2639,6 +2783,7 @@ async function syncMonitorConfigsFromLocalDisplays({
         displayName: resolvedDisplaySummary.detectedName,
         match: {
           electronDisplayId: resolvedDisplaySummary.electronDisplayId,
+          windowsDisplayDeviceId: resolvedDisplaySummary.windowsDisplayDeviceId,
           macSystemDisplayId: resolvedDisplaySummary.macSystemDisplayId,
           macVendorId: resolvedDisplaySummary.macVendorId,
           macProductId: resolvedDisplaySummary.macProductId,
@@ -2654,6 +2799,7 @@ async function syncMonitorConfigsFromLocalDisplays({
         displayName: resolvedDisplaySummary.detectedName,
         match: {
           electronDisplayId: resolvedDisplaySummary.electronDisplayId,
+          windowsDisplayDeviceId: resolvedDisplaySummary.windowsDisplayDeviceId,
           macSystemDisplayId: resolvedDisplaySummary.macSystemDisplayId,
           macVendorId: resolvedDisplaySummary.macVendorId,
           macProductId: resolvedDisplaySummary.macProductId,
@@ -2672,6 +2818,9 @@ async function syncMonitorConfigsFromLocalDisplays({
   const preservedMacIdentityKeys = new Set(
     nextMonitorConfigs.map(getMacPersistableMonitorIdentityKey).filter(Boolean)
   );
+  const preservedWindowsDeviceNames = new Set(
+    nextMonitorConfigs.map(getWindowsMonitorDeviceKey).filter(Boolean)
+  );
 
   for (const storedMonitorConfig of unmatchedStoredMonitorConfigs) {
     if (usedMonitorIds.has(storedMonitorConfig.id)) {
@@ -2683,10 +2832,18 @@ async function syncMonitorConfigsFromLocalDisplays({
       continue;
     }
 
-    if (shouldPreserveDisconnectedMonitorConfig(storedMonitorConfig)) {
+    const windowsDeviceKey = getWindowsMonitorDeviceKey(storedMonitorConfig);
+    if (windowsDeviceKey && preservedWindowsDeviceNames.has(windowsDeviceKey)) {
+      continue;
+    }
+
+    if (shouldPreserveDisconnectedMonitorConfig(storedMonitorConfig, windowsTopologyDisplays)) {
       nextMonitorConfigs.push(normalizeMonitorConfig(storedMonitorConfig));
       if (macIdentityKey) {
         preservedMacIdentityKeys.add(macIdentityKey);
+      }
+      if (windowsDeviceKey) {
+        preservedWindowsDeviceNames.add(windowsDeviceKey);
       }
     }
   }
@@ -2733,23 +2890,87 @@ function findStoredMonitorConfigForDisplay(
     return macSoftMatches[0];
   }
 
-  return (
-    candidates.find((monitorConfig) => {
-      return (
-        normalizeText(monitorConfig.displayKey) === displaySummary.displayKey ||
-        (macHardwareDisplayKey && buildMacHardwareDisplayKey(monitorConfig) === macHardwareDisplayKey) ||
-        (Number.isInteger(displaySummary.macSystemDisplayId) &&
-          monitorConfig.match?.macSystemDisplayId === displaySummary.macSystemDisplayId) ||
-        (displaySummary.gdiDeviceName &&
-          normalizeText(monitorConfig.match?.gdiDeviceName) === displaySummary.gdiDeviceName) ||
-        (Number.isInteger(displaySummary.electronDisplayId) &&
-          monitorConfig.match?.electronDisplayId === displaySummary.electronDisplayId)
-      );
-    }) || null
-  );
+  const exactMatches = candidates
+    .map((monitorConfig) => ({
+      monitorConfig,
+      score: getStoredMonitorConfigMatchScore(
+        monitorConfig,
+        displaySummary,
+        macHardwareDisplayKey
+      ),
+    }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score);
+  return exactMatches[0]?.monitorConfig || null;
 }
 
-function shouldPreserveDisconnectedMonitorConfig(monitorConfig) {
+function getStoredMonitorConfigMatchScore(monitorConfig, displaySummary, macHardwareDisplayKey = "") {
+  let score = 0;
+  const storedWindowsDisplayDeviceId = normalizeText(
+    monitorConfig.match?.windowsDisplayDeviceId
+  ).toLowerCase();
+  const currentWindowsDisplayDeviceId = normalizeText(
+    displaySummary.windowsDisplayDeviceId
+  ).toLowerCase();
+  const windowsIdentityMismatch = Boolean(
+    storedWindowsDisplayDeviceId &&
+      currentWindowsDisplayDeviceId &&
+      storedWindowsDisplayDeviceId !== currentWindowsDisplayDeviceId
+  );
+  if (windowsIdentityMismatch) {
+    return 0;
+  }
+  if (
+    storedWindowsDisplayDeviceId &&
+    currentWindowsDisplayDeviceId &&
+    storedWindowsDisplayDeviceId === currentWindowsDisplayDeviceId
+  ) {
+    score = Math.max(score, 200);
+  }
+  if (
+    !windowsIdentityMismatch &&
+    normalizeText(monitorConfig.displayKey) === displaySummary.displayKey
+  ) {
+    score = Math.max(score, 100);
+  }
+  if (macHardwareDisplayKey && buildMacHardwareDisplayKey(monitorConfig) === macHardwareDisplayKey) {
+    score = Math.max(score, 100);
+  }
+  if (
+    !windowsIdentityMismatch &&
+    displaySummary.gdiDeviceName &&
+    normalizeText(monitorConfig.match?.gdiDeviceName).toLowerCase() ===
+      displaySummary.gdiDeviceName.toLowerCase()
+  ) {
+    score = Math.max(score, 100);
+  }
+  if (
+    Number.isInteger(displaySummary.macSystemDisplayId) &&
+    monitorConfig.match?.macSystemDisplayId === displaySummary.macSystemDisplayId
+  ) {
+    score = Math.max(score, 60);
+  }
+  if (
+    Number.isInteger(displaySummary.electronDisplayId) &&
+    monitorConfig.match?.electronDisplayId === displaySummary.electronDisplayId
+  ) {
+    score = score > 0 ? score + 20 : 40;
+  }
+
+  if (score > 0 && getExistingMonitorDesktopRuntime(monitorConfig.id)?.pendingRestore) {
+    score += 10;
+  }
+  if (score > 0 && isUserCustomizedMonitorConfig(monitorConfig)) {
+    score += 5;
+  }
+  return score;
+}
+
+function getWindowsMonitorDeviceKey(monitorConfig) {
+  return normalizeText(monitorConfig?.match?.gdiDeviceName).toLowerCase();
+}
+
+function shouldPreserveDisconnectedMonitorConfig(monitorConfig, windowsTopologyDisplays = null) {
   if (process.platform === "darwin") {
     return hasMacPersistableMonitorIdentity(monitorConfig);
   }
@@ -2758,10 +2979,24 @@ function shouldPreserveDisconnectedMonitorConfig(monitorConfig) {
     return false;
   }
 
-  return Boolean(
-    normalizeText(monitorConfig?.match?.gdiDeviceName) ||
-      getExistingMonitorDesktopRuntime(monitorConfig.id)?.pendingRestore
+  const pendingRestore = Boolean(getExistingMonitorDesktopRuntime(monitorConfig.id)?.pendingRestore);
+  const deviceKey = getWindowsMonitorDeviceKey(monitorConfig);
+  if (!deviceKey) {
+    return pendingRestore;
+  }
+
+  if (!Array.isArray(windowsTopologyDisplays) || windowsTopologyDisplays.length === 0) {
+    return pendingRestore || isUserCustomizedMonitorConfig(monitorConfig);
+  }
+
+  const topologyDisplay = windowsTopologyDisplays.find(
+    (display) => normalizeText(display?.deviceName).toLowerCase() === deviceKey
   );
+  if (!topologyDisplay) {
+    return pendingRestore || isUserCustomizedMonitorConfig(monitorConfig);
+  }
+
+  return !topologyDisplay.attached && isWindowsPhysicalDetachedDisplayCandidate(topologyDisplay);
 }
 
 function hasMacPersistableMonitorIdentity(monitorConfig) {
@@ -2811,10 +3046,15 @@ function pruneStateForKnownMonitorIds(knownMonitorIds) {
   return changed;
 }
 
-async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false } = {}) {
+async function getLocalDisplaySummaries({
+  forceMacDisplayMetadataRefresh = false,
+  windowsTopologyDisplays = null,
+} = {}) {
   const orderedDisplays = getOrderedLocalDisplays();
   if (process.platform === "win32") {
-    const topologyDisplays = await getWindowsTopologyDisplays();
+    const topologyDisplays = Array.isArray(windowsTopologyDisplays)
+      ? windowsTopologyDisplays
+      : await getWindowsTopologyDisplays();
     const attachedTopologyDisplays = topologyDisplays
       .filter((display) => display.attached)
       .sort(compareDisplayLikeObjects);
@@ -2869,6 +3109,7 @@ async function getLocalDisplaySummaries({ forceMacDisplayMetadataRefresh = false
           position: `${topologyDisplay.positionX}, ${topologyDisplay.positionY}`,
           internal: Boolean(electronDisplay?.internal),
           electronDisplayId: Number.isInteger(electronDisplay?.id) ? electronDisplay.id : null,
+          windowsDisplayDeviceId: normalizeText(topologyDisplay.displayDeviceId),
           gdiDeviceName: normalizeText(topologyDisplay.deviceName),
           productCode: normalizeText(topologyDisplay.productCode),
           ddcProbe: createDdcProbeSummary(ddcProbe, "Windows 没有找到可用的物理显示器 DDC/CI 句柄。"),
@@ -3018,6 +3259,11 @@ function buildDisplayKeyForLocalDisplay(
   macProfilerDisplay = null
 ) {
   if (process.platform === "win32") {
+    const windowsDisplayDeviceId = normalizeText(topologyDisplay?.displayDeviceId).toLowerCase();
+    if (windowsDisplayDeviceId) {
+      return `win-device:${windowsDisplayDeviceId}`;
+    }
+
     const gdiDeviceName = normalizeText(topologyDisplay?.deviceName);
     if (gdiDeviceName) {
       return `win:${gdiDeviceName}`;
@@ -3301,8 +3547,12 @@ function isGenericMacDisplayName(displayName) {
   return /^(|display|spdisplays_display|unknown display)$/iu.test(normalizeText(displayName));
 }
 
-async function getWindowsTopologyDisplays() {
+async function getWindowsTopologyDisplays({ force = false } = {}) {
   if (process.platform !== "win32") {
+    return [];
+  }
+
+  if (!force && Date.now() < windowsTopologyRetryAfter) {
     return [];
   }
 
@@ -3310,9 +3560,26 @@ async function getWindowsTopologyDisplays() {
     const output = await runWindowsTopologyCommand(["-Summary"]);
     const parsed = JSON.parse(output);
     const displays = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+    const recoveredFromFailure = windowsTopologyFailureCount > 0;
+    windowsTopologyFailureCount = 0;
+    windowsTopologyRetryAfter = 0;
+    if (recoveredFromFailure) {
+      appendDiagnosticLog("Windows topology helper recovered.");
+      scheduleTrayRebuild("topology-recovered");
+    }
     return displays.map(normalizeWindowsTopologyDisplay).filter(Boolean);
   } catch (error) {
-    appendDiagnosticLog("Failed to read Windows topology", error);
+    windowsTopologyFailureCount += 1;
+    const backoffMs = Math.min(
+      WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS,
+      WINDOWS_TOPOLOGY_FAILURE_BACKOFF_BASE_MS * 2 ** (windowsTopologyFailureCount - 1)
+    );
+    windowsTopologyRetryAfter = Date.now() + backoffMs;
+    appendDiagnosticLogRateLimited(
+      "windows-topology-read",
+      `Failed to read Windows topology; retrying in ${backoffMs}ms`,
+      error
+    );
     return [];
   }
 }
@@ -3324,6 +3591,7 @@ function normalizeWindowsTopologyDisplay(display) {
 
   return {
     deviceName: normalizeText(display.DeviceName),
+    displayDeviceId: normalizeText(display.DisplayDeviceId),
     deviceString: normalizeText(display.DeviceString),
     displayName: normalizeText(display.DisplayName),
     friendlyName: normalizeText(display.FriendlyName),
@@ -3418,7 +3686,11 @@ async function getWindowsDdcProbeResult(topologyDisplay) {
       error: normalizeText(error.message),
     };
     windowsDdcProbeCache.set(cacheKey, nextResult);
-    appendDiagnosticLog(`Windows DDC probe failed for ${deviceName}`, error);
+    appendDiagnosticLogRateLimited(
+      `windows-ddc-probe:${deviceName.toLowerCase()}`,
+      `Windows DDC probe failed for ${deviceName}`,
+      error
+    );
     return nextResult;
   }
 }
@@ -3514,6 +3786,15 @@ function mapWindowsTopologyDisplaysToElectronDisplays(attachedTopologyDisplays, 
 }
 
 function isTopologyDisplayMatchMonitor(topologyDisplay, monitorContextOrConfig) {
+  const storedDisplayDeviceId = normalizeText(
+    monitorContextOrConfig?.display?.windowsDisplayDeviceId ||
+      monitorContextOrConfig?.match?.windowsDisplayDeviceId
+  ).toLowerCase();
+  const topologyDisplayDeviceId = normalizeText(topologyDisplay?.displayDeviceId).toLowerCase();
+  if (storedDisplayDeviceId && topologyDisplayDeviceId) {
+    return storedDisplayDeviceId === topologyDisplayDeviceId;
+  }
+
   const gdiDeviceName = normalizeText(
     monitorContextOrConfig?.display?.gdiDeviceName ||
       monitorContextOrConfig?.match?.gdiDeviceName
@@ -3556,17 +3837,21 @@ async function runWindowsTopologyCommand(args) {
   return nextOperation;
 }
 
-async function getCurrentWindowsAttachedDisplayCount() {
-  const topologyDisplays = await getWindowsTopologyDisplays();
+async function getCurrentWindowsAttachedDisplayCount({ force = false } = {}) {
+  const topologyDisplays = await getWindowsTopologyDisplays({ force });
   const attachedCount = topologyDisplays.filter((display) => display.attached).length;
   return attachedCount > 0 ? attachedCount : null;
 }
 
 async function waitForDisplayCount(expectedCount, errorMessage) {
   const startedAt = Date.now();
+  let forceTopologyRefresh = true;
 
   while (Date.now() - startedAt < 8000) {
-    const attachedCount = await getCurrentWindowsAttachedDisplayCount();
+    const attachedCount = await getCurrentWindowsAttachedDisplayCount({
+      force: forceTopologyRefresh,
+    });
+    forceTopologyRefresh = false;
     if (!Number.isInteger(expectedCount) || attachedCount === expectedCount) {
       return;
     }
@@ -3935,7 +4220,7 @@ function renderMonitorSection(monitorContext) {
     </div>
     ${
       runtime.pendingRestore
-        ? `<div class="banner success" style="margin-top: 12px;">这块屏已经标记为“等待接回”。Windows 会持续尝试把它重新加回桌面。</div>`
+        ? `<div class="banner success" style="margin-top: 12px;">这块屏正在等待接回。Windows 检测到它已回到本机接口后会恢复状态；要主动接回请使用“接回 Windows 的共享屏”。</div>`
         : ""
     }
     ${renderDailyVisibleMonitorActions(monitorContext)}
@@ -3958,7 +4243,7 @@ function renderDailyVisibleMonitorActions(monitorContext) {
   const currentText = Number.isInteger(monitorContext.status.currentInputValue)
     ? `当前回读：${describeInputValue(monitorContext.status.currentInputValue)}`
     : monitorContext.status.ddcAvailable === false
-      ? "当前不能确认输入源，但可以按按钮发送切换命令。"
+      ? "当前没有可用的 DDC/CI 控制通道，切换按钮已停用。"
       : "当前输入源未知，切换后可能需要人工看屏幕确认。";
 
   if (!peerTarget) {
@@ -4364,6 +4649,7 @@ function createDefaultMonitorConfig(partial = {}) {
       electronDisplayId: Number.isInteger(partial.match?.electronDisplayId)
         ? partial.match.electronDisplayId
         : null,
+      windowsDisplayDeviceId: normalizeText(partial.match?.windowsDisplayDeviceId),
       macSystemDisplayId: Number.isInteger(partial.match?.macSystemDisplayId)
         ? partial.match.macSystemDisplayId
         : null,
@@ -4386,6 +4672,9 @@ function normalizeMonitorConfig(rawMonitorConfig = {}, fallbackMonitorConfig = {
       electronDisplayId: Number.isInteger(rawMonitorConfig.match?.electronDisplayId)
         ? rawMonitorConfig.match.electronDisplayId
         : baseline.match.electronDisplayId,
+      windowsDisplayDeviceId:
+        normalizeText(rawMonitorConfig.match?.windowsDisplayDeviceId) ||
+        baseline.match.windowsDisplayDeviceId,
       macSystemDisplayId: Number.isInteger(rawMonitorConfig.match?.macSystemDisplayId)
         ? rawMonitorConfig.match.macSystemDisplayId
         : baseline.match.macSystemDisplayId,
@@ -4700,14 +4989,31 @@ function recordSwitchOutcome(status, monitorId, targetId, message = "") {
 }
 
 function getSwitchSuccessMessages(monitorContext, target, switchResult = null) {
-  if (switchResult?.verificationStatus === "unconfirmed") {
+  if (switchResult?.verificationStatus === "accepted") {
+    const handoffText = switchResult.desktopHandoffCompleted
+      ? "，并已从 Windows 桌面移除"
+      : "";
     return {
       outcomeMessage: `${getMonitorDisplayTitle(
         monitorContext
-      )} 已发送切换命令：${target.label}。当前显示器未提供可靠回读，结果待人工确认。`,
+      )} 已接受切换命令：${target.label}${handoffText}。画面结果待人工确认。`,
       notificationMessage: `${getMonitorDisplayTitle(
         monitorContext
-      )} 已发送切换命令到 ${target.label}，当前无法可靠确认结果。`,
+      )} 已接受切到 ${target.label} 的命令${handoffText}，画面结果待确认。`,
+    };
+  }
+
+  if (switchResult?.verificationStatus === "unconfirmed") {
+    const detail = normalizeText(switchResult.message);
+    return {
+      outcomeMessage: `${getMonitorDisplayTitle(
+        monitorContext
+      )} 已发送切换命令：${target.label}，但当前输入回读尚未确认目标。${
+        detail ? ` ${detail}` : ""
+      }`,
+      notificationMessage: `${getMonitorDisplayTitle(
+        monitorContext
+      )} 已发送切换到 ${target.label} 的命令，但回读仍未确认目标。`,
     };
   }
 
@@ -4938,17 +5244,78 @@ function getDiagnosticLogPath() {
   return path.join(app.getPath("userData"), "app.log");
 }
 
+function appendDiagnosticLogRateLimited(
+  key,
+  message,
+  error = null,
+  intervalMs = DIAGNOSTIC_LOG_REPEAT_INTERVAL_MS
+) {
+  const normalizedKey = normalizeText(key) || normalizeText(message);
+  const lastWrittenAt = diagnosticLogLastWriteByKey.get(normalizedKey) || 0;
+  if (Date.now() - lastWrittenAt < intervalMs) {
+    return;
+  }
+
+  diagnosticLogLastWriteByKey.set(normalizedKey, Date.now());
+  appendDiagnosticLog(message, error);
+}
+
 function appendDiagnosticLog(message, error = null) {
   try {
-    fs.mkdirSync(path.dirname(getDiagnosticLogPath()), { recursive: true });
+    const logPath = getDiagnosticLogPath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    trimDiagnosticLogIfNeeded(logPath);
     const lines = [`[${new Date().toISOString()}] ${message}`];
     const details = formatDiagnosticError(error);
     if (details) {
       lines.push(details);
     }
-    fs.appendFileSync(getDiagnosticLogPath(), `${lines.join("\n")}\n`);
+    fs.appendFileSync(logPath, `${lines.join("\n")}\n`);
   } catch {
     // Ignore logging failures.
+  }
+}
+
+function trimDiagnosticLogIfNeeded(logPath = getDiagnosticLogPath()) {
+  let fileHandle = null;
+  try {
+    const stats = fs.statSync(logPath);
+    if (stats.size <= DIAGNOSTIC_LOG_MAX_BYTES) {
+      return false;
+    }
+
+    const bytesToKeep = Math.min(DIAGNOSTIC_LOG_TAIL_BYTES, stats.size);
+    const tailBuffer = Buffer.alloc(bytesToKeep);
+    fileHandle = fs.openSync(logPath, "r");
+    fs.readSync(fileHandle, tailBuffer, 0, bytesToKeep, stats.size - bytesToKeep);
+    fs.closeSync(fileHandle);
+    fileHandle = null;
+
+    const decodedTail = tailBuffer.toString("utf8");
+    const firstLineBreak = decodedTail.indexOf("\n");
+    const completeTail = firstLineBreak >= 0 ? decodedTail.slice(firstLineBreak + 1) : decodedTail;
+    fs.writeFileSync(
+      logPath,
+      `[${new Date().toISOString()}] Diagnostic log trimmed from ${stats.size} bytes.\n${completeTail}`
+    );
+    return true;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      try {
+        process.stderr.write(`Failed to trim diagnostic log: ${formatDiagnosticError(error)}\n`);
+      } catch {
+        // Ignore reporting failures.
+      }
+    }
+    return false;
+  } finally {
+    if (fileHandle !== null) {
+      try {
+        fs.closeSync(fileHandle);
+      } catch {
+        // Ignore cleanup failures.
+      }
+    }
   }
 }
 
@@ -5217,7 +5584,7 @@ async function runSwitchCandidateSequence(candidates, runCandidate) {
   for (let index = 0; index < candidates.length; index += 1) {
     try {
       const result = await runCandidate(candidates[index]);
-      if (result?.verificationStatus === "confirmed") {
+      if (["confirmed", "accepted"].includes(result?.verificationStatus)) {
         return result;
       }
 

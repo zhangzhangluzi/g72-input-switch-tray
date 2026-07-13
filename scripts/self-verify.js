@@ -24,8 +24,10 @@ function verifyMainSourceBusinessGuards() {
 
   assert.match(
     mainSource,
-    /verificationStatus === "confirmed"[\s\S]*detachWindowsDisplayForMonitor/u
+    /\["confirmed", "accepted"\]\.includes\(switchResult\.verificationStatus\)[\s\S]*detachWindowsDisplayForMonitor/u
   );
+  assert.match(mainSource, /function classifyWindowsSwitchVerification/u);
+  assert.match(mainSource, /\["confirmed", "accepted"\]\.includes\(result\?\.verificationStatus\)/u);
   assert.match(mainSource, /MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000/u);
   assert.match(mainSource, /screen\.getPrimaryDisplay\(\)\?\.id/u);
   assert.match(mainSource, /DISPLAY_NAME_FALLBACK_ALLOWED: displaySummary\.displayNameIsUnique \? "1" : "0"/u);
@@ -35,9 +37,10 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function isSingleMacSoftDisplayMatch/u);
   assert.match(mainSource, /function buildMacSoftDisplayKey/u);
   assert.match(mainSource, /function withDisplayNameUniqueness/u);
-  assert.match(mainSource, /async function attemptPendingWindowsRestores\(\{\s*monitorId: targetMonitorId = null,\s*displaySummaries = null,/u);
-  assert.match(mainSource, /allowAttachDetached = false/u);
-  assert.match(mainSource, /allowAttachDetached: true/u);
+  assert.match(mainSource, /async function attemptPendingWindowsRestores\(\{\s*monitorId: targetMonitorId = null,\s*forceTopologyRefresh = false,/u);
+  assert.match(mainSource, /pendingMonitorConfigs\.length === 0/u);
+  assert.match(mainSource, /isWindowsInputValueForTarget\(currentInput\.value, localTarget, monitorConfig\)/u);
+  assert.doesNotMatch(mainSource, /allowAttachDetached/u);
   assert.match(mainSource, /const windowsTakeoverInProgressMonitorIds = new Set\(\)/u);
   assert.match(mainSource, /const windowsTakeoverProtectedUntilByMonitorId = new Map\(\)/u);
   assert.match(mainSource, /WINDOWS_TAKEOVER_SETTLE_MS = 45000/u);
@@ -50,6 +53,8 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /isWindowsTakeoverInProgress\(monitorConfig\)/u);
   assert.match(mainSource, /function isWindowsTakeoverInProgress/u);
   assert.match(mainSource, /function markWindowsTakeoverProtection/u);
+  assert.match(mainSource, /function queueMonitorOperation/u);
+  assert.match(mainSource, /takeoverWindowsDetachedMonitorUnlocked/u);
   assert.match(mainSource, /function killProcessTree/u);
   assert.match(mainSource, /taskkill\.exe/u);
   assert.match(mainSource, /稳定保留这块屏/u);
@@ -106,6 +111,9 @@ function verifyMainSourceBusinessGuards() {
     /\.filter\(\(\{ electronDisplay \}\) => Boolean\(electronDisplay\) && !electronDisplay\.internal\);/u
   );
   assert.match(mainSource, /startDisplayChangeWatcher\(\);/u);
+  assert.match(mainSource, /function scheduleLocalDisplayTopologyChange/u);
+  assert.match(mainSource, /DISPLAY_CHANGE_DEBOUNCE_MS = 750/u);
+  assert.match(mainSource, /WINDOWS_RESTORE_CHECK_INTERVAL_MS = 5000/u);
   assert.match(mainSource, /screen\.on\("display-added", handleDisplayChange\);/u);
   assert.match(mainSource, /screen\.on\("display-metrics-changed", handleDisplayChange\);/u);
   assert.match(mainSource, /forceMacDisplayMetadataRefresh/u);
@@ -153,6 +161,12 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /async function switchMonitorUnlocked/u);
   assert.match(mainSource, /switchOperationQueue = switchTask\.catch\(\(\) => \{\}\)/u);
   assert.match(mainSource, /function shouldPreserveDisconnectedMonitorConfig/u);
+  assert.match(mainSource, /function getStoredMonitorConfigMatchScore/u);
+  assert.match(mainSource, /windowsDisplayDeviceId/u);
+  assert.match(mainSource, /win-device:/u);
+  assert.match(mainSource, /storedDisplayDeviceId === topologyDisplayDeviceId/u);
+  assert.match(mainSource, /preservedWindowsDeviceNames/u);
+  assert.match(mainSource, /isWindowsPhysicalDetachedDisplayCandidate\(topologyDisplay\)/u);
   assert.match(mainSource, /process\.platform === "darwin"[\s\S]{0,120}hasMacPersistableMonitorIdentity/u);
   assert.match(mainSource, /function findStoredMonitorConfigForDisplay/u);
   assert.match(mainSource, /customizedMacSoftMatches\.length === 1/u);
@@ -187,6 +201,10 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function shouldUseWindowsPowerShellTemp\(file\)/u);
   assert.match(mainSource, /function getWindowsPowerShellEnv\(\)/u);
   assert.match(mainSource, /function getWindowsHelperTempPath\(\)/u);
+  assert.match(mainSource, /WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS = 60000/u);
+  assert.match(mainSource, /appendDiagnosticLogRateLimited\(\s*"windows-topology-read"/u);
+  assert.match(mainSource, /function trimDiagnosticLogIfNeeded/u);
+  assert.match(mainSource, /DIAGNOSTIC_LOG_MAX_BYTES = 2 \* 1024 \* 1024/u);
   assert.match(mainSource, /TEMP: tempPath/u);
   assert.match(mainSource, /TMP: tempPath/u);
   assert.doesNotMatch(mainSource, /request\.destroy\(\)/u);
@@ -482,6 +500,195 @@ function verifyWindowsDetachedVirtualDisplaysRejected() {
   assert.match(mainSource, /!isWindowsPhysicalDetachedDisplayCandidate\(topologyDisplay\)/u);
 }
 
+function verifyWindowsSwitchVerificationBehavior() {
+  const mainSource = fs.readFileSync(path.resolve(__dirname, "..", "src", "main.js"), "utf8");
+  const helperSource = ["normalizeText", "classifyWindowsSwitchVerification"]
+    .map((name) => extractFunction(mainSource, name))
+    .join("\n");
+  const script = `
+    ${helperSource}
+    globalThis.result = {
+      confirmed: classifyWindowsSwitchVerification([16], 16, ""),
+      explicitMismatch: classifyWindowsSwitchVerification([16], 15, ""),
+      readbackLost: classifyWindowsSwitchVerification([16], null, "No physical monitor handles"),
+    };
+  `;
+  const context = {};
+  vm.runInNewContext(script, context);
+
+  assert.equal(context.result.confirmed.status, "confirmed");
+  assert.equal(context.result.explicitMismatch.status, "unconfirmed");
+  assert.equal(context.result.readbackLost.status, "accepted");
+  assert.equal(context.result.readbackLost.error, "No physical monitor handles");
+}
+
+function verifyWindowsDisconnectedConfigPruningBehavior() {
+  const mainSource = fs.readFileSync(path.resolve(__dirname, "..", "src", "main.js"), "utf8");
+  const helperSource = [
+    "normalizeText",
+    "getStoredMonitorConfigMatchScore",
+    "getWindowsMonitorDeviceKey",
+    "isWindowsPhysicalDetachedDisplayCandidate",
+    "shouldPreserveDisconnectedMonitorConfig",
+  ]
+    .map((name) => extractFunction(mainSource, name))
+    .join("\n");
+  const script = `
+    const process = { platform: "win32" };
+    const runtimes = new Map();
+    function getExistingMonitorDesktopRuntime(id) { return runtimes.get(id) || null; }
+    function isUserCustomizedMonitorConfig(config) { return Boolean(config.customized); }
+    function hasMacPersistableMonitorIdentity() { return false; }
+    function buildMacHardwareDisplayKey() { return ""; }
+    ${helperSource}
+    const physical = {
+      deviceName: String.raw\`\\\\.\\DISPLAY2\`,
+      deviceString: "AMD Radeon RX 6750 GRE 12GB",
+      displayName: "H24E7",
+      friendlyName: "H24E7",
+      productCode: "SKG2431",
+      attached: false,
+    };
+    const virtual = {
+      ...physical,
+      deviceName: String.raw\`\\\\.\\DISPLAY27\`,
+      deviceString: "MuMu Virtual Display Adapter",
+    };
+    const physicalConfig = { id: "physical", match: { gdiDeviceName: physical.deviceName } };
+    const virtualConfig = { id: "virtual", match: { gdiDeviceName: virtual.deviceName } };
+    globalThis.result = {
+      physicalDetached: shouldPreserveDisconnectedMonitorConfig(physicalConfig, [physical, virtual]),
+      virtualDetached: shouldPreserveDisconnectedMonitorConfig(virtualConfig, [physical, virtual]),
+      attachedDuplicate: shouldPreserveDisconnectedMonitorConfig(physicalConfig, [
+        { ...physical, attached: true },
+      ]),
+      missingDefault: shouldPreserveDisconnectedMonitorConfig(physicalConfig, [virtual]),
+      missingCustomized: shouldPreserveDisconnectedMonitorConfig(
+        { ...physicalConfig, customized: true },
+        [virtual]
+      ),
+      stableIdentityMatch: getStoredMonitorConfigMatchScore(
+        {
+          id: "stable",
+          displayKey: "old-key",
+          match: { windowsDisplayDeviceId: String.raw\`MONITOR\\SKG2431\\INSTANCE-A\` },
+        },
+        {
+          displayKey: "new-key",
+          windowsDisplayDeviceId: String.raw\`monitor\\skg2431\\instance-a\`,
+        }
+      ),
+      stableIdentityMismatch: getStoredMonitorConfigMatchScore(
+        {
+          id: "stale",
+          displayKey: "win:display1",
+          match: {
+            windowsDisplayDeviceId: String.raw\`MONITOR\\SKG2431\\INSTANCE-OLD\`,
+            gdiDeviceName: physical.deviceName,
+          },
+        },
+        {
+          displayKey: "win:display1",
+          windowsDisplayDeviceId: String.raw\`MONITOR\\SKG2431\\INSTANCE-NEW\`,
+          gdiDeviceName: physical.deviceName,
+        }
+      ),
+    };
+  `;
+  const context = {};
+  vm.runInNewContext(script, context);
+
+  assert.equal(context.result.physicalDetached, true);
+  assert.equal(context.result.virtualDetached, false);
+  assert.equal(context.result.attachedDuplicate, false);
+  assert.equal(context.result.missingDefault, false);
+  assert.equal(context.result.missingCustomized, true);
+  assert.ok(context.result.stableIdentityMatch >= 200);
+  assert.equal(context.result.stableIdentityMismatch, 0);
+}
+
+function verifyWindowsDetachedIdentityRefreshBehavior() {
+  const mainSource = fs.readFileSync(path.resolve(__dirname, "..", "src", "main.js"), "utf8");
+  const helperSource = [
+    "normalizeText",
+    "createWindowsDetachedDisplaySummary",
+    "createWindowsDetachedTakeoverContext",
+  ]
+    .map((name) => extractFunction(mainSource, name))
+    .join("\n");
+  const script = `
+    function getWindowsUsableDetachedDisplayName(display) {
+      return normalizeText(display?.displayName);
+    }
+    function getMonitorDisplayName(config) {
+      return normalizeText(config?.displayName);
+    }
+    function normalizeMonitorConfig(config) { return config; }
+    ${helperSource}
+    globalThis.result = createWindowsDetachedTakeoverContext(
+      {
+        id: "shared-screen",
+        displayKey: String.raw\`win:\\\\.\\DISPLAY2\`,
+        displayName: "H24E7",
+        match: {
+          windowsDisplayDeviceId: String.raw\`MONITOR\\SKG2431\\INSTANCE-A\`,
+          gdiDeviceName: String.raw\`\\\\.\\DISPLAY2\`,
+          productCode: "SKG2431",
+        },
+      },
+      {
+        deviceName: String.raw\`\\\\.\\DISPLAY9\`,
+        displayDeviceId: String.raw\`MONITOR\\SKG2431\\INSTANCE-A\`,
+        displayName: "H24E7",
+        productCode: "SKG2431",
+        width: 2560,
+        height: 1440,
+      },
+      "stored"
+    );
+  `;
+  const context = {};
+  vm.runInNewContext(script, context);
+
+  assert.equal(context.result.id, "shared-screen");
+  assert.equal(context.result.monitor.match.gdiDeviceName, String.raw`\\.\DISPLAY9`);
+  assert.equal(
+    context.result.monitor.displayKey,
+    String.raw`win-device:monitor\skg2431\instance-a`
+  );
+  assert.equal(context.result.display.gdiDeviceName, String.raw`\\.\DISPLAY9`);
+}
+
+function verifyDiagnosticLogTrimming() {
+  const mainSource = fs.readFileSync(path.resolve(__dirname, "..", "src", "main.js"), "utf8");
+  const helperSource = ["formatDiagnosticError", "trimDiagnosticLogIfNeeded"]
+    .map((name) => extractFunction(mainSource, name))
+    .join("\n");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "monitor-input-switch-log-selftest-"));
+  const logPath = path.join(tempDir, "app.log");
+
+  try {
+    fs.writeFileSync(logPath, "topology failure\n".repeat(220000));
+    const script = `
+      const DIAGNOSTIC_LOG_MAX_BYTES = 2 * 1024 * 1024;
+      const DIAGNOSTIC_LOG_TAIL_BYTES = 512 * 1024;
+      function getDiagnosticLogPath() { return ${JSON.stringify(logPath)}; }
+      ${helperSource}
+      globalThis.result = trimDiagnosticLogIfNeeded(${JSON.stringify(logPath)});
+    `;
+    const context = { fs, Buffer, process };
+    vm.runInNewContext(script, context);
+
+    const trimmedLog = fs.readFileSync(logPath, "utf8");
+    assert.equal(context.result, true);
+    assert.ok(fs.statSync(logPath).size < 600 * 1024);
+    assert.match(trimmedLog, /Diagnostic log trimmed from/u);
+    assert.match(trimmedLog, /topology failure/u);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 function verifyLocalOnlyDocs() {
   const readmePath = path.resolve(__dirname, "..", "README.md");
   const handoffDocPath = path.resolve(__dirname, "..", "docs", "shared-monitor-handoff.md");
@@ -497,16 +704,22 @@ function verifyLocalOnlyDocs() {
   assert.match(readme, /接回 Windows 的共享屏/u);
   assert.match(readme, /灰色第二屏/u);
   assert.match(readme, /takeover candidates ignore known virtual display adapters/u);
+  assert.match(readme, /write accepted, then readback disappeared/u);
+  assert.match(readme, /diagnostic log is rate-limited and size-capped/u);
+  assert.match(readme, /Win32 display-device identity/u);
   assert.match(handoffDoc, /no LAN peer discovery/u);
   assert.match(handoffDoc, /Daily user model/u);
   assert.match(handoffDoc, /A gray second screen in Windows Settings is not treated as proof/u);
   assert.match(handoffDoc, /Per-interface device labels are optional presentation labels only/u);
   assert.match(handoffDoc, /configured daily peer interface is the actual target/u);
-  assert.match(handoffDoc, /does not blindly re-add a detached waiting screen/u);
+  assert.match(handoffDoc, /manual repair action do not blindly re-add a detached waiting screen/u);
   assert.match(handoffDoc, /takeover path first attaches the detached Windows display device/u);
   assert.match(handoffDoc, /hardware-bound/u);
   assert.match(handoffDoc, /same-model duplicate attached to Windows while its input is not that screen's configured local interface/u);
   assert.match(handoffDoc, /Known virtual display adapters/u);
+  assert.match(handoffDoc, /successful write followed by complete DDC\/readback loss/u);
+  assert.match(handoffDoc, /Background restore checks are read-only and back off/u);
+  assert.match(handoffDoc, /logical monitor's display-device identity/u);
   assert.match(
     handoffDoc,
     /controls only the external physical screens that are currently attached to the local host/u
@@ -579,7 +792,12 @@ function verifyWindowsHelperSourceGuards() {
   assert.match(topologyScript, /preferredModeDisplayEntry/u);
   assert.match(topologyScript, /resolvedPreferredWidth/u);
   assert.match(topologyScript, /RollbackDisplayModes/u);
+  assert.match(topologyScript, /DisplayDeviceId/u);
+  assert.match(topologyScript, /-DisplayDeviceId \$resolvedDisplayDeviceId/u);
+  assert.match(topologyScript, /\[Console\]::OutputEncoding = \$Utf8NoBom/u);
+  assert.match(topologyScript, /\[Console\]::Error\.WriteLine\(\$message\.Trim\(\)\)/u);
   assert.match(setInputScript, /\[switch\]\$ProbeDdc/u);
+  assert.match(setInputScript, /\[Console\]::OutputEncoding = \$Utf8NoBom/u);
   assert.match(setInputScript, /physicalMonitorCount/u);
   assert.match(setInputScript, /probeScope = "physicalMonitorHandle"/u);
   assert.doesNotMatch(setInputScript, /capabilitiesAvailable/u);
@@ -1023,6 +1241,10 @@ function main() {
   verifyStrictIntegerParsing();
   verifyMonitorConfigFormRejectsInvalidInputValues();
   verifyWindowsDetachedVirtualDisplaysRejected();
+  verifyWindowsSwitchVerificationBehavior();
+  verifyWindowsDisconnectedConfigPruningBehavior();
+  verifyWindowsDetachedIdentityRefreshBehavior();
+  verifyDiagnosticLogTrimming();
   verifyLocalOnlyDocs();
   verifyPinnedMacDdcctlBuildScript();
   verifyBuildScriptsUseUserTempWrapper();

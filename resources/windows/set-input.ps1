@@ -16,6 +16,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$Utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+[Console]::OutputEncoding = $Utf8NoBom
+$OutputEncoding = $Utf8NoBom
 
 if (-not $ListOnly -and -not $ReadInputValue -and -not $ReadCapabilities -and -not $ProbeDdc) {
     if ([string]::IsNullOrWhiteSpace($MonitorName) -and [string]::IsNullOrWhiteSpace($GdiDeviceName)) {
