@@ -202,6 +202,12 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function getWindowsPowerShellEnv\(\)/u);
   assert.match(mainSource, /function getWindowsHelperTempPath\(\)/u);
   assert.match(mainSource, /WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS = 60000/u);
+  assert.match(mainSource, /EXPLORER_SIGNATURE_TIMEOUT_MS = 3000/u);
+  assert.match(mainSource, /EXPLORER_SIGNATURE_LOG_INTERVAL_MS = 60 \* 60 \* 1000/u);
+  assert.match(mainSource, /trayHealthCheckInFlight/u);
+  assert.match(mainSource, /runCommand\(\s*"tasklist\.exe"/u);
+  assert.match(mainSource, /function parseExplorerSignature/u);
+  assert.doesNotMatch(mainSource, /Get-Process explorer/u);
   assert.match(mainSource, /appendDiagnosticLogRateLimited\(\s*"windows-topology-read"/u);
   assert.match(mainSource, /function trimDiagnosticLogIfNeeded/u);
   assert.match(mainSource, /function createDiagnosticLogEntry/u);
@@ -727,6 +733,29 @@ function verifyDiagnosticLogTrimming() {
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+function verifyExplorerSignatureParsing() {
+  const mainSource = fs.readFileSync(path.resolve(__dirname, "..", "src", "main.js"), "utf8");
+  const helperSource = extractFunction(mainSource, "parseExplorerSignature");
+  const script = `
+    ${helperSource}
+    globalThis.result = {
+      normal: parseExplorerSignature('"explorer.exe","13216","Console","1","342,020 K"'),
+      multiline: parseExplorerSignature(
+        'header ignored\\r\\n"explorer.exe","99","Console","1","100 K"'
+      ),
+      missing: parseExplorerSignature('INFO: No tasks are running which match the specified criteria.'),
+      malformed: parseExplorerSignature('"explorer.exe","not-a-pid"'),
+    };
+  `;
+  const context = {};
+  vm.runInNewContext(script, context);
+
+  assert.equal(context.result.normal, "explorer:13216");
+  assert.equal(context.result.multiline, "explorer:99");
+  assert.equal(context.result.missing, null);
+  assert.equal(context.result.malformed, null);
 }
 
 function verifyLocalOnlyDocs() {
@@ -1285,6 +1314,7 @@ function main() {
   verifyWindowsSwitchVerificationBehavior();
   verifyWindowsDisconnectedConfigPruningBehavior();
   verifyWindowsDetachedIdentityRefreshBehavior();
+  verifyExplorerSignatureParsing();
   verifyDiagnosticLogTrimming();
   verifyLocalOnlyDocs();
   verifyPinnedMacDdcctlBuildScript();

@@ -13,6 +13,8 @@ const LOOPBACK_HOST = "127.0.0.1";
 const PREFERRED_CONTROL_PORT = 3847;
 const TRAY_REBUILD_DELAY_MS = 1200;
 const TRAY_HEALTHCHECK_INTERVAL_MS = 5000;
+const EXPLORER_SIGNATURE_TIMEOUT_MS = 3000;
+const EXPLORER_SIGNATURE_LOG_INTERVAL_MS = 60 * 60 * 1000;
 const DISPLAY_CHANGE_DEBOUNCE_MS = 750;
 const WINDOWS_RESTORE_CHECK_INTERVAL_MS = 5000;
 const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
@@ -58,6 +60,7 @@ let activeControlPort = PREFERRED_CONTROL_PORT;
 let windowsRestoreTimer = null;
 let trayRebuildTimer = null;
 let trayHealthTimer = null;
+let trayHealthCheckInFlight = false;
 let displayChangeTimer = null;
 let displayChangeInFlight = false;
 let displayChangeQueued = false;
@@ -2161,31 +2164,36 @@ function startWindowsTrayWatcher() {
 }
 
 async function verifyTrayHealth() {
-  if (process.platform !== "win32") {
+  if (process.platform !== "win32" || trayHealthCheckInFlight) {
     return;
   }
 
-  if (!tray || isTrayDestroyed()) {
-    rebuildTray();
-    return;
-  }
+  trayHealthCheckInFlight = true;
+  try {
+    if (!tray || isTrayDestroyed()) {
+      rebuildTray();
+      return;
+    }
 
-  if (windowsTopologyFailureCount > 0 && Date.now() >= windowsTopologyRetryAfter) {
-    void refreshMenu();
-  }
+    if (windowsTopologyFailureCount > 0 && Date.now() >= windowsTopologyRetryAfter) {
+      void refreshMenu();
+    }
 
-  const nextExplorerSignature = await getExplorerSignature();
-  if (!nextExplorerSignature) {
-    return;
-  }
+    const nextExplorerSignature = await getExplorerSignature();
+    if (!nextExplorerSignature) {
+      return;
+    }
 
-  if (explorerSignature && explorerSignature !== nextExplorerSignature) {
+    if (explorerSignature && explorerSignature !== nextExplorerSignature) {
+      explorerSignature = nextExplorerSignature;
+      scheduleTrayRebuild(0);
+      return;
+    }
+
     explorerSignature = nextExplorerSignature;
-    scheduleTrayRebuild(0);
-    return;
+  } finally {
+    trayHealthCheckInFlight = false;
   }
-
-  explorerSignature = nextExplorerSignature;
 }
 
 async function refreshExplorerSignature() {
@@ -2194,16 +2202,26 @@ async function refreshExplorerSignature() {
 
 async function getExplorerSignature() {
   try {
-    const output = await runCommand("powershell.exe", [
-      "-NoProfile",
-      "-Command",
-      "$p = Get-Process explorer -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1; if ($p) { '{0}:{1}' -f $p.Id, $p.StartTime.ToFileTimeUtc() }",
-    ]);
-    return normalizeText(output) || null;
+    const output = await runCommand(
+      "tasklist.exe",
+      ["/FI", "IMAGENAME eq explorer.exe", "/FO", "CSV", "/NH"],
+      { timeout: EXPLORER_SIGNATURE_TIMEOUT_MS }
+    );
+    return parseExplorerSignature(output);
   } catch (error) {
-    appendDiagnosticLogRateLimited("explorer-signature", "Failed to read explorer signature", error);
+    appendDiagnosticLogRateLimited(
+      "explorer-signature",
+      "Failed to read explorer signature",
+      error,
+      EXPLORER_SIGNATURE_LOG_INTERVAL_MS
+    );
     return null;
   }
+}
+
+function parseExplorerSignature(output) {
+  const match = /(?:^|\r?\n)"explorer\.exe","(\d+)"/iu.exec(String(output ?? ""));
+  return match ? `explorer:${match[1]}` : null;
 }
 
 function isTrayDestroyed() {
