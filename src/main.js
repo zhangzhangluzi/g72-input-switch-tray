@@ -27,8 +27,9 @@ const WINDOWS_TAKEOVER_SETTLE_MS = 45000;
 const WINDOWS_TOPOLOGY_FAILURE_BACKOFF_BASE_MS = 5000;
 const WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS = 60000;
 const LOCAL_REQUEST_BODY_LIMIT_BYTES = 64 * 1024;
-const DIAGNOSTIC_LOG_MAX_BYTES = 2 * 1024 * 1024;
-const DIAGNOSTIC_LOG_TAIL_BYTES = 512 * 1024;
+const DIAGNOSTIC_LOG_MAX_BYTES = 256 * 1024;
+const DIAGNOSTIC_LOG_TAIL_BYTES = 96 * 1024;
+const DIAGNOSTIC_LOG_ENTRY_MAX_BYTES = 32 * 1024;
 const DIAGNOSTIC_LOG_REPEAT_INTERVAL_MS = 5 * 60 * 1000;
 const TARGET_SLOTS = [
   { id: "dp1", title: "DP1", defaultInputValue: 15 },
@@ -89,12 +90,12 @@ if (process.platform === "win32") {
 
 process.on("unhandledRejection", (reason) => {
   appendDiagnosticLog("Unhandled promise rejection", reason);
-  scheduleTrayRebuild("unhandled-rejection", 0);
+  scheduleTrayRebuild(0);
 });
 
 process.on("uncaughtException", (error) => {
   appendDiagnosticLog("Uncaught exception", error);
-  scheduleTrayRebuild("uncaught-exception", 0);
+  scheduleTrayRebuild(0);
 });
 
 if (!app.requestSingleInstanceLock()) {
@@ -215,13 +216,12 @@ function destroyTray() {
   tray = null;
 }
 
-function rebuildTray(reason = "unknown") {
-  appendDiagnosticLog(`Rebuilding tray (${reason})`);
+function rebuildTray() {
   createTray();
   void refreshMenu();
 }
 
-function scheduleTrayRebuild(reason, delayMs = TRAY_REBUILD_DELAY_MS) {
+function scheduleTrayRebuild(delayMs = TRAY_REBUILD_DELAY_MS) {
   if (process.platform !== "win32") {
     return;
   }
@@ -232,7 +232,7 @@ function scheduleTrayRebuild(reason, delayMs = TRAY_REBUILD_DELAY_MS) {
 
   trayRebuildTimer = setTimeout(() => {
     trayRebuildTimer = null;
-    rebuildTray(reason);
+    rebuildTray();
   }, delayMs);
 }
 
@@ -327,7 +327,7 @@ async function refreshMenu({ monitorContexts = null } = {}) {
 
     tray.setContextMenu(menu);
   } catch (error) {
-    appendDiagnosticLog("Failed to refresh tray menu", error);
+    appendDiagnosticLogRateLimited("tray-menu-refresh", "Failed to refresh tray menu", error);
   } finally {
     refreshMenuInFlight = false;
     if (refreshMenuQueued) {
@@ -1282,7 +1282,12 @@ async function getMacDdcProbeResult(displaySummary) {
       error: normalizeText(error.message),
     };
     macDdcProbeCache.set(cacheKey, nextResult);
-    appendDiagnosticLog(`macOS DDC probe failed for ${getMonitorDisplayName({ display: displaySummary })}`, error);
+    const monitorName = getMonitorDisplayName({ display: displaySummary });
+    appendDiagnosticLogRateLimited(
+      `mac-ddc-probe:${normalizeText(cacheKey).toLowerCase()}`,
+      `macOS DDC probe failed for ${monitorName}`,
+      error
+    );
     return nextResult;
   }
 }
@@ -1790,7 +1795,8 @@ async function attemptWindowsDuplicateForeignDisplayDetaches({
         await detachWindowsTopologyDisplay(candidate.display, candidate.reason);
         changed = true;
       } catch (error) {
-        appendDiagnosticLog(
+        appendDiagnosticLogRateLimited(
+          `windows-duplicate-detach:${normalizeText(candidate.display.deviceName).toLowerCase()}`,
           `Failed to detach duplicate Windows display ${candidate.display.deviceName}`,
           error
         );
@@ -2122,14 +2128,18 @@ async function handleLocalDisplayTopologyChange() {
     if (process.platform === "win32") {
       await attemptPendingWindowsRestores();
       await attemptWindowsDuplicateForeignDisplayDetaches();
-      scheduleTrayRebuild("display-change");
+      scheduleTrayRebuild();
       return;
     }
 
     const monitorContexts = await buildMonitorContextsWithStatus({ displaySummaries });
     await refreshMenu({ monitorContexts });
   } catch (error) {
-    appendDiagnosticLog("Failed to handle local display topology change", error);
+    appendDiagnosticLogRateLimited(
+      "display-topology-change",
+      "Failed to handle local display topology change",
+      error
+    );
   } finally {
     displayChangeInFlight = false;
     if (displayChangeQueued) {
@@ -2156,7 +2166,7 @@ async function verifyTrayHealth() {
   }
 
   if (!tray || isTrayDestroyed()) {
-    rebuildTray("tray-missing");
+    rebuildTray();
     return;
   }
 
@@ -2171,7 +2181,7 @@ async function verifyTrayHealth() {
 
   if (explorerSignature && explorerSignature !== nextExplorerSignature) {
     explorerSignature = nextExplorerSignature;
-    scheduleTrayRebuild("explorer-restarted", 0);
+    scheduleTrayRebuild(0);
     return;
   }
 
@@ -3329,7 +3339,11 @@ async function getMacSystemProfilerDisplays({ forceRefresh = false } = {}) {
     };
     return displays;
   } catch (error) {
-    appendDiagnosticLog("Failed to read macOS display metadata", error);
+    appendDiagnosticLogRateLimited(
+      "mac-display-metadata",
+      "Failed to read macOS display metadata",
+      error
+    );
     if (forceRefresh) {
       macDisplayMetadataCache = {
         fetchedAt: 0,
@@ -3564,8 +3578,11 @@ async function getWindowsTopologyDisplays({ force = false } = {}) {
     windowsTopologyFailureCount = 0;
     windowsTopologyRetryAfter = 0;
     if (recoveredFromFailure) {
-      appendDiagnosticLog("Windows topology helper recovered.");
-      scheduleTrayRebuild("topology-recovered");
+      appendDiagnosticLogRateLimited(
+        "windows-topology-recovered",
+        "Windows topology helper recovered."
+      );
+      scheduleTrayRebuild();
     }
     return displays.map(normalizeWindowsTopologyDisplay).filter(Boolean);
   } catch (error) {
@@ -5264,40 +5281,87 @@ function appendDiagnosticLog(message, error = null) {
   try {
     const logPath = getDiagnosticLogPath();
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    const entry = createDiagnosticLogEntry(message, error);
+    trimDiagnosticLogIfNeeded(logPath, Buffer.byteLength(entry));
+    fs.appendFileSync(logPath, entry);
     trimDiagnosticLogIfNeeded(logPath);
-    const lines = [`[${new Date().toISOString()}] ${message}`];
-    const details = formatDiagnosticError(error);
-    if (details) {
-      lines.push(details);
-    }
-    fs.appendFileSync(logPath, `${lines.join("\n")}\n`);
   } catch {
     // Ignore logging failures.
   }
 }
 
-function trimDiagnosticLogIfNeeded(logPath = getDiagnosticLogPath()) {
+function createDiagnosticLogEntry(message, error = null) {
+  const lines = [`[${new Date().toISOString()}] ${message}`];
+  const details = formatDiagnosticError(error);
+  if (details) {
+    lines.push(details);
+  }
+
+  return `${truncateDiagnosticLogText(
+    lines.join("\n"),
+    DIAGNOSTIC_LOG_ENTRY_MAX_BYTES - 1
+  )}\n`;
+}
+
+function truncateDiagnosticLogText(value, maxBytes) {
+  const byteLimit = Number.isFinite(maxBytes) ? Math.max(0, Math.floor(maxBytes)) : 0;
+  if (byteLimit === 0) {
+    return "";
+  }
+
+  const valueBuffer = Buffer.from(String(value ?? ""), "utf8");
+  if (valueBuffer.length <= byteLimit) {
+    return valueBuffer.toString("utf8");
+  }
+
+  const suffix = `\n[diagnostic entry truncated; original ${valueBuffer.length} bytes]`;
+  const suffixBuffer = Buffer.from(suffix, "utf8");
+  if (suffixBuffer.length >= byteLimit) {
+    return suffixBuffer.subarray(0, byteLimit).toString("utf8").replace(/\uFFFD+$/u, "");
+  }
+
+  const head = valueBuffer
+    .subarray(0, byteLimit - suffixBuffer.length)
+    .toString("utf8")
+    .replace(/\uFFFD+$/u, "");
+  return `${head}${suffix}`;
+}
+
+function trimDiagnosticLogIfNeeded(logPath = getDiagnosticLogPath(), incomingBytes = 0) {
   let fileHandle = null;
   try {
     const stats = fs.statSync(logPath);
-    if (stats.size <= DIAGNOSTIC_LOG_MAX_BYTES) {
+    const reservedBytes = Number.isFinite(incomingBytes)
+      ? Math.max(0, Math.min(DIAGNOSTIC_LOG_MAX_BYTES, Math.floor(incomingBytes)))
+      : 0;
+    if (stats.size + reservedBytes <= DIAGNOSTIC_LOG_MAX_BYTES) {
       return false;
     }
 
-    const bytesToKeep = Math.min(DIAGNOSTIC_LOG_TAIL_BYTES, stats.size);
-    const tailBuffer = Buffer.alloc(bytesToKeep);
-    fileHandle = fs.openSync(logPath, "r");
-    fs.readSync(fileHandle, tailBuffer, 0, bytesToKeep, stats.size - bytesToKeep);
-    fs.closeSync(fileHandle);
-    fileHandle = null;
-
-    const decodedTail = tailBuffer.toString("utf8");
-    const firstLineBreak = decodedTail.indexOf("\n");
-    const completeTail = firstLineBreak >= 0 ? decodedTail.slice(firstLineBreak + 1) : decodedTail;
-    fs.writeFileSync(
-      logPath,
-      `[${new Date().toISOString()}] Diagnostic log trimmed from ${stats.size} bytes.\n${completeTail}`
+    const marker = `[${new Date().toISOString()}] Diagnostic log rolled from ${stats.size} bytes.\n`;
+    const availableTailBytes = Math.max(
+      0,
+      DIAGNOSTIC_LOG_MAX_BYTES - reservedBytes - Buffer.byteLength(marker)
     );
+    const bytesToKeep = Math.min(DIAGNOSTIC_LOG_TAIL_BYTES, stats.size, availableTailBytes);
+    let completeTail = "";
+    if (bytesToKeep > 0) {
+      const tailBuffer = Buffer.alloc(bytesToKeep);
+      fileHandle = fs.openSync(logPath, "r");
+      fs.readSync(fileHandle, tailBuffer, 0, bytesToKeep, stats.size - bytesToKeep);
+      fs.closeSync(fileHandle);
+      fileHandle = null;
+
+      const decodedTail = tailBuffer.toString("utf8");
+      if (stats.size > bytesToKeep) {
+        const firstLineBreak = decodedTail.indexOf("\n");
+        completeTail = firstLineBreak >= 0 ? decodedTail.slice(firstLineBreak + 1) : "";
+      } else {
+        completeTail = decodedTail;
+      }
+    }
+
+    fs.writeFileSync(logPath, `${marker}${completeTail}`);
     return true;
   } catch (error) {
     if (error?.code !== "ENOENT") {

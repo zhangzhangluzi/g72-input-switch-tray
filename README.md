@@ -78,7 +78,7 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - The app starts a local settings page on port `3847` and binds it to `127.0.0.1` only. The HTTP server is only used for local setup and local direct switch actions; the app does not rely on LAN peer discovery or cross-machine coordination.
 - If port `3847` is unavailable, the local pages automatically fall back to another free local port.
 - The local `/health` endpoint reports an Electron display snapshot only; it does not run DDC probes, query current input, or rewrite monitor configuration.
-- Windows topology polling backs off after repeated helper failures, and the diagnostic log is rate-limited and size-capped so a temporary display-driver failure cannot create an unbounded PowerShell/logging loop.
+- Windows topology polling backs off after repeated helper failures. The diagnostic log is duplicate-rate-limited, each entry is truncated to 32 KiB, and the single rolling file is hard-capped at 256 KiB while retaining only its recent tail.
 - macOS only switches screens that are still visible to the current Mac. Once a screen has moved to another host, the current Mac no longer pretends it can still control that screen locally.
 - On Windows, only screens that can be stably mapped to a local external display are exposed as switch targets.
 

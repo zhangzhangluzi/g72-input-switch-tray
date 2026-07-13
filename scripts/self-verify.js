@@ -204,7 +204,12 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS = 60000/u);
   assert.match(mainSource, /appendDiagnosticLogRateLimited\(\s*"windows-topology-read"/u);
   assert.match(mainSource, /function trimDiagnosticLogIfNeeded/u);
-  assert.match(mainSource, /DIAGNOSTIC_LOG_MAX_BYTES = 2 \* 1024 \* 1024/u);
+  assert.match(mainSource, /function createDiagnosticLogEntry/u);
+  assert.match(mainSource, /function truncateDiagnosticLogText/u);
+  assert.match(mainSource, /DIAGNOSTIC_LOG_MAX_BYTES = 256 \* 1024/u);
+  assert.match(mainSource, /DIAGNOSTIC_LOG_TAIL_BYTES = 96 \* 1024/u);
+  assert.match(mainSource, /DIAGNOSTIC_LOG_ENTRY_MAX_BYTES = 32 \* 1024/u);
+  assert.doesNotMatch(mainSource, /appendDiagnosticLog\(`Rebuilding tray/u);
   assert.match(mainSource, /TEMP: tempPath/u);
   assert.match(mainSource, /TMP: tempPath/u);
   assert.doesNotMatch(mainSource, /request\.destroy\(\)/u);
@@ -661,29 +666,64 @@ function verifyWindowsDetachedIdentityRefreshBehavior() {
 
 function verifyDiagnosticLogTrimming() {
   const mainSource = fs.readFileSync(path.resolve(__dirname, "..", "src", "main.js"), "utf8");
-  const helperSource = ["formatDiagnosticError", "trimDiagnosticLogIfNeeded"]
+  const helperSource = [
+    "formatDiagnosticError",
+    "truncateDiagnosticLogText",
+    "createDiagnosticLogEntry",
+    "trimDiagnosticLogIfNeeded",
+  ]
     .map((name) => extractFunction(mainSource, name))
     .join("\n");
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "monitor-input-switch-log-selftest-"));
   const logPath = path.join(tempDir, "app.log");
 
   try {
-    fs.writeFileSync(logPath, "topology failure\n".repeat(220000));
+    fs.writeFileSync(logPath, "old topology failure\n".repeat(40000));
     const script = `
-      const DIAGNOSTIC_LOG_MAX_BYTES = 2 * 1024 * 1024;
-      const DIAGNOSTIC_LOG_TAIL_BYTES = 512 * 1024;
+      const DIAGNOSTIC_LOG_MAX_BYTES = 256 * 1024;
+      const DIAGNOSTIC_LOG_TAIL_BYTES = 96 * 1024;
+      const DIAGNOSTIC_LOG_ENTRY_MAX_BYTES = 32 * 1024;
       function getDiagnosticLogPath() { return ${JSON.stringify(logPath)}; }
       ${helperSource}
-      globalThis.result = trimDiagnosticLogIfNeeded(${JSON.stringify(logPath)});
+      const initialRoll = trimDiagnosticLogIfNeeded(${JSON.stringify(logPath)});
+      const oversizedEntry = createDiagnosticLogEntry("oversized", "X".repeat(1024 * 1024));
+      let rollCount = initialRoll ? 1 : 0;
+      let maxObservedBytes = fs.statSync(${JSON.stringify(logPath)}).size;
+      for (let index = 0; index < 240; index += 1) {
+        const entry = createDiagnosticLogEntry(
+          \`event-\${index}\`,
+          \`failure-\${index}:\${"y".repeat(4096)}\`
+        );
+        if (trimDiagnosticLogIfNeeded(${JSON.stringify(logPath)}, Buffer.byteLength(entry))) {
+          rollCount += 1;
+        }
+        fs.appendFileSync(${JSON.stringify(logPath)}, entry);
+        trimDiagnosticLogIfNeeded(${JSON.stringify(logPath)});
+        const currentBytes = fs.statSync(${JSON.stringify(logPath)}).size;
+        maxObservedBytes = Math.max(maxObservedBytes, currentBytes);
+        if (currentBytes > DIAGNOSTIC_LOG_MAX_BYTES) {
+          throw new Error(\`Log exceeded hard cap: \${currentBytes}\`);
+        }
+      }
+      globalThis.result = {
+        initialRoll,
+        oversizedEntryBytes: Buffer.byteLength(oversizedEntry),
+        rollCount,
+        maxObservedBytes,
+      };
     `;
     const context = { fs, Buffer, process };
     vm.runInNewContext(script, context);
 
-    const trimmedLog = fs.readFileSync(logPath, "utf8");
-    assert.equal(context.result, true);
-    assert.ok(fs.statSync(logPath).size < 600 * 1024);
-    assert.match(trimmedLog, /Diagnostic log trimmed from/u);
-    assert.match(trimmedLog, /topology failure/u);
+    const rolledLog = fs.readFileSync(logPath, "utf8");
+    assert.equal(context.result.initialRoll, true);
+    assert.ok(context.result.oversizedEntryBytes <= 32 * 1024);
+    assert.ok(context.result.rollCount >= 2);
+    assert.ok(context.result.maxObservedBytes <= 256 * 1024);
+    assert.ok(fs.statSync(logPath).size <= 256 * 1024);
+    assert.match(rolledLog, /Diagnostic log rolled from/u);
+    assert.match(rolledLog, /event-239/u);
+    assert.doesNotMatch(rolledLog, /old topology failure/u);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -705,7 +745,8 @@ function verifyLocalOnlyDocs() {
   assert.match(readme, /灰色第二屏/u);
   assert.match(readme, /takeover candidates ignore known virtual display adapters/u);
   assert.match(readme, /write accepted, then readback disappeared/u);
-  assert.match(readme, /diagnostic log is rate-limited and size-capped/u);
+  assert.match(readme, /single rolling file is hard-capped at 256 KiB/u);
+  assert.match(readme, /each entry is truncated to 32 KiB/u);
   assert.match(readme, /Win32 display-device identity/u);
   assert.match(handoffDoc, /no LAN peer discovery/u);
   assert.match(handoffDoc, /Daily user model/u);
