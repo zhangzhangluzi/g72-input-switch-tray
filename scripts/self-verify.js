@@ -812,7 +812,7 @@ function verifyWindowsPowerShellScriptArgs() {
       regularInvocation: resolveHelperCommandInvocation("tasklist.exe", ["/NH"]),
     });
   `;
-  const context = { path };
+  const context = { path: path.win32 };
   vm.runInNewContext(script, context);
   const result = JSON.parse(context.result);
 
