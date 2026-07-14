@@ -64,6 +64,7 @@ This project now uses one rule set only:
 - Real display add / remove events trigger an immediate read-only restore check. A 15-second fallback check runs only while a detached screen is waiting, and topology failures use exponential backoff.
 - A recent successful topology snapshot may be reused for at most 30 seconds during transient helper failures so verification never treats “read failed” as proof that a display detached. User-triggered switch and takeover entry checks require fresh topology data.
 - Optional WMI friendly-name lookup and on-disk identity cache access must not block core Win32 topology reads or actions.
+- Windows PowerShell helpers must use the shared `hidden-process.exe` launcher with Win32 `CreateProcessW`, `CREATE_NO_WINDOW`, redirected pipes, and explicit `-WindowStyle Hidden`; background checks must never open a visible terminal window or fall back to a visible console path.
 - Only an explicit takeover action may attach a detached screen before switching it to the local Windows input.
 - This is not remote coordination. It is only Windows repairing its own local desktop state.
 

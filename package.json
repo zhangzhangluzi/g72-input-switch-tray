@@ -1,15 +1,20 @@
 {
   "name": "g72-input-switch-tray",
-  "version": "0.3.44",
+  "version": "0.3.45",
   "description": "用于切换任意支持 DDC/CI 的显示器输入源的跨平台托盘应用。",
   "main": "src/main.js",
   "scripts": {
+    "build:windows-launcher": "node scripts/build-windows-hidden-process.js",
+    "prestart": "npm run build:windows-launcher",
     "start": "electron --log-level=3 .",
+    "predist": "npm run build:windows-launcher",
     "dist": "node scripts/with-user-temp.js node node_modules/electron-builder/out/cli/cli.js --publish never",
+    "predist:win": "npm run build:windows-launcher",
     "dist:win": "node scripts/with-user-temp.js node node_modules/electron-builder/out/cli/cli.js --win nsis --x64 --publish never",
     "dist:mac": "./scripts/ensure-macos-ddcctl.sh && electron-builder --mac dmg zip --publish never",
     "lint:js": "eslint src/main.js scripts/*.js",
     "verify:self": "npm run lint:js && node scripts/self-verify.js",
+    "prerelease": "npm run build:windows-launcher",
     "release": "node scripts/with-user-temp.js node node_modules/electron-builder/out/cli/cli.js --publish always"
   },
   "keywords": [

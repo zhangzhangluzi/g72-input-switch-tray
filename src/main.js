@@ -936,16 +936,14 @@ async function switchOnWindowsForContext(monitorContext, targetId, target) {
   const attachedDisplayCountBeforeSwitch = attachedTopologyDisplayCount;
 
   const switchResult = await runSwitchCandidateSequence(candidates, async (candidate) => {
-    await runCommand("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      scriptPath,
-      ...selectorArgs,
-      "-InputValue",
-      String(candidate),
-    ]);
+    await runCommand(
+      "powershell.exe",
+      getWindowsPowerShellScriptArgs(scriptPath, [
+        ...selectorArgs,
+        "-InputValue",
+        String(candidate),
+      ])
+    );
 
     const verificationResult = await verifyWindowsSwitchOutcomeForContext(
       monitorContext,
@@ -1124,17 +1122,16 @@ async function getWindowsCurrentInputResultForContext(monitorContext) {
 
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
   try {
-    const output = await runCommand("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      scriptPath,
-      ...getWindowsMonitorSelectorArgs(monitorContext),
-      "-ReadInputValue",
-    ], {
-      timeout: CURRENT_INPUT_COMMAND_TIMEOUT_MS,
-    });
+    const output = await runCommand(
+      "powershell.exe",
+      getWindowsPowerShellScriptArgs(scriptPath, [
+        ...getWindowsMonitorSelectorArgs(monitorContext),
+        "-ReadInputValue",
+      ]),
+      {
+        timeout: CURRENT_INPUT_COMMAND_TIMEOUT_MS,
+      }
+    );
     const parsed = JSON.parse(output);
     const currentInputValue = Number.isInteger(parsed?.currentInputValue)
       ? parsed.currentInputValue
@@ -1708,17 +1705,15 @@ async function switchWindowsDisplayForMonitorConfig(monitorConfig, target) {
   const expectedValues = getExpectedProbeInputValues(target.inputValue, monitorConfig);
 
   return runSwitchCandidateSequence(candidates, async (candidate) => {
-    await runCommand("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      scriptPath,
-      "-GdiDeviceName",
-      deviceName,
-      "-InputValue",
-      String(candidate),
-    ]);
+    await runCommand(
+      "powershell.exe",
+      getWindowsPowerShellScriptArgs(scriptPath, [
+        "-GdiDeviceName",
+        deviceName,
+        "-InputValue",
+        String(candidate),
+      ])
+    );
 
     const currentInputResult = await getWindowsCurrentInputResultForTopologyDisplay({
       deviceName,
@@ -1982,16 +1977,14 @@ async function getWindowsCurrentInputResultForTopologyDisplay(topologyDisplay) {
 
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
   try {
-    const output = await runCommand("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      scriptPath,
-      "-GdiDeviceName",
-      deviceName,
-      "-ReadInputValue",
-    ]);
+    const output = await runCommand(
+      "powershell.exe",
+      getWindowsPowerShellScriptArgs(scriptPath, [
+        "-GdiDeviceName",
+        deviceName,
+        "-ReadInputValue",
+      ])
+    );
     const parsed = JSON.parse(output);
     const currentInputValue = Number.isInteger(parsed?.currentInputValue)
       ? parsed.currentInputValue
@@ -3772,18 +3765,17 @@ async function getWindowsDdcProbeResult(topologyDisplay) {
 
   const scriptPath = getBundledResourcePath("windows", "set-input.ps1");
   try {
-    const output = await runCommand("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      scriptPath,
-      "-GdiDeviceName",
-      deviceName,
-      "-ProbeDdc",
-    ], {
-      timeout: WINDOWS_DDC_PROBE_TIMEOUT_MS,
-    });
+    const output = await runCommand(
+      "powershell.exe",
+      getWindowsPowerShellScriptArgs(scriptPath, [
+        "-GdiDeviceName",
+        deviceName,
+        "-ProbeDdc",
+      ]),
+      {
+        timeout: WINDOWS_DDC_PROBE_TIMEOUT_MS,
+      }
+    );
     const parsed = JSON.parse(output);
     const nextResult = {
       ok: Boolean(parsed?.ok) && Number(parsed?.physicalMonitorCount || 0) > 0,
@@ -3933,19 +3925,31 @@ function isWindowsMonitorAttachedInTopology(topologyDisplays, monitorContextOrCo
     : false;
 }
 
+function getWindowsPowerShellScriptArgs(scriptPath, args = []) {
+  return [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    scriptPath,
+    ...(Array.isArray(args) ? args : []),
+  ];
+}
+
 async function runWindowsTopologyCommand(args) {
   const topologyScriptPath = getBundledResourcePath("windows", "display-topology.ps1");
   const commandTask = () =>
-    runCommand("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      topologyScriptPath,
-      ...args,
-    ], {
-      timeout: WINDOWS_TOPOLOGY_COMMAND_TIMEOUT_MS,
-    });
+    runCommand(
+      "powershell.exe",
+      getWindowsPowerShellScriptArgs(topologyScriptPath, args),
+      {
+        timeout: WINDOWS_TOPOLOGY_COMMAND_TIMEOUT_MS,
+      }
+    );
 
   const nextOperation = windowsTopologyOperationQueue.then(commandTask, commandTask);
   windowsTopologyOperationQueue = nextOperation.catch(() => {});
@@ -5603,15 +5607,37 @@ function readRequestBody(request, maxBytes = LOCAL_REQUEST_BODY_LIMIT_BYTES) {
   });
 }
 
+function resolveHelperCommandInvocation(file, args) {
+  const normalizedArgs = Array.isArray(args) ? args : [];
+  if (!shouldUseWindowsPowerShellTemp(file)) {
+    return {
+      file,
+      args: normalizedArgs,
+    };
+  }
+
+  const hiddenLauncherPath = getBundledResourcePath("windows", "hidden-process.exe");
+  if (!fs.existsSync(hiddenLauncherPath)) {
+    throw new Error("Windows 无法找到无窗口 helper 启动器 hidden-process.exe。");
+  }
+
+  return {
+    file: hiddenLauncherPath,
+    args: [getWindowsPowerShellExecutablePath(), ...normalizedArgs],
+  };
+}
+
 function runCommand(file, args, options = {}) {
+  const invocation = resolveHelperCommandInvocation(file, args);
   const env = {
     ...(shouldUseWindowsPowerShellTemp(file) ? getWindowsPowerShellEnv() : {}),
     ...(options.env || {}),
   };
   const execOptions = {
-    windowsHide: true,
     timeout: HELPER_COMMAND_TIMEOUT_MS,
     ...options,
+    shell: false,
+    windowsHide: true,
   };
 
   if (Object.keys(env).length > 0) {
@@ -5643,7 +5669,7 @@ function runCommand(file, args, options = {}) {
       callback();
     };
 
-    const child = execFile(file, args, childOptions, (error, stdout, stderr) => {
+    const child = execFile(invocation.file, invocation.args, childOptions, (error, stdout, stderr) => {
       const combinedOutput = [stdout, stderr].filter(Boolean).join("\n").trim();
       settle(() => {
         if (error) {
@@ -5671,6 +5697,22 @@ function shouldUseWindowsPowerShellTemp(file) {
     process.platform === "win32" &&
     path.basename(normalizeText(file)).toLowerCase() === "powershell.exe"
   );
+}
+
+function getWindowsPowerShellExecutablePath() {
+  const systemRoot = normalizeText(process.env.SystemRoot) || "C:\\Windows";
+  const executablePath = path.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe"
+  );
+  if (!fs.existsSync(executablePath)) {
+    throw new Error(`Windows 无法找到 PowerShell：${executablePath}`);
+  }
+
+  return executablePath;
 }
 
 function getWindowsPowerShellEnv() {

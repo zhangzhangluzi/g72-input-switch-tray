@@ -201,6 +201,19 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function shouldUseWindowsPowerShellTemp\(file\)/u);
   assert.match(mainSource, /function getWindowsPowerShellEnv\(\)/u);
   assert.match(mainSource, /function getWindowsHelperTempPath\(\)/u);
+  assert.match(mainSource, /function getWindowsPowerShellScriptArgs\(/u);
+  assert.match(mainSource, /function resolveHelperCommandInvocation\(/u);
+  assert.match(mainSource, /function getWindowsPowerShellExecutablePath\(/u);
+  assert.match(mainSource, /"-WindowStyle",\s*"Hidden"/u);
+  assert.match(mainSource, /getBundledResourcePath\("windows", "hidden-process\.exe"\)/u);
+  assert.match(
+    mainSource,
+    /args: \[getWindowsPowerShellExecutablePath\(\), \.\.\.normalizedArgs\]/u
+  );
+  assert.doesNotMatch(mainSource, /runCommand\("powershell\.exe",\s*\[/u);
+  assert.doesNotMatch(mainSource, /conhost\.exe|--headless/u);
+  assert.match(mainSource, /shell: false,\s*windowsHide: true/u);
+  assert.match(mainSource, /execFile\(invocation\.file, invocation\.args/u);
   assert.match(mainSource, /WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS = 60000/u);
   assert.match(mainSource, /WINDOWS_TOPOLOGY_CACHE_TTL_MS = 30 \* 1000/u);
   assert.match(mainSource, /WINDOWS_TOPOLOGY_LOG_INTERVAL_MS = 60 \* 60 \* 1000/u);
@@ -771,6 +784,149 @@ function verifyExplorerSignatureParsing() {
   assert.equal(context.result.malformed, null);
 }
 
+function verifyWindowsPowerShellScriptArgs() {
+  const mainSource = fs.readFileSync(path.resolve(__dirname, "..", "src", "main.js"), "utf8");
+  const helperSource = [
+    "normalizeText",
+    "shouldUseWindowsPowerShellTemp",
+    "getWindowsPowerShellScriptArgs",
+    "resolveHelperCommandInvocation",
+    "getWindowsPowerShellExecutablePath",
+  ]
+    .map((name) => extractFunction(mainSource, name))
+    .join("\n");
+  const script = `
+    const process = { platform: "win32", env: { SystemRoot: "C:\\\\Windows" } };
+    const fs = { existsSync: () => true };
+    function getBundledResourcePath(...segments) {
+      return path.join("C:\\\\app\\\\resources", ...segments);
+    }
+    ${helperSource}
+    const powershellArgs = getWindowsPowerShellScriptArgs(
+      "C:\\\\helpers\\\\display-topology.ps1",
+      ["-Summary"]
+    );
+    globalThis.result = JSON.stringify({
+      powershellArgs,
+      powershellInvocation: resolveHelperCommandInvocation("powershell.exe", powershellArgs),
+      regularInvocation: resolveHelperCommandInvocation("tasklist.exe", ["/NH"]),
+    });
+  `;
+  const context = { path };
+  vm.runInNewContext(script, context);
+  const result = JSON.parse(context.result);
+
+  assert.deepEqual(result.powershellArgs, [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    "C:\\helpers\\display-topology.ps1",
+    "-Summary",
+  ]);
+  assert.deepEqual(result.powershellInvocation, {
+    file: "C:\\app\\resources\\windows\\hidden-process.exe",
+    args: [
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      ...result.powershellArgs,
+    ],
+  });
+  assert.deepEqual(result.regularInvocation, {
+    file: "tasklist.exe",
+    args: ["/NH"],
+  });
+}
+
+function verifyWindowsHiddenLauncher() {
+  const projectRoot = path.resolve(__dirname, "..");
+  const sourcePath = path.join(projectRoot, "native", "windows", "hidden-process.cs");
+  const buildScriptPath = path.join(projectRoot, "scripts", "build-windows-hidden-process.js");
+  const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"));
+  const gitignore = fs.readFileSync(path.join(projectRoot, ".gitignore"), "utf8");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const buildScript = fs.readFileSync(buildScriptPath, "utf8");
+
+  assert.match(source, /CreateProcessW/u);
+  assert.match(source, /CreateNoWindow = 0x08000000/u);
+  assert.match(source, /StartfUseShowWindow/u);
+  assert.match(source, /ShowWindow = SwHide/u);
+  assert.match(source, /StartfUseStdHandles/u);
+  assert.match(source, /CreatePipe/u);
+  assert.match(source, /SearchPathW/u);
+  assert.match(source, /Task\.Factory\.StartNew/u);
+  assert.doesNotMatch(source, /ProcessStartInfo|Process\.Start/u);
+  assert.match(source, /QuoteArgument/u);
+  assert.match(buildScript, /\/target:winexe/u);
+  assert.match(buildScript, /\/platform:x64/u);
+  assert.match(buildScript, /windowsHide: true/u);
+  assert.equal(packageJson.scripts.prestart, "npm run build:windows-launcher");
+  assert.equal(packageJson.scripts["predist:win"], "npm run build:windows-launcher");
+  assert.match(gitignore, /resources\/windows\/hidden-process\.exe/u);
+
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "monitor-hidden-launcher-selftest-"));
+  const launcherPath = path.join(tempDir, "hidden-process.exe");
+  const echoScriptPath = path.join(tempDir, "echo arguments.js");
+  const expectedArguments = ["value with spaces", 'value"quote', "C:\\path with space\\"];
+
+  try {
+    execFileSync(process.execPath, [buildScriptPath, "--output", launcherPath], {
+      encoding: "utf8",
+      timeout: 30000,
+      windowsHide: true,
+    });
+    assert.equal(fs.existsSync(launcherPath), true);
+    assert.ok(fs.statSync(launcherPath).size >= 4096);
+
+    fs.writeFileSync(
+      echoScriptPath,
+      'process.stdout.write(JSON.stringify(process.argv.slice(2)));\n'
+    );
+    const echoedArguments = JSON.parse(
+      execFileSync(launcherPath, [process.execPath, echoScriptPath, ...expectedArguments], {
+        encoding: "utf8",
+        timeout: 10000,
+        windowsHide: true,
+      })
+    );
+    assert.deepEqual(echoedArguments, expectedArguments);
+
+    const powershellPath = path.join(
+      process.env.SystemRoot || "C:\\Windows",
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe"
+    );
+    const powershellOutput = execFileSync(
+      launcherPath,
+      [
+        powershellPath,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Console]::Write("launcher-ok")',
+      ],
+      {
+        encoding: "utf8",
+        timeout: 10000,
+        windowsHide: true,
+      }
+    );
+    assert.equal(powershellOutput, "launcher-ok");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 async function verifyWindowsTopologyCacheBehavior() {
   const mainSource = fs.readFileSync(path.resolve(__dirname, "..", "src", "main.js"), "utf8");
   const helperSource = ["cloneWindowsTopologyDisplays", "getCachedWindowsTopologyDisplays"]
@@ -909,6 +1065,9 @@ function verifyLocalOnlyDocs() {
   assert.match(readme, /single rolling file is hard-capped at 64 KiB/u);
   assert.match(readme, /retaining only the newest 24 KiB/u);
   assert.match(readme, /each entry is truncated to 8 KiB/u);
+  assert.match(readme, /-WindowStyle Hidden/u);
+  assert.match(readme, /hidden-process\.exe/u);
+  assert.match(readme, /CREATE_NO_WINDOW/u);
   assert.match(readme, /Win32 display-device identity/u);
   assert.match(handoffDoc, /no LAN peer discovery/u);
   assert.match(handoffDoc, /Daily user model/u);
@@ -924,6 +1083,8 @@ function verifyLocalOnlyDocs() {
   assert.match(handoffDoc, /15-second fallback check runs only while a detached screen is waiting/u);
   assert.match(handoffDoc, /recent successful topology snapshot may be reused for at most 30 seconds/u);
   assert.match(handoffDoc, /Optional WMI friendly-name lookup/u);
+  assert.match(handoffDoc, /explicit `-WindowStyle Hidden`/u);
+  assert.match(handoffDoc, /hidden-process\.exe/u);
   assert.match(handoffDoc, /logical monitor's display-device identity/u);
   assert.match(
     handoffDoc,
@@ -1460,6 +1621,8 @@ async function main() {
   verifyWindowsDisconnectedConfigPruningBehavior();
   verifyWindowsDetachedIdentityRefreshBehavior();
   verifyExplorerSignatureParsing();
+  verifyWindowsPowerShellScriptArgs();
+  verifyWindowsHiddenLauncher();
   await verifyWindowsTopologyCacheBehavior();
   verifyDiagnosticLogTrimming();
   verifyLocalOnlyDocs();

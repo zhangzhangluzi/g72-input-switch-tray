@@ -4,6 +4,7 @@ dist/
 .cache/
 resources/bin/ddcctl
 resources/bin/ddcctl.commit
+resources/windows/hidden-process.exe
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
