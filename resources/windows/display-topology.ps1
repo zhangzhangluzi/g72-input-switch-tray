@@ -800,8 +800,15 @@ public static class NativeDisplayTopology
 
 function Get-FriendlyNameMap {
     $friendlyNameMap = @{}
+    $monitors = @()
 
-    foreach ($monitor in Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID) {
+    try {
+        $monitors = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop)
+    } catch {
+        return $friendlyNameMap
+    }
+
+    foreach ($monitor in $monitors) {
         $friendlyName = ([System.Text.Encoding]::ASCII.GetString($monitor.UserFriendlyName) -replace "`0", "").Trim()
         if ([string]::IsNullOrWhiteSpace($friendlyName)) {
             continue
@@ -829,12 +836,12 @@ function Get-DisplayCachePath {
 }
 
 function Read-DisplayCache {
-    $cachePath = Get-DisplayCachePath
-    if (-not (Test-Path -LiteralPath $cachePath)) {
-        return @{}
-    }
-
     try {
+        $cachePath = Get-DisplayCachePath
+        if (-not (Test-Path -LiteralPath $cachePath -ErrorAction Stop)) {
+            return @{}
+        }
+
         $raw = Get-Content -LiteralPath $cachePath -Raw -ErrorAction Stop
         if ([string]::IsNullOrWhiteSpace($raw)) {
             return @{}
@@ -923,19 +930,23 @@ function Save-DisplayCache {
         return
     }
 
-    $cachePath = Get-DisplayCachePath
-    $cacheDirectory = Split-Path -Path $cachePath -Parent
-    if (-not (Test-Path -LiteralPath $cacheDirectory)) {
-        New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
-    }
+    try {
+        $cachePath = Get-DisplayCachePath
+        $cacheDirectory = Split-Path -Path $cachePath -Parent
+        if (-not (Test-Path -LiteralPath $cacheDirectory)) {
+            New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
+        }
 
-    $cacheEntries = @(
-        $DisplayCache.Values |
-            Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace($_.DeviceName) } |
-            Sort-Object DeviceName
-    )
-    $json = ConvertTo-Json -InputObject $cacheEntries -Depth 4
-    Set-Content -LiteralPath $cachePath -Value $json -Encoding UTF8
+        $cacheEntries = @(
+            $DisplayCache.Values |
+                Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace($_.DeviceName) } |
+                Sort-Object DeviceName
+        )
+        $json = ConvertTo-Json -InputObject $cacheEntries -Depth 4
+        Set-Content -LiteralPath $cachePath -Value $json -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        # Cache enrichment is optional and must not block topology actions.
+    }
 }
 
 function Set-DisplayCacheEntry {

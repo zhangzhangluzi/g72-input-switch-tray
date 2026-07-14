@@ -113,7 +113,7 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /startDisplayChangeWatcher\(\);/u);
   assert.match(mainSource, /function scheduleLocalDisplayTopologyChange/u);
   assert.match(mainSource, /DISPLAY_CHANGE_DEBOUNCE_MS = 750/u);
-  assert.match(mainSource, /WINDOWS_RESTORE_CHECK_INTERVAL_MS = 5000/u);
+  assert.match(mainSource, /WINDOWS_RESTORE_CHECK_INTERVAL_MS = 15000/u);
   assert.match(mainSource, /screen\.on\("display-added", handleDisplayChange\);/u);
   assert.match(mainSource, /screen\.on\("display-metrics-changed", handleDisplayChange\);/u);
   assert.match(mainSource, /forceMacDisplayMetadataRefresh/u);
@@ -202,6 +202,11 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function getWindowsPowerShellEnv\(\)/u);
   assert.match(mainSource, /function getWindowsHelperTempPath\(\)/u);
   assert.match(mainSource, /WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS = 60000/u);
+  assert.match(mainSource, /WINDOWS_TOPOLOGY_CACHE_TTL_MS = 30 \* 1000/u);
+  assert.match(mainSource, /WINDOWS_TOPOLOGY_LOG_INTERVAL_MS = 60 \* 60 \* 1000/u);
+  assert.match(mainSource, /function getCachedWindowsTopologyDisplays/u);
+  assert.match(mainSource, /allowCachedOnFailure: false/u);
+  assert.match(mainSource, /throwOnFailure: true/u);
   assert.match(mainSource, /EXPLORER_SIGNATURE_TIMEOUT_MS = 3000/u);
   assert.match(mainSource, /EXPLORER_SIGNATURE_LOG_INTERVAL_MS = 60 \* 60 \* 1000/u);
   assert.match(mainSource, /trayHealthCheckInFlight/u);
@@ -212,12 +217,17 @@ function verifyMainSourceBusinessGuards() {
   assert.match(mainSource, /function trimDiagnosticLogIfNeeded/u);
   assert.match(mainSource, /function createDiagnosticLogEntry/u);
   assert.match(mainSource, /function truncateDiagnosticLogText/u);
-  assert.match(mainSource, /DIAGNOSTIC_LOG_MAX_BYTES = 256 \* 1024/u);
-  assert.match(mainSource, /DIAGNOSTIC_LOG_TAIL_BYTES = 96 \* 1024/u);
-  assert.match(mainSource, /DIAGNOSTIC_LOG_ENTRY_MAX_BYTES = 32 \* 1024/u);
+  assert.match(
+    mainSource,
+    /app\.whenReady\(\)\.then[\s\S]{0,240}trimDiagnosticLogIfNeeded\(\);/u
+  );
+  assert.match(mainSource, /DIAGNOSTIC_LOG_MAX_BYTES = 64 \* 1024/u);
+  assert.match(mainSource, /DIAGNOSTIC_LOG_TAIL_BYTES = 24 \* 1024/u);
+  assert.match(mainSource, /DIAGNOSTIC_LOG_ENTRY_MAX_BYTES = 8 \* 1024/u);
   assert.doesNotMatch(mainSource, /appendDiagnosticLog\(`Rebuilding tray/u);
   assert.match(mainSource, /TEMP: tempPath/u);
   assert.match(mainSource, /TMP: tempPath/u);
+  assert.match(mainSource, /<link rel="icon" href="data:,">/u);
   assert.doesNotMatch(mainSource, /request\.destroy\(\)/u);
   assert.match(mainSource, /function hasMacPhysicalIdentity/u);
   assert.match(mainSource, /function hasMacSafeDdcTargetIdentity/u);
@@ -231,7 +241,7 @@ function verifyMainSourceBusinessGuards() {
 }
 
 function extractFunction(source, name) {
-  const start = source.indexOf(`function ${name}`);
+  const start = source.indexOf(`function ${name}(`);
   assert.notEqual(start, -1, `Missing function ${name}`);
   const declarationEnd = source.indexOf(") {", start);
   const bodyStart = declarationEnd >= 0
@@ -640,6 +650,7 @@ function verifyWindowsDetachedIdentityRefreshBehavior() {
       {
         id: "shared-screen",
         displayKey: String.raw\`win:\\\\.\\DISPLAY2\`,
+        roleLabel: "共享屏幕",
         displayName: "H24E7",
         match: {
           windowsDisplayDeviceId: String.raw\`MONITOR\\SKG2431\\INSTANCE-A\`,
@@ -668,6 +679,7 @@ function verifyWindowsDetachedIdentityRefreshBehavior() {
     String.raw`win-device:monitor\skg2431\instance-a`
   );
   assert.equal(context.result.display.gdiDeviceName, String.raw`\\.\DISPLAY9`);
+  assert.equal(context.result.display.roleLabel, "共享屏幕");
 }
 
 function verifyDiagnosticLogTrimming() {
@@ -677,6 +689,7 @@ function verifyDiagnosticLogTrimming() {
     "truncateDiagnosticLogText",
     "createDiagnosticLogEntry",
     "trimDiagnosticLogIfNeeded",
+    "appendDiagnosticLog",
   ]
     .map((name) => extractFunction(mainSource, name))
     .join("\n");
@@ -686,9 +699,9 @@ function verifyDiagnosticLogTrimming() {
   try {
     fs.writeFileSync(logPath, "old topology failure\n".repeat(40000));
     const script = `
-      const DIAGNOSTIC_LOG_MAX_BYTES = 256 * 1024;
-      const DIAGNOSTIC_LOG_TAIL_BYTES = 96 * 1024;
-      const DIAGNOSTIC_LOG_ENTRY_MAX_BYTES = 32 * 1024;
+      const DIAGNOSTIC_LOG_MAX_BYTES = 64 * 1024;
+      const DIAGNOSTIC_LOG_TAIL_BYTES = 24 * 1024;
+      const DIAGNOSTIC_LOG_ENTRY_MAX_BYTES = 8 * 1024;
       function getDiagnosticLogPath() { return ${JSON.stringify(logPath)}; }
       ${helperSource}
       const initialRoll = trimDiagnosticLogIfNeeded(${JSON.stringify(logPath)});
@@ -696,16 +709,15 @@ function verifyDiagnosticLogTrimming() {
       let rollCount = initialRoll ? 1 : 0;
       let maxObservedBytes = fs.statSync(${JSON.stringify(logPath)}).size;
       for (let index = 0; index < 240; index += 1) {
-        const entry = createDiagnosticLogEntry(
+        const beforeBytes = fs.statSync(${JSON.stringify(logPath)}).size;
+        appendDiagnosticLog(
           \`event-\${index}\`,
           \`failure-\${index}:\${"y".repeat(4096)}\`
         );
-        if (trimDiagnosticLogIfNeeded(${JSON.stringify(logPath)}, Buffer.byteLength(entry))) {
+        const currentBytes = fs.statSync(${JSON.stringify(logPath)}).size;
+        if (currentBytes < beforeBytes) {
           rollCount += 1;
         }
-        fs.appendFileSync(${JSON.stringify(logPath)}, entry);
-        trimDiagnosticLogIfNeeded(${JSON.stringify(logPath)});
-        const currentBytes = fs.statSync(${JSON.stringify(logPath)}).size;
         maxObservedBytes = Math.max(maxObservedBytes, currentBytes);
         if (currentBytes > DIAGNOSTIC_LOG_MAX_BYTES) {
           throw new Error(\`Log exceeded hard cap: \${currentBytes}\`);
@@ -718,15 +730,16 @@ function verifyDiagnosticLogTrimming() {
         maxObservedBytes,
       };
     `;
-    const context = { fs, Buffer, process };
+    const context = { fs, path, Buffer, process };
     vm.runInNewContext(script, context);
 
     const rolledLog = fs.readFileSync(logPath, "utf8");
     assert.equal(context.result.initialRoll, true);
-    assert.ok(context.result.oversizedEntryBytes <= 32 * 1024);
+    assert.ok(context.result.oversizedEntryBytes <= 8 * 1024);
     assert.ok(context.result.rollCount >= 2);
-    assert.ok(context.result.maxObservedBytes <= 256 * 1024);
-    assert.ok(fs.statSync(logPath).size <= 256 * 1024);
+    assert.ok(context.result.maxObservedBytes <= 64 * 1024);
+    assert.ok(fs.statSync(logPath).size <= 64 * 1024);
+    assert.deepEqual(fs.readdirSync(tempDir), ["app.log"]);
     assert.match(rolledLog, /Diagnostic log rolled from/u);
     assert.match(rolledLog, /event-239/u);
     assert.doesNotMatch(rolledLog, /old topology failure/u);
@@ -758,6 +771,125 @@ function verifyExplorerSignatureParsing() {
   assert.equal(context.result.malformed, null);
 }
 
+async function verifyWindowsTopologyCacheBehavior() {
+  const mainSource = fs.readFileSync(path.resolve(__dirname, "..", "src", "main.js"), "utf8");
+  const helperSource = ["cloneWindowsTopologyDisplays", "getCachedWindowsTopologyDisplays"]
+    .map((name) => extractFunction(mainSource, name))
+    .join("\n");
+  const script = `
+    const WINDOWS_TOPOLOGY_CACHE_TTL_MS = 30 * 1000;
+    let windowsTopologyCache = {
+      fetchedAt: 1000,
+      displays: [{ deviceName: "DISPLAY1", attached: true }],
+    };
+    ${helperSource}
+    const fresh = getCachedWindowsTopologyDisplays(30_999);
+    fresh[0].attached = false;
+    globalThis.result = {
+      freshLength: fresh.length,
+      cacheStayedIsolated: windowsTopologyCache.displays[0].attached,
+      boundaryLength: getCachedWindowsTopologyDisplays(31_000).length,
+      expiredLength: getCachedWindowsTopologyDisplays(31_001).length,
+      missingLength: (() => {
+        windowsTopologyCache = { fetchedAt: 0, displays: [] };
+        return getCachedWindowsTopologyDisplays(1000).length;
+      })(),
+    };
+  `;
+  const context = {};
+  vm.runInNewContext(script, context);
+
+  assert.equal(context.result.freshLength, 1);
+  assert.equal(context.result.cacheStayedIsolated, true);
+  assert.equal(context.result.boundaryLength, 1);
+  assert.equal(context.result.expiredLength, 0);
+  assert.equal(context.result.missingLength, 0);
+
+  const topologySource = [
+    "normalizeText",
+    "normalizeWindowsTopologyDisplay",
+    "cloneWindowsTopologyDisplays",
+    "getCachedWindowsTopologyDisplays",
+    "getWindowsTopologyDisplays",
+  ]
+    .map((name) => extractFunction(mainSource, name))
+    .join("\n")
+    .replace(
+      "function getWindowsTopologyDisplays",
+      "async function getWindowsTopologyDisplays"
+    );
+  const successfulOutput = JSON.stringify([
+    {
+      DeviceName: String.raw`\\.\DISPLAY1`,
+      DisplayName: "H24E7",
+      Attached: true,
+      Primary: true,
+      Width: 2560,
+      Height: 1440,
+    },
+  ]);
+  const asyncScript = `
+    (async () => {
+      const process = { platform: "win32" };
+      const WINDOWS_TOPOLOGY_CACHE_TTL_MS = 30 * 1000;
+      const WINDOWS_TOPOLOGY_FAILURE_BACKOFF_BASE_MS = 5000;
+      const WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS = 60000;
+      const WINDOWS_TOPOLOGY_LOG_INTERVAL_MS = 60 * 60 * 1000;
+      const WINDOWS_TOPOLOGY_RECOVERY_LOG_THRESHOLD_MS = 60 * 1000;
+      let windowsTopologyFailureCount = 0;
+      let windowsTopologyRetryAfter = 0;
+      let windowsTopologyFailureStartedAt = 0;
+      let windowsTopologyCache = { fetchedAt: 0, displays: [] };
+      let now = 1000;
+      let helperMode = "success";
+      const Date = { now: () => now };
+      function appendDiagnosticLogRateLimited() {}
+      function scheduleTrayRebuild() {}
+      async function runWindowsTopologyCommand() {
+        if (helperMode === "failure") {
+          throw new Error("simulated topology failure");
+        }
+        return ${JSON.stringify(successfulOutput)};
+      }
+      ${topologySource}
+
+      const initial = await getWindowsTopologyDisplays({ force: true });
+      helperMode = "failure";
+      now = 2000;
+      const cached = await getWindowsTopologyDisplays({ force: true });
+      cached[0].attached = false;
+      const isolated = getCachedWindowsTopologyDisplays(now);
+      now = 32_001;
+      const expired = await getWindowsTopologyDisplays({ force: true });
+      let strictFailure = "";
+      try {
+        await getWindowsTopologyDisplays({
+          force: true,
+          allowCachedOnFailure: false,
+          throwOnFailure: true,
+        });
+      } catch (error) {
+        strictFailure = error.message;
+      }
+
+      globalThis.result = {
+        initialLength: initial.length,
+        cachedLength: cached.length,
+        cacheStayedIsolated: isolated[0].attached,
+        expiredLength: expired.length,
+        strictFailure,
+      };
+    })()
+  `;
+  const asyncContext = {};
+  await vm.runInNewContext(asyncScript, asyncContext);
+  assert.equal(asyncContext.result.initialLength, 1);
+  assert.equal(asyncContext.result.cachedLength, 1);
+  assert.equal(asyncContext.result.cacheStayedIsolated, true);
+  assert.equal(asyncContext.result.expiredLength, 0);
+  assert.match(asyncContext.result.strictFailure, /Windows 暂时无法读取显示拓扑/u);
+}
+
 function verifyLocalOnlyDocs() {
   const readmePath = path.resolve(__dirname, "..", "README.md");
   const handoffDocPath = path.resolve(__dirname, "..", "docs", "shared-monitor-handoff.md");
@@ -774,8 +906,9 @@ function verifyLocalOnlyDocs() {
   assert.match(readme, /灰色第二屏/u);
   assert.match(readme, /takeover candidates ignore known virtual display adapters/u);
   assert.match(readme, /write accepted, then readback disappeared/u);
-  assert.match(readme, /single rolling file is hard-capped at 256 KiB/u);
-  assert.match(readme, /each entry is truncated to 32 KiB/u);
+  assert.match(readme, /single rolling file is hard-capped at 64 KiB/u);
+  assert.match(readme, /retaining only the newest 24 KiB/u);
+  assert.match(readme, /each entry is truncated to 8 KiB/u);
   assert.match(readme, /Win32 display-device identity/u);
   assert.match(handoffDoc, /no LAN peer discovery/u);
   assert.match(handoffDoc, /Daily user model/u);
@@ -788,7 +921,9 @@ function verifyLocalOnlyDocs() {
   assert.match(handoffDoc, /same-model duplicate attached to Windows while its input is not that screen's configured local interface/u);
   assert.match(handoffDoc, /Known virtual display adapters/u);
   assert.match(handoffDoc, /successful write followed by complete DDC\/readback loss/u);
-  assert.match(handoffDoc, /Background restore checks are read-only and back off/u);
+  assert.match(handoffDoc, /15-second fallback check runs only while a detached screen is waiting/u);
+  assert.match(handoffDoc, /recent successful topology snapshot may be reused for at most 30 seconds/u);
+  assert.match(handoffDoc, /Optional WMI friendly-name lookup/u);
   assert.match(handoffDoc, /logical monitor's display-device identity/u);
   assert.match(
     handoffDoc,
@@ -866,6 +1001,12 @@ function verifyWindowsHelperSourceGuards() {
   assert.match(topologyScript, /-DisplayDeviceId \$resolvedDisplayDeviceId/u);
   assert.match(topologyScript, /\[Console\]::OutputEncoding = \$Utf8NoBom/u);
   assert.match(topologyScript, /\[Console\]::Error\.WriteLine\(\$message\.Trim\(\)\)/u);
+  assert.match(
+    topologyScript,
+    /try \{[\s\S]{0,240}Get-CimInstance -Namespace root\\wmi -ClassName WmiMonitorID -ErrorAction Stop[\s\S]{0,160}catch \{\s*return \$friendlyNameMap/u
+  );
+  assert.match(topologyScript, /Test-Path -LiteralPath \$cachePath -ErrorAction Stop/u);
+  assert.match(topologyScript, /Cache enrichment is optional and must not block topology actions/u);
   assert.match(setInputScript, /\[switch\]\$ProbeDdc/u);
   assert.match(setInputScript, /\[Console\]::OutputEncoding = \$Utf8NoBom/u);
   assert.match(setInputScript, /physicalMonitorCount/u);
@@ -884,8 +1025,12 @@ function verifyCiWorkflowTriggers() {
   assert.match(workflow, /create-release:/u);
   assert.match(workflow, /release-windows:/u);
   assert.match(workflow, /release-macos:/u);
+  assert.match(workflow, /finalize-release:/u);
   assert.match(workflow, /contents: write/u);
   assert.match(workflow, /gh release upload/u);
+  assert.match(workflow, /gh release create[\s\S]{0,200}--draft/u);
+  assert.match(workflow, /gh release edit[\s\S]{0,160}--draft=false --latest/u);
+  assert.match(workflow, /Verify tag matches package version/u);
   assert.match(workflow, /npm run dist:win/u);
   assert.match(workflow, /npm run dist:mac/u);
   assert.doesNotMatch(workflow, /npm run release/u);
@@ -1304,7 +1449,7 @@ function verifyMacHelperAppsIfAvailable() {
   throw new Error("No macOS app bundle was found for self verification.");
 }
 
-function main() {
+async function main() {
   verifyMainSourceSyntax();
   verifyMainSourceBusinessGuards();
   verifyMacMonitorConfigSyncBehavior();
@@ -1315,6 +1460,7 @@ function main() {
   verifyWindowsDisconnectedConfigPruningBehavior();
   verifyWindowsDetachedIdentityRefreshBehavior();
   verifyExplorerSignatureParsing();
+  await verifyWindowsTopologyCacheBehavior();
   verifyDiagnosticLogTrimming();
   verifyLocalOnlyDocs();
   verifyPinnedMacDdcctlBuildScript();
@@ -1337,4 +1483,7 @@ function main() {
   process.stdout.write("Self verification passed.\n");
 }
 
-main();
+main().catch((error) => {
+  process.stderr.write(`${error?.stack || error}\n`);
+  process.exitCode = 1;
+});

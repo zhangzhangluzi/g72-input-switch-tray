@@ -16,7 +16,7 @@ const TRAY_HEALTHCHECK_INTERVAL_MS = 5000;
 const EXPLORER_SIGNATURE_TIMEOUT_MS = 3000;
 const EXPLORER_SIGNATURE_LOG_INTERVAL_MS = 60 * 60 * 1000;
 const DISPLAY_CHANGE_DEBOUNCE_MS = 750;
-const WINDOWS_RESTORE_CHECK_INTERVAL_MS = 5000;
+const WINDOWS_RESTORE_CHECK_INTERVAL_MS = 15000;
 const WINDOWS_DISPLAY_HANDOFF_DELAY_MS = 1500;
 const MAC_DISPLAY_METADATA_CACHE_TTL_MS = 5000;
 const DDC_PROBE_CACHE_TTL_MS = 10000;
@@ -28,10 +28,13 @@ const SYSTEM_PROFILER_COMMAND_TIMEOUT_MS = 45000;
 const WINDOWS_TAKEOVER_SETTLE_MS = 45000;
 const WINDOWS_TOPOLOGY_FAILURE_BACKOFF_BASE_MS = 5000;
 const WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS = 60000;
+const WINDOWS_TOPOLOGY_CACHE_TTL_MS = 30 * 1000;
+const WINDOWS_TOPOLOGY_LOG_INTERVAL_MS = 60 * 60 * 1000;
+const WINDOWS_TOPOLOGY_RECOVERY_LOG_THRESHOLD_MS = 60 * 1000;
 const LOCAL_REQUEST_BODY_LIMIT_BYTES = 64 * 1024;
-const DIAGNOSTIC_LOG_MAX_BYTES = 256 * 1024;
-const DIAGNOSTIC_LOG_TAIL_BYTES = 96 * 1024;
-const DIAGNOSTIC_LOG_ENTRY_MAX_BYTES = 32 * 1024;
+const DIAGNOSTIC_LOG_MAX_BYTES = 64 * 1024;
+const DIAGNOSTIC_LOG_TAIL_BYTES = 24 * 1024;
+const DIAGNOSTIC_LOG_ENTRY_MAX_BYTES = 8 * 1024;
 const DIAGNOSTIC_LOG_REPEAT_INTERVAL_MS = 5 * 60 * 1000;
 const TARGET_SLOTS = [
   { id: "dp1", title: "DP1", defaultInputValue: 15 },
@@ -71,6 +74,11 @@ let windowsRestoreInFlight = false;
 let windowsDuplicateDetachInFlight = false;
 let windowsTopologyFailureCount = 0;
 let windowsTopologyRetryAfter = 0;
+let windowsTopologyFailureStartedAt = 0;
+let windowsTopologyCache = {
+  fetchedAt: 0,
+  displays: [],
+};
 const windowsTakeoverInProgressMonitorIds = new Set();
 const windowsTakeoverProtectedUntilByMonitorId = new Map();
 const diagnosticLogLastWriteByKey = new Map();
@@ -896,7 +904,11 @@ async function switchMonitorUnlocked(monitorId, targetId, options = {}) {
 async function switchOnWindowsForContext(monitorContext, targetId, target) {
   const monitorConfig = monitorContext.monitor;
   const switchingToLocalInterface = isLocalInterfaceTarget(targetId, monitorConfig);
-  const topologyDisplays = await getWindowsTopologyDisplays({ force: true });
+  const topologyDisplays = await getWindowsTopologyDisplays({
+    force: true,
+    allowCachedOnFailure: false,
+    throwOnFailure: true,
+  });
   const attachedTopologyDisplayCount = topologyDisplays.filter((display) => display.attached).length;
   let topologyDisplay = topologyDisplays.find((display) =>
     isTopologyDisplayMatchMonitor(display, monitorContext)
@@ -1569,6 +1581,7 @@ async function takeoverWindowsDetachedMonitorUnlocked(
   const takeoverContexts = await getWindowsDetachedTakeoverContexts({
     persistCandidates: true,
     forceTopologyRefresh: true,
+    allowCachedTopology: false,
   });
   const takeoverContext = takeoverContexts.find(
     (monitorContext) => monitorContext.id === normalizedMonitorId
@@ -1587,7 +1600,11 @@ async function takeoverWindowsDetachedMonitorUnlocked(
     upsertStoredMonitorConfig(monitorConfig);
     saveState(state);
 
-    const topologyDisplays = await getWindowsTopologyDisplays({ force: true });
+    const topologyDisplays = await getWindowsTopologyDisplays({
+      force: true,
+      allowCachedOnFailure: false,
+      throwOnFailure: true,
+    });
     const topologyDisplay = topologyDisplays.find((display) =>
       isTopologyDisplayMatchMonitor(display, monitorConfig)
     );
@@ -1744,7 +1761,10 @@ async function attemptPendingWindowsRestores({
       return false;
     }
 
-    const topologyDisplays = await getWindowsTopologyDisplays({ force: forceTopologyRefresh });
+    const topologyDisplays = await getWindowsTopologyDisplays({
+      force: forceTopologyRefresh,
+      allowCachedOnFailure: false,
+    });
     let changed = false;
 
     for (const monitorConfig of pendingMonitorConfigs) {
@@ -1786,7 +1806,10 @@ async function attemptWindowsDuplicateForeignDisplayDetaches({
   windowsDuplicateDetachInFlight = true;
 
   try {
-    const topologyDisplays = await getWindowsTopologyDisplays({ force: forceTopologyRefresh });
+    const topologyDisplays = await getWindowsTopologyDisplays({
+      force: forceTopologyRefresh,
+      allowCachedOnFailure: false,
+    });
     const candidates = await getWindowsDuplicateForeignDisplayDetachCandidates(
       topologyDisplays,
       normalizeText(monitorId) || null
@@ -2347,6 +2370,7 @@ async function getWindowsDetachedTakeoverContexts({
   topologyDisplays = null,
   persistCandidates = false,
   forceTopologyRefresh = false,
+  allowCachedTopology = true,
 } = {}) {
   if (process.platform !== "win32") {
     return [];
@@ -2365,7 +2389,11 @@ async function getWindowsDetachedTakeoverContexts({
   );
   const resolvedTopologyDisplays = Array.isArray(topologyDisplays)
     ? topologyDisplays
-    : await getWindowsTopologyDisplays({ force: forceTopologyRefresh });
+    : await getWindowsTopologyDisplays({
+        force: forceTopologyRefresh,
+        allowCachedOnFailure: allowCachedTopology,
+        throwOnFailure: forceTopologyRefresh && !allowCachedTopology,
+      });
   const prunedHeuristicConfigs = persistCandidates
     ? pruneRedundantWindowsHeuristicTakeoverConfigs(
         connectedMonitorIds,
@@ -2594,7 +2622,7 @@ function createWindowsDetachedDisplaySummary(monitorConfig, topologyDisplay) {
     id: monitorConfig.id,
     displayKey,
     index: null,
-    roleLabel: "待接回屏幕",
+    roleLabel: normalizeText(monitorConfig?.roleLabel) || "待接回屏幕",
     detectedName,
     resolution: width > 0 && height > 0 ? `${width} × ${height}` : "当前未接入桌面",
     position: "当前未接入桌面",
@@ -3579,44 +3607,96 @@ function isGenericMacDisplayName(displayName) {
   return /^(|display|spdisplays_display|unknown display)$/iu.test(normalizeText(displayName));
 }
 
-async function getWindowsTopologyDisplays({ force = false } = {}) {
+async function getWindowsTopologyDisplays({
+  force = false,
+  allowCachedOnFailure = true,
+  throwOnFailure = false,
+} = {}) {
   if (process.platform !== "win32") {
     return [];
   }
 
   if (!force && Date.now() < windowsTopologyRetryAfter) {
-    return [];
+    return allowCachedOnFailure ? getCachedWindowsTopologyDisplays() : [];
   }
 
   try {
     const output = await runWindowsTopologyCommand(["-Summary"]);
     const parsed = JSON.parse(output);
     const displays = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+    const normalizedDisplays = displays.map(normalizeWindowsTopologyDisplay).filter(Boolean);
+    if (normalizedDisplays.length === 0) {
+      throw new Error("Windows topology helper returned no display records.");
+    }
+
     const recoveredFromFailure = windowsTopologyFailureCount > 0;
+    const failureDurationMs = windowsTopologyFailureStartedAt
+      ? Date.now() - windowsTopologyFailureStartedAt
+      : 0;
     windowsTopologyFailureCount = 0;
     windowsTopologyRetryAfter = 0;
-    if (recoveredFromFailure) {
+    windowsTopologyFailureStartedAt = 0;
+    windowsTopologyCache = {
+      fetchedAt: Date.now(),
+      displays: cloneWindowsTopologyDisplays(normalizedDisplays),
+    };
+    if (
+      recoveredFromFailure &&
+      failureDurationMs >= WINDOWS_TOPOLOGY_RECOVERY_LOG_THRESHOLD_MS
+    ) {
       appendDiagnosticLogRateLimited(
         "windows-topology-recovered",
-        "Windows topology helper recovered."
+        `Windows topology helper recovered after ${Math.round(failureDurationMs / 1000)}s.`,
+        null,
+        WINDOWS_TOPOLOGY_LOG_INTERVAL_MS
       );
       scheduleTrayRebuild();
     }
-    return displays.map(normalizeWindowsTopologyDisplay).filter(Boolean);
+    return cloneWindowsTopologyDisplays(normalizedDisplays);
   } catch (error) {
+    if (windowsTopologyFailureCount === 0) {
+      windowsTopologyFailureStartedAt = Date.now();
+    }
     windowsTopologyFailureCount += 1;
     const backoffMs = Math.min(
       WINDOWS_TOPOLOGY_FAILURE_BACKOFF_MAX_MS,
       WINDOWS_TOPOLOGY_FAILURE_BACKOFF_BASE_MS * 2 ** (windowsTopologyFailureCount - 1)
     );
     windowsTopologyRetryAfter = Date.now() + backoffMs;
+    const cachedDisplays = allowCachedOnFailure ? getCachedWindowsTopologyDisplays() : [];
     appendDiagnosticLogRateLimited(
       "windows-topology-read",
-      `Failed to read Windows topology; retrying in ${backoffMs}ms`,
-      error
+      `Failed to read Windows topology; retrying in ${backoffMs}ms${
+        cachedDisplays.length > 0 ? " with a recent cached snapshot" : ""
+      }`,
+      error,
+      WINDOWS_TOPOLOGY_LOG_INTERVAL_MS
     );
+    if (throwOnFailure) {
+      throw new Error(
+        `Windows 暂时无法读取显示拓扑：${normalizeText(error?.message) || "未知错误"}`
+      );
+    }
+    return cachedDisplays;
+  }
+}
+
+function cloneWindowsTopologyDisplays(displays) {
+  return Array.isArray(displays) ? displays.map((display) => ({ ...display })) : [];
+}
+
+function getCachedWindowsTopologyDisplays(now = Date.now()) {
+  if (
+    !Number.isFinite(windowsTopologyCache.fetchedAt) ||
+    windowsTopologyCache.fetchedAt <= 0 ||
+    !Array.isArray(windowsTopologyCache.displays) ||
+    windowsTopologyCache.displays.length === 0 ||
+    now - windowsTopologyCache.fetchedAt > WINDOWS_TOPOLOGY_CACHE_TTL_MS
+  ) {
     return [];
   }
+
+  return cloneWindowsTopologyDisplays(windowsTopologyCache.displays);
 }
 
 function normalizeWindowsTopologyDisplay(display) {
@@ -4008,6 +4088,7 @@ function renderSettingsPage(requestUrl, monitorContexts, windowsTakeoverContexts
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
   <title>${escapeHtml(APP_NAME)} 设置页</title>
   <style>
     ${renderSharedStyles()}

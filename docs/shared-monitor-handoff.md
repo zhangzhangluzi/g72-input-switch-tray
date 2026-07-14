@@ -61,7 +61,10 @@ This project now uses one rule set only:
 - The takeover path is hardware-bound: if the monitor does not expose a DDC/CI physical monitor handle to Windows while it is displaying another input, Windows cannot actively pull that screen back.
 - Takeover candidates must be physical Windows display devices. Known virtual display adapters such as ToDesk, MuMu, RayLink, GameViewer, spacedesk, Parsec, dummy, and generic IDD devices must not appear as shared-screen takeover targets.
 - If a same-model duplicate attached to Windows while its input is not that screen's configured local interface, the app can remove that duplicate from the Windows desktop topology.
-- Background restore checks are read-only and back off after topology failures. Only an explicit takeover action may attach a detached screen before switching it to the local Windows input.
+- Real display add / remove events trigger an immediate read-only restore check. A 15-second fallback check runs only while a detached screen is waiting, and topology failures use exponential backoff.
+- A recent successful topology snapshot may be reused for at most 30 seconds during transient helper failures so verification never treats “read failed” as proof that a display detached. User-triggered switch and takeover entry checks require fresh topology data.
+- Optional WMI friendly-name lookup and on-disk identity cache access must not block core Win32 topology reads or actions.
+- Only an explicit takeover action may attach a detached screen before switching it to the local Windows input.
 - This is not remote coordination. It is only Windows repairing its own local desktop state.
 
 ### 5. Current input readback

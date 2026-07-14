@@ -78,7 +78,9 @@ Cross-platform tray app for switching each locally connected external DDC/CI-cap
 - The app starts a local settings page on port `3847` and binds it to `127.0.0.1` only. The HTTP server is only used for local setup and local direct switch actions; the app does not rely on LAN peer discovery or cross-machine coordination.
 - If port `3847` is unavailable, the local pages automatically fall back to another free local port.
 - The local `/health` endpoint reports an Electron display snapshot only; it does not run DDC probes, query current input, or rewrite monitor configuration.
-- Windows topology polling backs off after repeated helper failures. The diagnostic log is duplicate-rate-limited, each entry is truncated to 32 KiB, and the single rolling file is hard-capped at 256 KiB while retaining only its recent tail.
+- Windows reacts immediately to real display add / remove events and uses a 15-second read-only fallback check only while a detached screen is waiting. Optional WMI friendly-name and topology-cache failures do not block the core Win32 topology result.
+- A successful Windows topology snapshot may be reused for at most 30 seconds after a transient helper failure so detach / attach verification cannot mistake “read failed” for “screen removed”. User-triggered switch and takeover entry checks still require a fresh snapshot.
+- Windows topology polling backs off after repeated helper failures. The same topology error is logged at most once per hour, each entry is truncated to 8 KiB, and the single rolling file is hard-capped at 64 KiB while retaining only the newest 24 KiB. No numbered backup logs are created, and an oversized legacy log is trimmed on the next app start.
 - macOS only switches screens that are still visible to the current Mac. Once a screen has moved to another host, the current Mac no longer pretends it can still control that screen locally.
 - On Windows, only screens that can be stably mapped to a local external display are exposed as switch targets.
 
@@ -97,4 +99,4 @@ npm run dist:mac
 npm run verify:self
 ```
 
-Tag a release with a `v` prefix, for example `v0.2.0`, and GitHub Actions will publish Windows and macOS release artifacts to GitHub Releases.
+Tag a release with a `v` prefix that matches `package.json`, for example `v0.2.0`. GitHub Actions keeps the release as a draft until both Windows and macOS assets pass verification and upload successfully, then publishes the complete release.
